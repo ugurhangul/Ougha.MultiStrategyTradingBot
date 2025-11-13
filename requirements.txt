@@ -1,0 +1,28 @@
+# MetaTrader 5 API
+MetaTrader5>=5.0.45
+
+# Data manipulation and analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical analysis
+TA-Lib>=0.4.28
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Logging
+colorlog>=6.7.0
+
+# Type hints
+typing-extensions>=4.5.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+
+# Utilities
+python-dateutil>=2.8.2
+pytz>=2023.3
+

@@ -1,0 +1,16 @@
+ReportOptimizer-259540182.xml
+logs/*
+src/__pycache__/*
+.env
+src/config/__pycache__/*
+src/core/__pycache__/*
+src/execution/__pycache__/*
+src/indicators/__pycache__/*
+src/models/__pycache__/*
+src/risk/__pycache__/*
+src/strategy/__pycache__/*
+src/utils/__pycache__/*
+/logs
+/data
+/.idea/*
+/ea/tester/*

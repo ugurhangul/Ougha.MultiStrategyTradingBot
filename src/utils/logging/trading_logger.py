@@ -1,0 +1,499 @@
+﻿"""
+Main trading logger class.
+"""
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict
+import colorlog
+
+from src.utils.logging.formatters import UTCFormatter
+
+
+class TradingLogger:
+    """Custom logger for trading operations"""
+
+    def __init__(self, name: str = "TradingBot", log_to_file: bool = True,
+                 log_to_console: bool = True, log_level: str = "INFO",
+                 enable_detailed: bool = True):
+        """
+        Initialize the trading logger.
+
+        Args:
+            name: Logger name
+            log_to_file: Enable file logging
+            log_to_console: Enable console logging
+            log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+            enable_detailed: Enable detailed logging
+        """
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(getattr(logging, log_level.upper()))
+        self.logger.handlers.clear()  # Clear existing handlers
+
+        self.enable_detailed = enable_detailed
+        self.log_dir = Path("logs")
+        self.symbol_handlers: Dict[str, logging.FileHandler] = {}
+        self.disable_log_handler: Optional[logging.FileHandler] = None
+        self.disabled_symbols: set = set()  # Track disabled symbols to avoid duplicates
+
+        # Create logs directory if it doesn't exist
+        if log_to_file:
+            self.log_dir.mkdir(exist_ok=True)
+
+            # Create date-based directory structure: logs/YYYY-MM-DD/
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date_dir = self.log_dir / date_str
+            date_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create master log file: logs/YYYY-MM-DD/main.log
+            master_log_file = date_dir / "main.log"
+
+            file_handler = logging.FileHandler(master_log_file, encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+
+            # Use UTC formatter for file logs
+            file_formatter = UTCFormatter(
+                '%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(file_handler)
+
+            # Create disable log file: logs/YYYY-MM-DD/disable.log
+            disable_log_file = date_dir / "disable.log"
+            self.disable_log_handler = logging.FileHandler(disable_log_file, encoding='utf-8')
+            self.disable_log_handler.setLevel(logging.INFO)
+            self.disable_log_handler.setFormatter(file_formatter)
+
+        # Create console handler with colors (still using UTC)
+        if log_to_console:
+            console_handler = colorlog.StreamHandler()
+            console_handler.setLevel(getattr(logging, log_level.upper()))
+
+            # Create custom colored formatter with UTC
+            class UTCColoredFormatter(colorlog.ColoredFormatter):
+                def formatTime(self, record, datefmt=None):
+                    dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+                    if datefmt:
+                        s = dt.strftime(datefmt)
+                    else:
+                        s = dt.isoformat(timespec='seconds')
+                    return s
+
+            console_formatter = UTCColoredFormatter(
+                '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                datefmt='%H:%M:%S',
+                log_colors={
+                    'DEBUG': 'cyan',
+                    'INFO': 'white',
+                    'WARNING': 'yellow',
+                    'ERROR': 'red',
+                    'CRITICAL': 'red,bg_white',
+                }
+            )
+            console_handler.setFormatter(console_formatter)
+            self.logger.addHandler(console_handler)
+
+    def _get_symbol_handler(self, symbol: str) -> Optional[logging.FileHandler]:
+        """
+        Get or create a file handler for a specific symbol.
+
+        Args:
+            symbol: Trading symbol name
+
+        Returns:
+            File handler for the symbol, or None if file logging is disabled
+        """
+        # Check if handler already exists
+        if symbol in self.symbol_handlers:
+            return self.symbol_handlers[symbol]
+
+        # Create new handler for this symbol
+        try:
+            # Create date-based directory structure: logs/YYYY-MM-DD/
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date_dir = self.log_dir / date_str
+            date_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create symbol-specific log file: logs/YYYY-MM-DD/SYMBOL.log
+            log_file = date_dir / f"{symbol}.log"
+
+            handler = logging.FileHandler(log_file, encoding='utf-8')
+            handler.setLevel(logging.DEBUG)
+
+            # Use UTC formatter
+            formatter = UTCFormatter(
+                '%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+
+            # Store handler
+            self.symbol_handlers[symbol] = handler
+
+            return handler
+        except Exception as e:
+            self.logger.error(f"Failed to create log handler for {symbol}: {e}")
+            return None
+
+    def _log_to_symbol_file(self, level: int, message: str, symbol: str):
+        """
+        Log a message to a symbol-specific file.
+
+        Args:
+            level: Logging level
+            message: Log message
+            symbol: Trading symbol
+        """
+        handler = self._get_symbol_handler(symbol)
+        if handler:
+            # Create a log record
+            record = self.logger.makeRecord(
+                self.logger.name,
+                level,
+                "(symbol_log)",
+                0,
+                message,
+                (),
+                None
+            )
+            handler.emit(record)
+
+    def info(self, message: str, symbol: Optional[str] = None):
+        """Log info message"""
+        if symbol:
+            # Log to symbol-specific file
+            self._log_to_symbol_file(logging.INFO, message, symbol)
+            # Add symbol prefix for master log
+            message = f"[{symbol}] {message}"
+        self.logger.info(message)
+
+    def debug(self, message: str, symbol: Optional[str] = None):
+        """Log debug message (only if detailed logging enabled)"""
+        if self.enable_detailed:
+            if symbol:
+                # Log to symbol-specific file
+                self._log_to_symbol_file(logging.DEBUG, message, symbol)
+                # Add symbol prefix for master log
+                message = f"[{symbol}] {message}"
+            self.logger.debug(message)
+
+    def warning(self, message: str, symbol: Optional[str] = None):
+        """Log warning message"""
+        if symbol:
+            # Log to symbol-specific file
+            self._log_to_symbol_file(logging.WARNING, message, symbol)
+            # Add symbol prefix for master log
+            message = f"[{symbol}] {message}"
+        self.logger.warning(message)
+
+    def error(self, message: str, symbol: Optional[str] = None):
+        """Log error message"""
+        if symbol:
+            # Log to symbol-specific file
+            self._log_to_symbol_file(logging.ERROR, message, symbol)
+            # Add symbol prefix for master log
+            message = f"[{symbol}] {message}"
+        self.logger.error(message)
+
+    def critical(self, message: str, symbol: Optional[str] = None):
+        """Log critical message"""
+        if symbol:
+            # Log to symbol-specific file
+            self._log_to_symbol_file(logging.CRITICAL, message, symbol)
+            # Add symbol prefix for master log
+            message = f"[{symbol}] {message}"
+        self.logger.critical(message)
+
+    def separator(self, char: str = "=", length: int = 60):
+        """Log a separator line"""
+        self.logger.info(char * length)
+
+    def header(self, title: str, width: int = 60):
+        """Log a formatted header"""
+        self.separator("=", width)
+        padding = (width - len(title) - 2) // 2
+        self.logger.info(f"{'=' * padding} {title} {'=' * padding}")
+        self.separator("=", width)
+
+    def box(self, title: str, lines: list[str], width: int = 60):
+        """Log a formatted box with title and content"""
+        self.logger.info("╔" + "═" * (width - 2) + "╗")
+
+        # Title
+        title_padding = width - len(title) - 4
+        self.logger.info(f"║  {title}{' ' * title_padding}║")
+
+        self.logger.info("╚" + "═" * (width - 2) + "╝")
+
+        # Content
+        for line in lines:
+            self.logger.info(line)
+
+    def trade_signal(self, signal_type: str, symbol: str, entry: float,
+                    sl: float, tp: float, lot_size: float):
+        """Log a trade signal"""
+        self.header(f"{signal_type} SIGNAL - {symbol}")
+        self.info(f"Entry Price: {entry:.5f}")
+        self.info(f"Stop Loss: {sl:.5f}")
+        self.info(f"Take Profit: {tp:.5f}")
+        self.info(f"Lot Size: {lot_size:.2f}")
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rr = reward / risk if risk > 0 else 0
+        self.info(f"Risk: {risk:.5f} | Reward: {reward:.5f} | R:R: {rr:.2f}")
+        self.separator()
+
+    def position_opened(self, ticket: int, symbol: str, position_type: str,
+                       volume: float, price: float, sl: float, tp: float):
+        """Log position opened"""
+        self.header(f"POSITION OPENED - {symbol}")
+        self.info(f"Ticket: {ticket}")
+        self.info(f"Type: {position_type}")
+        self.info(f"Volume: {volume:.2f}")
+        self.info(f"Price: {price:.5f}")
+        self.info(f"SL: {sl:.5f} | TP: {tp:.5f}")
+        self.separator()
+
+    def position_closed(self, ticket: int, symbol: str, profit: float,
+                       is_win: bool, rr_achieved: float):
+        """Log position closed"""
+        result = "WIN" if is_win else "LOSS"
+        self.header(f"POSITION CLOSED - {result}")
+        self.info(f"Ticket: {ticket} | Symbol: {symbol}")
+        self.info(f"Profit: ${profit:.2f}")
+        self.info(f"R:R Achieved: {rr_achieved:.2f}")
+        self.separator()
+
+    def symbol_disabled(self, symbol: str, reason: str, stats: Optional[dict] = None):
+        """
+        Log symbol disabled event.
+
+        Args:
+            symbol: Symbol name
+            reason: Reason for disabling
+            stats: Optional statistics dictionary
+        """
+        # Check if symbol is already in disabled set (avoid duplicate logging)
+        if symbol in self.disabled_symbols:
+            return
+
+        # Add to disabled set
+        self.disabled_symbols.add(symbol)
+
+        # Prepare log message
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        message = f"[{symbol}] DISABLED | Reason: {reason}"
+
+        # Log to main log
+        self.info(f"Symbol disabled: {reason}", symbol)
+
+        # Log to disable.log
+        if self.disable_log_handler:
+            record = self.logger.makeRecord(
+                self.logger.name,
+                logging.INFO,
+                "(disable_log)",
+                0,
+                message,
+                (),
+                None
+            )
+            self.disable_log_handler.emit(record)
+
+        # Log detailed box if stats provided
+        if stats:
+            lines = [
+                f"Reason: {reason}",
+                "",
+                "Statistics:",
+                f"  Total Trades: {stats.get('total_trades', 0)}",
+                f"  Wins: {stats.get('wins', 0)} ({stats.get('win_rate', 0):.1f}%)",
+                f"  Losses: {stats.get('losses', 0)}",
+                f"  Net P&L: ${stats.get('net_pnl', 0):.2f}",
+                f"  Consecutive Losses: {stats.get('consecutive_losses', 0)}",
+                f"  Current Drawdown: {stats.get('current_drawdown', 0):.2f}%",
+                f"  Max Drawdown: {stats.get('max_drawdown', 0):.2f}%",
+                "",
+                f"Re-enable Date: {stats.get('reenable_date', 'N/A')}"
+            ]
+            self.box(f"SYMBOL DISABLED: {symbol}", lines)
+
+    def symbol_reenabled(self, symbol: str, old_stats: Optional[dict] = None):
+        """
+        Log symbol re-enabled event.
+
+        Args:
+            symbol: Symbol name
+            old_stats: Optional previous statistics dictionary
+        """
+        # Remove from disabled set
+        self.disabled_symbols.discard(symbol)
+
+        # Prepare log message
+        message = f"[{symbol}] RE-ENABLED | Cooling period expired"
+
+        # Log to main log
+        self.info("Symbol re-enabled after cooling period", symbol)
+
+        # Log to disable.log
+        if self.disable_log_handler:
+            record = self.logger.makeRecord(
+                self.logger.name,
+                logging.INFO,
+                "(disable_log)",
+                0,
+                message,
+                (),
+                None
+            )
+            self.disable_log_handler.emit(record)
+
+        # Log detailed box if stats provided
+        if old_stats:
+            lines = [
+                "Reason: Cooling period expired",
+                "",
+                "Previous Performance:",
+                f"  Total Trades: {old_stats.get('total_trades', 0)}",
+                f"  Net P&L: ${old_stats.get('net_pnl', 0):.2f}",
+                f"  Disable Reason: {old_stats.get('disable_reason', 'N/A')}",
+                "",
+                "Statistics: RESET",
+                "Status: Ready to trade"
+            ]
+            self.box(f"SYMBOL RE-ENABLED: {symbol}", lines)
+
+    def trade_error(self, symbol: str, error_type: str, error_message: str,
+                   context: Optional[dict] = None, remove_from_active_set: bool = True):
+        """
+        Log trade execution or data retrieval error with comprehensive details.
+        Optionally removes symbol from active.set if error is persistent.
+
+        Args:
+            symbol: Symbol name
+            error_type: Type of error (e.g., "Trade Execution", "Data Retrieval", "Spread Check")
+            error_message: Specific error message or exception
+            context: Optional context dictionary with additional details
+            remove_from_active_set: Whether to check if symbol should be removed from active.set
+        """
+        # Build error message
+        message = f"{error_type} Error: {error_message}"
+
+        # Log to main error log
+        self.error(message, symbol)
+
+        # Log detailed context if provided
+        if context:
+            for key, value in context.items():
+                self.error(f"  {key}: {value}", symbol)
+
+        # Check if symbol should be removed from active.set
+        if remove_from_active_set:
+            try:
+                from src.utils.active_set_manager import get_active_set_manager
+
+                manager = get_active_set_manager()
+                if manager.should_remove_symbol(error_message):
+                    # Remove from active.set
+                    if manager.remove_symbol(symbol, f"{error_type}: {error_message}", self):
+                        self.warning(
+                            f"Symbol removed from active.set due to persistent error: {error_message}",
+                            symbol
+                        )
+            except Exception:
+                # Don't crash if active set manager fails
+                pass
+
+    def spread_warning(self, symbol: str, current_spread_percent: float,
+                      current_spread_points: float, threshold_percent: float,
+                      is_rejected: bool = False, remove_from_active_set: bool = True):
+        """
+        Log spread-related warnings.
+        Optionally removes symbol from active.set if spread is consistently too high.
+
+        Args:
+            symbol: Symbol name
+            current_spread_percent: Current spread as percentage
+            current_spread_points: Current spread in points
+            threshold_percent: Maximum allowed spread percentage
+            is_rejected: Whether trade was rejected due to spread
+            remove_from_active_set: Whether to check if symbol should be removed from active.set
+        """
+        status = "REJECTED" if is_rejected else "WARNING"
+        message = (
+            f"Spread {status}: {current_spread_percent:.3f}% ({current_spread_points:.1f} points) "
+            f"| Threshold: {threshold_percent:.3f}%"
+        )
+
+        if is_rejected:
+            self.warning(message, symbol)
+
+            # Remove from active.set if spread is rejected
+            if remove_from_active_set:
+                try:
+                    from src.utils.active_set_manager import get_active_set_manager
+
+                    manager = get_active_set_manager()
+                    error_msg = f"Spread too high: {current_spread_percent:.3f}% (max: {threshold_percent:.3f}%)"
+
+                    if manager.remove_symbol(symbol, error_msg, self):
+                        self.warning(
+                            f"Symbol removed from active.set due to excessive spread",
+                            symbol
+                        )
+                except Exception:
+                    # Don't crash if active set manager fails
+                    pass
+        else:
+            self.warning(f"Elevated spread: {message}", symbol)
+
+    def liquidity_warning(self, symbol: str, volume: float, avg_volume: float,
+                         reason: str):
+        """
+        Log liquidity or volume warnings.
+
+        Args:
+            symbol: Symbol name
+            volume: Current volume
+            avg_volume: Average volume
+            reason: Reason for warning
+        """
+        message = (
+            f"Liquidity Warning: {reason} | "
+            f"Current Volume: {volume:.0f} | Average: {avg_volume:.0f}"
+        )
+        self.warning(message, symbol)
+
+    def symbol_condition_warning(self, symbol: str, condition: str, details: str,
+                                remove_from_active_set: bool = True):
+        """
+        Log general symbol-specific condition warnings.
+        Optionally removes symbol from active.set for persistent conditions.
+
+        Args:
+            symbol: Symbol name
+            condition: Condition type (e.g., "Market Hours", "Trading Disabled")
+            details: Additional details about the condition
+            remove_from_active_set: Whether to check if symbol should be removed from active.set
+        """
+        message = f"{condition}: {details}"
+        self.warning(message, symbol)
+
+        # Remove from active.set if trading is disabled
+        if remove_from_active_set and "Trading Disabled" in condition:
+            try:
+                from src.utils.active_set_manager import get_active_set_manager
+
+                manager = get_active_set_manager()
+                error_msg = f"{condition}: {details}"
+
+                if manager.remove_symbol(symbol, error_msg, self):
+                    self.warning(
+                        f"Symbol removed from active.set: {condition}",
+                        symbol
+                    )
+            except Exception:
+                # Don't crash if active set manager fails
+                pass
+
