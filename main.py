@@ -1,5 +1,5 @@
 """
-FiveMinScalper - Python Multi-Symbol Trading Bot
+Ougha Multi Strategy Trading Bot
 Main entry point for the trading system.
 """
 import sys
@@ -32,7 +32,7 @@ class TradingBot:
             enable_detailed=config.logging.enable_detailed_logging
         )
         
-        self.logger.header("FiveMinScalper - Python Multi-Symbol Trading Bot")
+        self.logger.header("Ougha Multi Strategy Trading Bot")
         self.logger.info("Initializing trading system...")
 
         # Validate configuration (skip symbols check - will load from Market Watch)
@@ -226,8 +226,7 @@ def main():
     print("""
     ╔════════════════════════════════════════════════════════════╗
     ║                                                            ║
-    ║         FiveMinScalper - Python Trading Bot                ║
-    ║         Multi-Symbol False Breakout Strategy               ║
+    ║                    Ougha Multi Strategy                    ║
     ║                                                            ║
     ╚════════════════════════════════════════════════════════════╝
     """)

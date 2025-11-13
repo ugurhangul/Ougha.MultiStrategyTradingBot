@@ -1,6 +1,6 @@
 ﻿# Configuration System Documentation
 
-This directory contains the hierarchical configuration system for the FiveMinScalper trading bot.
+This directory contains the hierarchical configuration system for the Ougha multi-strategy trading bot.
 
 ## 📁 Directory Structure
 
@@ -197,5 +197,5 @@ from src.config.symbols import SymbolOptimizer
 ---
 
 **Last Updated**: 2025-11-12  
-**Maintainer**: FiveMinScalper Development Team
+**Maintainer**: @ugurhangul
 

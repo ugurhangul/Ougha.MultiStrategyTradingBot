@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
-Comprehensive unused code analyzer for the fiveminScalper codebase.
+Comprehensive unused code analyzer for the Ougha Multi Strategy codebase.
 Analyzes Python files for unused imports, functions, classes, variables, and more.
 """
 
