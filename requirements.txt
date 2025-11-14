@@ -26,3 +26,6 @@ pytest-cov>=4.1.0
 python-dateutil>=2.8.2
 pytz>=2023.3
 
+# Backtesting
+hftbacktest>=2.4.3
+

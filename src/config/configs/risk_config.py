@@ -23,6 +23,6 @@ class TrailingStopConfig:
     # ATR-based trailing stop
     use_atr_trailing: bool = False
     atr_period: int = 14
-    atr_multiplier: float = 2.0
+    atr_multiplier: float = 1.5
     atr_timeframe: str = "H4"
 

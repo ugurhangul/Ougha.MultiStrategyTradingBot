@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from typing import Dict, List, Set, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from src.core.mt5_connector import MT5Connector
 from src.core.symbol_session_monitor import SymbolSessionMonitor
@@ -63,7 +63,7 @@ class TradingController:
 
         # Monitoring
         self.last_position_check = datetime.now(timezone.utc)
-    
+
     def initialize(self, symbols: List[str]) -> bool:
         """
         Initialize strategies for all symbols.
@@ -159,11 +159,11 @@ class TradingController:
             self.logger.info("Session checking is disabled - initializing all symbols")
             for symbol in symbols:
                 success_count += self._initialize_symbol(symbol)
-        
+
         self.logger.info("=" * 60)
         self.logger.info(f"Initialized {success_count}/{len(symbols)} symbols")
         self.logger.info("=" * 60)
-        
+
         return success_count > 0
 
     def _initialize_symbol(self, symbol: str) -> int:
@@ -246,11 +246,6 @@ class TradingController:
                 skipped_count += 1
                 continue
 
-            if not self.connector.is_market_open(symbol):
-                self.logger.warning(f"Market is CLOSED for {symbol} - Skipping thread creation", symbol)
-                skipped_count += 1
-                continue
-
             thread = threading.Thread(
                 target=self._symbol_worker,
                 args=(symbol, strategy),
@@ -261,8 +256,22 @@ class TradingController:
             self.threads[symbol] = thread
             started_count += 1
 
+            # Log initial trading session state if session checking is enabled
+            if config.trading_hours.check_symbol_session:
+                in_session = self.session_monitor.check_symbol_session(symbol)
+                if in_session:
+                    self.logger.info(
+                        f"{symbol}: In active trading session - worker will start trading immediately",
+                        symbol
+                    )
+                else:
+                    self.logger.info(
+                        f"{symbol}: NOT in active trading session - worker will start in sleep mode until session opens",
+                        symbol
+                    )
+
         if started_count == 0:
-            self.logger.error("No symbol threads were started - all symbols are either disabled or market is closed")
+            self.logger.error("No symbol threads were started - all symbols have trading disabled")
             self.running = False
             return
 
@@ -278,9 +287,9 @@ class TradingController:
         self.logger.info("=" * 60)
         self.logger.info(f"Thread Summary: {started_count} started, {skipped_count} skipped")
         if skipped_count > 0:
-            self.logger.warning(f"{skipped_count} symbol(s) skipped due to trading disabled or market closed")
+            self.logger.warning(f"{skipped_count} symbol(s) skipped due to trading disabled")
         self.logger.info("=" * 60)
-    
+
     def _symbol_worker(self, symbol: str, strategy: MultiStrategyOrchestrator):
         """
         Worker thread for a single symbol.
@@ -304,10 +313,14 @@ class TradingController:
                     self.logger.warning(f"Trading DISABLED for symbol - Stopping worker thread", symbol)
                     break
 
-                # Check if market is still open
-                if not self.connector.is_market_open(symbol):
-                    self.logger.warning(f"Market CLOSED for symbol - Stopping worker thread", symbol)
-                    break
+                # Check if symbol is in an active trading session
+                if not self._is_symbol_in_active_session(symbol):
+                    # Put the worker thread to sleep until the next active session
+                    if not self._sleep_until_next_session(symbol):
+                        # Sleep was aborted because controller is stopping
+                        break
+                    # After waking up, re-validate all conditions
+                    continue
 
                 # Process tick
                 strategy.on_tick()
@@ -325,7 +338,258 @@ class TradingController:
                 time.sleep(5)  # Wait before retrying
 
         self.logger.info(f"Worker thread stopped for {symbol}", symbol)
-    
+
+    def _is_symbol_in_active_session(self, symbol: str) -> bool:
+        """Determine if a symbol is currently in an active trading session.
+
+        This combines broker / MT5 session status with optional configured
+        trading hours to support pre/post-market filtering.
+        """
+        trading_hours_config = config.trading_hours
+
+        # Optionally skip MT5-based session checks if disabled in config
+        if trading_hours_config.check_symbol_session:
+            # First rely on the MT5-based session detection, which already
+            # understands holidays, early closes, etc.
+            in_session = self.session_monitor.check_symbol_session(symbol)
+            if not in_session:
+                return False
+
+        # If explicit trading hours filtering is disabled, MT5 status alone is enough
+        if not trading_hours_config.use_trading_hours:
+            return True
+
+        # Apply configured trading window (assumed to be in UTC)
+        now = datetime.now(timezone.utc)
+        start_hour = trading_hours_config.start_hour
+        end_hour = trading_hours_config.end_hour
+        current_hour = now.hour
+
+        if start_hour == end_hour:
+            # 24-hour session
+            return True
+
+        if start_hour < end_hour:
+            # Simple window within same day
+            return start_hour <= current_hour < end_hour
+
+        # Window crosses midnight, e.g. 22 -> 2
+        return current_hour >= start_hour or current_hour < end_hour
+
+    def _calculate_next_session_start(self) -> datetime:
+        """Estimate the start time of the next trading session in UTC.
+
+        Uses TradingHoursConfig when enabled; otherwise falls back to using
+        the session check interval as a conservative polling delay.
+        """
+        now = datetime.now(timezone.utc)
+        trading_hours_config = config.trading_hours
+
+        if not trading_hours_config.use_trading_hours:
+            # No explicit hours configured - poll again after check interval
+            return now + timedelta(seconds=trading_hours_config.session_check_interval_seconds)
+
+        start_hour = trading_hours_config.start_hour
+        end_hour = trading_hours_config.end_hour
+
+        # Assume a simple daily window [start_hour, end_hour) in UTC
+        today_start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+        today_end = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+        if now < today_start:
+            candidate = today_start
+        elif now >= today_end:
+            candidate = today_start + timedelta(days=1)
+        else:
+            # Within configured hours but MT5 reports no trading session
+            # (holiday, early close, etc.) - poll again after interval.
+            return now + timedelta(seconds=trading_hours_config.session_check_interval_seconds)
+
+        # Skip weekends (Saturday=5, Sunday=6)
+        while candidate.weekday() >= 5:
+            candidate = candidate + timedelta(days=1)
+            candidate = candidate.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+        return candidate
+
+    def _sleep_until_next_session(self, symbol: str) -> bool:
+        """Put the worker thread for a symbol to sleep until the next trading session.
+
+        Returns:
+            True if the worker should continue once the session is active,
+            False if trading should stop because the controller is shutting down.
+        """
+        trading_hours_config = config.trading_hours
+        now = datetime.now(timezone.utc)
+        next_session_start = self._calculate_next_session_start()
+
+        # Compute expected sleep duration (in seconds)
+        sleep_seconds = max(
+            trading_hours_config.session_check_interval_seconds,
+            int((next_session_start - now).total_seconds())
+        )
+
+        # Guard against non-positive durations
+        if sleep_seconds <= 0:
+            sleep_seconds = trading_hours_config.session_check_interval_seconds
+
+        message = (
+            f"{symbol}: Outside active trading session. "
+            f"Next session expected at {next_session_start.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(sleeping for ~{sleep_seconds // 60} minutes, "
+            f"checking every {trading_hours_config.session_check_interval_seconds} seconds)."
+        )
+        self.logger.info(message, symbol)
+
+        remaining = float(sleep_seconds)
+        check_interval = max(1, trading_hours_config.session_check_interval_seconds)
+        elapsed_since_check = 0.0
+
+        while self.running and remaining > 0:
+            step = min(remaining, 1.0)
+            time.sleep(step)
+            remaining -= step
+            elapsed_since_check += step
+
+            if not self.running:
+                # Controller is shutting down
+                return False
+
+            if elapsed_since_check >= check_interval:
+                elapsed_since_check = 0.0
+
+                # Wake up early if the session became active sooner than expected
+                if self._is_symbol_in_active_session(symbol):
+                    self.logger.info(
+                        f"{symbol}: Trading session became active earlier than expected - Resuming.",
+                        symbol
+                    )
+                    return True
+
+
+    def _should_close_positions_for_session_end(self, symbol: str) -> bool:
+        """Determine if positions for a symbol should be closed before session end.
+
+        Primary signal comes from MT5's *actual* trading mode (CLOSEONLY),
+        which reflects the broker's real session calendar including holidays
+        and early closes. Optionally falls back to static TradingHoursConfig
+        window when enabled.
+        """
+        trading_hours_config = config.trading_hours
+
+        if not trading_hours_config.close_positions_before_session_end:
+            return False
+
+        # --- 1) Prefer MT5's actual session state via trade_mode (CLOSEONLY) ---
+        # Force a fresh symbol_info fetch so trade_mode changes are seen promptly
+        try:
+            self.connector.clear_symbol_info_cache(symbol)
+            symbol_info = self.connector.get_symbol_info(symbol)
+        except Exception:
+            symbol_info = None
+
+        if symbol_info is not None:
+            # trade_mode values (see TradingStatusChecker and MT5 docs):
+            # 0 = DISABLED, 1 = LONGONLY, 2 = SHORTONLY,
+            # 3 = CLOSEONLY (only closing allowed), 4 = FULL
+            trade_mode = symbol_info.get("trade_mode", 0)
+
+            # When broker switches symbol to CLOSEONLY, the session is about to end
+            # but closing trades is still allowed. Close positions immediately.
+            if trade_mode == 3:
+                return True
+
+        # --- 2) Optional fallback: static trading hours window (if configured) ---
+        if not trading_hours_config.use_trading_hours:
+            return False
+
+        now = datetime.now(timezone.utc)
+        start_hour = trading_hours_config.start_hour
+        end_hour = trading_hours_config.end_hour
+
+        # 24-hour window - no specific session end where forced closure is needed
+        if start_hour == end_hour:
+            return False
+
+        # Determine the current session start/end that contains "now"
+        session_start = None
+        session_end = None
+
+        if start_hour < end_hour:
+            # Simple intraday window [start_hour, end_hour)
+            session_start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+            session_end = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+            if not (session_start <= now < session_end):
+                return False
+        else:
+            # Window crosses midnight, e.g. 22 -> 2
+            # Two segments: [start_hour, 24) and [0, end_hour)
+            if now.hour >= start_hour:
+                # Evening segment (today -> tomorrow)
+                session_start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+                session_end = (session_start + timedelta(days=1)).replace(
+                    hour=end_hour, minute=0, second=0, microsecond=0
+                )
+            elif now.hour < end_hour:
+                # Morning segment (continuation of previous day's session)
+                session_end = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+                session_start = (session_end - timedelta(days=1)).replace(
+                    hour=start_hour, minute=0, second=0, microsecond=0
+                )
+            else:
+                # Outside the configured session window
+                return False
+
+            if not (session_start <= now < session_end):
+                return False
+
+        minutes_to_end = (session_end - now).total_seconds() / 60.0
+        return minutes_to_end <= trading_hours_config.close_positions_minutes_before_end
+
+    def _close_positions_before_session_end(self, positions: List[PositionInfo]):
+        """Close open positions for symbols whose session is about to end.
+
+        This is intended to reduce the risk of holding positions into a closed
+        market. It respects TradingHoursConfig and only acts when both:
+        - close_positions_before_session_end is enabled
+        - the symbol is still in an active trading session
+        """
+        if not positions:
+            return
+
+        trading_hours_config = config.trading_hours
+        if not trading_hours_config.close_positions_before_session_end:
+            return
+
+        # Group positions by symbol to log and act per symbol
+        positions_by_symbol: Dict[str, List[PositionInfo]] = {}
+        for pos in positions:
+            positions_by_symbol.setdefault(pos.symbol, []).append(pos)
+
+        for symbol, symbol_positions in positions_by_symbol.items():
+            # Only attempt to close while we still consider the session active
+            if not self._is_symbol_in_active_session(symbol):
+                continue
+
+            if not self._should_close_positions_for_session_end(symbol):
+                continue
+
+            self.logger.info(
+                f"{symbol}: Trading session ending soon - closing {len(symbol_positions)} open position(s) before session end.",
+                symbol
+            )
+
+            for pos in symbol_positions:
+                success = self.order_manager.close_position(pos.ticket)
+                if not success:
+                    self.logger.warning(
+                        f"{symbol}: Failed to close position {pos.ticket} before session end.",
+                        symbol
+                    )
+
+
+
     def _position_monitor(self):
         """Monitor all positions and check for closed trades"""
         self.logger.info("Position monitor thread started")
@@ -363,8 +627,11 @@ class TradingController:
                 # Update known positions
                 known_positions = current_tickets
 
-                # Manage positions (breakeven and trailing stops)
                 if positions:
+                    # Close positions if the session is about to end
+                    self._close_positions_before_session_end(positions)
+
+                    # Manage positions (breakeven and trailing stops)
                     self.trade_manager.manage_positions(positions)
 
                 # Log statistics every 10 seconds
@@ -380,7 +647,7 @@ class TradingController:
                 time.sleep(10)
 
         self.logger.info("Position monitor thread stopped")
-    
+
     def _log_position_statistics(self, positions: List[PositionInfo]):
         """
         Log statistics about open positions.
@@ -466,28 +733,28 @@ class TradingController:
             strategy.on_position_closed(symbol, profit, volume, comment)
         else:
             self.logger.warning(f"No strategy found for symbol {symbol} (ticket {ticket})")
-    
+
     def stop(self):
         """Stop all trading"""
         self.logger.info("Stopping trading controller...")
-        
+
         self.running = False
-        
+
         # Wait for all threads to finish
         for symbol, thread in self.threads.items():
             self.logger.info(f"Waiting for {symbol} thread to stop...", symbol)
             thread.join(timeout=5)
-        
+
         # Shutdown all strategies
         for symbol, strategy in self.strategies.items():
             strategy.shutdown()
-        
+
         self.logger.info("Trading controller stopped")
-    
+
     def get_status(self) -> dict:
         """
         Get status of all strategies.
-        
+
         Returns:
             Dictionary with status for each symbol
         """
@@ -496,8 +763,8 @@ class TradingController:
                 symbol: strategy.get_status()
                 for symbol, strategy in self.strategies.items()
             }
-    
-      
+
+
 
     def _reconcile_positions(self):
         """

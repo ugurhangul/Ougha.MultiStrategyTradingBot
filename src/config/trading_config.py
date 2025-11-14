@@ -75,7 +75,7 @@ class TradingConfig:
             trailing_stop_distance=float(os.getenv('TRAILING_STOP_DISTANCE', '50.0')),
             use_atr_trailing=os.getenv('USE_ATR_TRAILING', 'false').lower() == 'true',
             atr_period=int(os.getenv('ATR_PERIOD', '14')),
-            atr_multiplier=float(os.getenv('ATR_MULTIPLIER', '2.0')),
+            atr_multiplier=float(os.getenv('ATR_MULTIPLIER', '1.5')),
             atr_timeframe=os.getenv('ATR_TIMEFRAME', 'H4')
         )
         
@@ -87,9 +87,11 @@ class TradingConfig:
             check_symbol_session=os.getenv('CHECK_SYMBOL_SESSION', 'true').lower() == 'true',
             wait_for_session=os.getenv('WAIT_FOR_SESSION', 'false').lower() == 'true',
             session_wait_timeout_minutes=int(os.getenv('SESSION_WAIT_TIMEOUT_MINUTES', '30')),
-            session_check_interval_seconds=int(os.getenv('SESSION_CHECK_INTERVAL_SECONDS', '60'))
+            session_check_interval_seconds=int(os.getenv('SESSION_CHECK_INTERVAL_SECONDS', '60')),
+            close_positions_before_session_end=os.getenv('CLOSE_POSITIONS_BEFORE_SESSION_END', 'false').lower() == 'true',
+            close_positions_minutes_before_end=int(os.getenv('CLOSE_POSITIONS_MINUTES_BEFORE_END', '10'))
         )
-        
+
         # Advanced settings
         self.advanced = AdvancedConfig(
             use_breakeven=os.getenv('USE_BREAKEVEN', 'true').lower() == 'true',

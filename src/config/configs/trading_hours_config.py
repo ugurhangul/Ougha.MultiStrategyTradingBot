@@ -17,3 +17,7 @@ class TradingHoursConfig:
     session_wait_timeout_minutes: int = 30  # Max time to wait for each symbol's session (0 = wait indefinitely)
     session_check_interval_seconds: int = 60  # How often to check session status while waiting
 
+    # Automatic position closure near session end
+    close_positions_before_session_end: bool = False  # Close open positions shortly before session end
+    close_positions_minutes_before_end: int = 10  # Minutes before session end to start closing positions
+
