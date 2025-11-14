@@ -223,27 +223,24 @@ class BaseStrategy(ABC):
 
         Args:
             direction: PositionType enum representing the direction of the trade (BUY or SELL)
+                      Note: Direction is not included in the comment as it's already visible in MT5
 
         Returns:
             Formatted comment string (max 31 characters for MT5)
 
-        Format: "{strategy}|{range_id}|{direction}|{confirmations}"
+        Format: "{strategy}|{range_id}|{confirmations}" for TB/FB or "{strategy}|{confirmations}" for HFT
         Examples:
-            - "TB|15M_1M|sell|N" - True Breakout SELL, 15M/1M range, no confirmations
-            - "FB|4H_5M|buy|V" - False Breakout BUY, 4H/5M range, volume confirmation
-            - "HFT|buy|MV" - HFT Momentum BUY, momentum+volume (no range)
+            - "TB|15M_1M|BV" - True Breakout, 15M/1M range, breakout volume confirmation
+            - "FB|4H_5M|RT" - False Breakout, 4H/5M range, retest confirmation
+            - "HFT|MV" - HFT Momentum, momentum+volume confirmations
         """
-
-        # Extract direction value from enum and convert to lowercase
-        direction_str = direction.value if isinstance(direction, PositionType) else str(direction)
-        direction_str = direction_str.lower()
 
         # Build comment based on strategy type
         # self.key format for TB/FB: "TB|15M_1M" or "FB|4H_5M"
         # self.key format for HFT: "HFT"
         confirmations = self.get_validations_for_comment()
 
-        comment = f"{self.key}|{direction_str}|{confirmations}"
+        comment = f"{self.key}|{confirmations}"
 
         # MT5 has a 31 character limit for comments
         if len(comment) > 31:

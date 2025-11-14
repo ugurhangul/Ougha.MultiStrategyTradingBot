@@ -264,7 +264,7 @@ class MultiStrategyOrchestrator:
             return
 
         # Parse comment using CommentParser for robust parsing
-        # Comment format: "TB|15M_1M|sell|N" or "FB|4H_5M|buy|V" or "HFT|buy|MV"
+        # Comment format: "TB|15M_1M|BV" or "FB|4H_5M|RT" or "HFT|MV"
         parsed = CommentParser.parse(comment)
 
         if parsed is None:

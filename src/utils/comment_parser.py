@@ -2,8 +2,10 @@
 Trade Comment Parser Utility
 
 Provides utilities for parsing and generating trade comment strings.
-Comment format: "{strategy}|{range_id}|{direction}|{confirmations}"
-Example: "TB|15M_1M|sell|N" or "FB|4H_5M|buy|V" or "HFT|buy|MV"
+Comment format: "{strategy}|{range_id}|{confirmations}" for TB/FB or "{strategy}|{confirmations}" for HFT
+Example: "TB|15M_1M|BV" or "FB|4H_5M|RT" or "HFT|MV"
+
+Note: Direction is not included in comments as it's already visible in MT5 position type.
 
 This eliminates duplication in comment parsing logic across the codebase.
 """
@@ -20,8 +22,8 @@ from src.constants import (
 class ParsedComment:
     """Parsed trade comment information."""
     strategy_type: str  # "TB", "FB", or "HFT"
-    direction: str  # "buy" or "sell" (lowercase)
-    confirmations: str  # "V", "D", "VD", "N", "MV", etc.
+    direction: str  # "buy" or "sell" (lowercase) - deprecated, kept for backward compatibility
+    confirmations: str  # "BV", "RT", "CV", "MV", etc.
     range_id: str  # "4H_5M", "15M_1M" (with underscores), or empty string for HFT
 
     @property
@@ -91,16 +93,17 @@ class CommentParser:
     """
     Utility for parsing and generating trade comment strings.
 
-    Comment format: "{strategy}|{range_id}|{direction}|{confirmations}"
+    Comment format: "{strategy}|{range_id}|{confirmations}" for TB/FB or "{strategy}|{confirmations}" for HFT
     - strategy: "TB" (True Breakout), "FB" (False Breakout), or "HFT" (HFT Momentum)
     - range_id: Range identifier with underscores (e.g., "4H_5M", "15M_1M"), omitted for HFT
-    - direction: "buy" or "sell" (lowercase)
-    - confirmations: "V" (volume), "D" (divergence), "VD" (both), "N" (none)
+    - confirmations: "BV" (breakout volume), "RT" (retest), "CV" (continuation volume), "MV" (momentum+volume), etc.
 
     Examples:
-    - "TB|15M_1M|sell|N" - True Breakout SELL with no confirmations, 15M/1M range
-    - "FB|4H_5M|buy|V" - False Breakout BUY with volume confirmation, 4H/5M range
-    - "HFT|buy|MV" - HFT Momentum BUY with momentum+volume (no range_id)
+    - "TB|15M_1M|BV" - True Breakout, 15M/1M range, breakout volume confirmation
+    - "FB|4H_5M|RT" - False Breakout, 4H/5M range, retest confirmation
+    - "HFT|MV" - HFT Momentum with momentum+volume (no range_id)
+
+    Note: Direction is not included as it's already visible in MT5 position type.
     """
 
     @staticmethod
@@ -108,9 +111,13 @@ class CommentParser:
         """
         Parse a trade comment string.
 
-        Format: "{strategy}|{range_id}|{direction}|{confirmations}"
+        New Format (without direction):
+        - For TB/FB: "TB|15M_1M|BV" (3 parts: strategy|range_id|confirmations)
+        - For HFT: "HFT|MV" (2 parts: strategy|confirmations, no range_id)
+
+        Legacy Format (with direction - for backward compatibility):
         - For TB/FB: "TB|15M_1M|sell|N" (4 parts)
-        - For HFT: "HFT|buy|MV" (3 parts, no range_id)
+        - For HFT: "HFT|buy|MV" (3 parts)
 
         Args:
             comment: Comment string to parse
@@ -122,7 +129,7 @@ class CommentParser:
             return None
 
         parts = comment.split('|')
-        if len(parts) < 3:
+        if len(parts) < 2:
             return None
 
         strategy_type = parts[0]
@@ -131,28 +138,37 @@ class CommentParser:
         if strategy_type not in [STRATEGY_TYPE_TRUE_BREAKOUT, STRATEGY_TYPE_FALSE_BREAKOUT, STRATEGY_TYPE_HFT_MOMENTUM]:
             return None
 
-        # HFT has 3 parts: strategy|direction|confirmations (no range_id)
-        # TB/FB have 4 parts: strategy|range_id|direction|confirmations
+        # New format (without direction)
         if strategy_type == STRATEGY_TYPE_HFT_MOMENTUM:
-            # HFT format: HFT|buy|MV
-            if len(parts) != 3:
+            # HFT new format: HFT|MV (2 parts)
+            # HFT legacy format: HFT|buy|MV (3 parts)
+            if len(parts) == 2:
+                # New format
+                confirmations = parts[1]
+                range_id = ""
+                direction = ""  # Not used in new format
+            elif len(parts) == 3:
+                # Legacy format with direction
+                direction = parts[1].lower()
+                confirmations = parts[2]
+                range_id = ""
+            else:
                 return None
-
-            direction = parts[1].lower()  # Normalize to lowercase
-            confirmations = parts[2]
-            range_id = ""
         else:
-            # TB/FB format: TB|15M_1M|sell|N
-            if len(parts) != 4:
+            # TB/FB new format: TB|15M_1M|BV (3 parts)
+            # TB/FB legacy format: TB|15M_1M|sell|N (4 parts)
+            if len(parts) == 3:
+                # New format
+                range_id = parts[1]
+                confirmations = parts[2]
+                direction = ""  # Not used in new format
+            elif len(parts) == 4:
+                # Legacy format with direction
+                range_id = parts[1]
+                direction = parts[2].lower()
+                confirmations = parts[3]
+            else:
                 return None
-
-            range_id = parts[1]
-            direction = parts[2].lower()  # Normalize to lowercase
-            confirmations = parts[3]
-
-        # Validate direction (case-insensitive, normalize to lowercase)
-        if direction not in ["buy", "sell"]:
-            return None
 
         return ParsedComment(
             strategy_type=strategy_type,

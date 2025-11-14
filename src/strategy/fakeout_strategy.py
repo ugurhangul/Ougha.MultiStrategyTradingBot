@@ -117,7 +117,7 @@ class FakeoutStrategy(BaseStrategy):
             self._validation_methods.append("_check_divergence_confirmation")
 
         # All validations must pass (AND logic)
-        self._validation_mode = "any"
+        self._validation_mode = "all"
 
         # Configure validation abbreviations for trade comments
         # Maps validation method names to short codes (for MT5 31-char limit)
@@ -722,55 +722,87 @@ class FakeoutStrategy(BaseStrategy):
 
         # === FALSE SELL: Check for reversal and confirmation ===
         if self.state.false_sell_qualified:
+            breakout_time = self.state.breakout_above_time
+
             # First check for reversal (price back into range)
             if not self.state.false_sell_reversal_detected:
+                # Ensure reversal happens on a later candle than the breakout
+                if breakout_time and candle.time <= breakout_time:
+                    return None
+
                 if candle.close < candle_ref.high:
                     self.state.false_sell_reversal_detected = True
                     self.state.false_sell_reversal_ok = True
+                    self.state.false_sell_reversal_time = candle.time
                     self.logger.info(f">>> FALSE SELL REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
-                    # CRITICAL FIX: Return early to wait for next candle before checking confirmation
-                    # This prevents executing trade on the same candle that detected the reversal
+                    # Return early to wait for next candle before checking confirmation
                     return None
 
-            # After reversal detected on previous candle, check for confirmation on current candle
-            if not self.state.false_sell_confirmation_detected:
+            # After reversal detected on a previous candle, check for confirmation
+            if self.state.false_sell_reversal_detected and not self.state.false_sell_confirmation_detected:
+                reversal_time = self.state.false_sell_reversal_time
+
+                # Ensure confirmation happens after the reversal candle
+                if reversal_time and candle.time <= reversal_time:
+                    return None
+
                 if candle.close < candle_ref.high:
                     self.state.false_sell_confirmation_detected = True
                     self.state.false_sell_confirmation_volume = candle.volume
 
-                    # Check confirmation volume (tracked but not required)
+                    # Check confirmation volume
                     confirmation_volume_ok = self._is_reversal_volume_high(candle.volume)
                     self.state.false_sell_confirmation_volume_ok = confirmation_volume_ok
+                    self.state.false_sell_confirmation_time = candle.time
 
                     vol_status = "✓" if confirmation_volume_ok else "✗"
-                    self.logger.info(f">>> FALSE SELL CONFIRMATION DETECTED [{self.config.range_config.range_id}] (Conf Vol {vol_status}) <<<", self.symbol)
+                    self.logger.info(
+                        f">>> FALSE SELL CONFIRMATION DETECTED [{self.config.range_config.range_id}] (Conf Vol {vol_status}) <<<",
+                        self.symbol,
+                    )
                     self.logger.info(f"*** FALSE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
                     return self._generate_sell_signal(candle)
 
         # === FALSE BUY: Check for reversal and confirmation ===
         if self.state.false_buy_qualified:
+            breakout_time = self.state.breakout_below_time
+
             # First check for reversal (price back into range)
             if not self.state.false_buy_reversal_detected:
+                # Ensure reversal happens on a later candle than the breakout
+                if breakout_time and candle.time <= breakout_time:
+                    return None
+
                 if candle.close > candle_ref.low:
                     self.state.false_buy_reversal_detected = True
                     self.state.false_buy_reversal_ok = True
+                    self.state.false_buy_reversal_time = candle.time
                     self.logger.info(f">>> FALSE BUY REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
-                    # CRITICAL FIX: Return early to wait for next candle before checking confirmation
-                    # This prevents executing trade on the same candle that detected the reversal
+                    # Return early to wait for next candle before checking confirmation
                     return None
 
-            # After reversal detected on previous candle, check for confirmation on current candle
-            if not self.state.false_buy_confirmation_detected:
+            # After reversal detected on a previous candle, check for confirmation
+            if self.state.false_buy_reversal_detected and not self.state.false_buy_confirmation_detected:
+                reversal_time = self.state.false_buy_reversal_time
+
+                # Ensure confirmation happens after the reversal candle
+                if reversal_time and candle.time <= reversal_time:
+                    return None
+
                 if candle.close > candle_ref.low:
                     self.state.false_buy_confirmation_detected = True
                     self.state.false_buy_confirmation_volume = candle.volume
 
-                    # Check confirmation volume (tracked but not required)
+                    # Check confirmation volume
                     confirmation_volume_ok = self._is_reversal_volume_high(candle.volume)
                     self.state.false_buy_confirmation_volume_ok = confirmation_volume_ok
+                    self.state.false_buy_confirmation_time = candle.time
 
                     vol_status = "✓" if confirmation_volume_ok else "✗"
-                    self.logger.info(f">>> FALSE BUY CONFIRMATION DETECTED [{self.config.range_config.range_id}] (Conf Vol {vol_status}) <<<", self.symbol)
+                    self.logger.info(
+                        f">>> FALSE BUY CONFIRMATION DETECTED [{self.config.range_config.range_id}] (Conf Vol {vol_status}) <<<",
+                        self.symbol,
+                    )
 
                     self.logger.info(f"*** FALSE BUY SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
                     return self._generate_buy_signal(candle)
@@ -882,7 +914,7 @@ class FakeoutStrategy(BaseStrategy):
 
     def _check_reversal_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
-        Check if reversal/confirmation volume is acceptable (tracked but not strictly required).
+        Check if reversal/confirmation volume meets configured requirements.
 
         Args:
             signal_data: Dictionary containing:
@@ -897,7 +929,7 @@ class FakeoutStrategy(BaseStrategy):
 
         if reversal_volume <= 0:
             return ValidationResult(
-                passed=True,  # Skip check if no volume data (not strictly required)
+                passed=True,  # Skip check if no volume data
                 method_name="_check_reversal_volume",
                 reason="No reversal volume data available, skipping"
             )
@@ -916,11 +948,10 @@ class FakeoutStrategy(BaseStrategy):
 
         direction_str = "BUY" if signal_direction > 0 else "SELL"
 
-        # Reversal volume is tracked but not required - always pass but log status
         return ValidationResult(
-            passed=True,  # Always pass (tracked but not required)
+            passed=volume_ok,
             method_name="_check_reversal_volume",
-            reason=f"Reversal volume for {direction_str} {'meets' if volume_ok else 'does not meet'} threshold (vol={reversal_volume:.0f}) [tracked only]"
+            reason=f"Reversal volume for {direction_str} {'meets' if volume_ok else 'does not meet'} threshold (vol={reversal_volume:.0f})"
         )
 
     def _check_divergence_confirmation(self, signal_data: Dict[str, Any]) -> ValidationResult:

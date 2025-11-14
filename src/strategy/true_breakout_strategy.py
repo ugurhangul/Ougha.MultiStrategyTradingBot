@@ -114,7 +114,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             "_check_continuation_volume"
         ]
         # All validations must pass (AND logic)
-        self._validation_mode = "any"
+        self._validation_mode = "all"
 
         # Configure validation abbreviations for trade comments
         # Maps validation method names to short codes (for MT5 31-char limit)
@@ -749,9 +749,13 @@ class TrueBreakoutStrategy(BaseStrategy):
         if self.state.true_buy_qualified:
             # First check for retest (pullback to reference high)
             if not self.state.true_buy_retest_detected:
-                # Get symbol-specific retest tolerance
-                retest_tolerance = self.symbol_params.retest_range_percent if self.symbol_params else RETEST_RANGE_PERCENT
-                retest_range = candle_ref.high * retest_tolerance
+                # Ensure retest happens on a later candle than the breakout
+                breakout_time = self.state.breakout_above_time
+                if breakout_time and candle.time <= breakout_time:
+                    return None
+
+                # Calculate intelligent retest tolerance (handles high-value instruments)
+                retest_range = self._calculate_retest_tolerance(candle_ref.high)
 
                 # Check if candle touched or came close to the reference high
                 # For bullish retest: check if candle's LOW touched the level (wick check)
@@ -770,6 +774,10 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_buy_retest_ok = True
                     vol_status = "✓" if retest_volume_ok else "✗"
                     self.logger.info(f">>> TRUE BUY RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol)
+                    self.logger.info(f"Candle Low: {candle.low:.5f} | Close: {candle.close:.5f}", self.symbol)
+                    self.logger.info(f"Reference High: {candle_ref.high:.5f}", self.symbol)
+                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol)
+                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol)
                     return None
 
             # After retest detected on previous candle, check for continuation on current candle
@@ -792,9 +800,13 @@ class TrueBreakoutStrategy(BaseStrategy):
         if self.state.true_sell_qualified:
             # First check for retest (pullback to reference low)
             if not self.state.true_sell_retest_detected:
-                # Get symbol-specific retest tolerance
-                retest_tolerance = self.symbol_params.retest_range_percent if self.symbol_params else RETEST_RANGE_PERCENT
-                retest_range = candle_ref.low * retest_tolerance
+                # Ensure retest happens on a later candle than the breakout
+                breakout_time = self.state.breakout_below_time
+                if breakout_time and candle.time <= breakout_time:
+                    return None
+
+                # Calculate intelligent retest tolerance (handles high-value instruments)
+                retest_range = self._calculate_retest_tolerance(candle_ref.low)
 
                 # Check if candle touched or came close to the reference low
                 # For bearish retest: check if candle's HIGH touched the level (wick check)
@@ -815,7 +827,7 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.logger.info(f">>> TRUE SELL RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol)
                     self.logger.info(f"Candle High: {candle.high:.5f} | Close: {candle.close:.5f}", self.symbol)
                     self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol)
-                    self.logger.info(f"Retest Tolerance: {retest_tolerance:.5f} ({retest_tolerance*100:.3f}%)", self.symbol)
+                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol)
                     self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol)
                     # CRITICAL FIX: Return early to wait for next candle before checking continuation
                     # This prevents executing trade on the same candle that detected the retest
@@ -841,6 +853,91 @@ class TrueBreakoutStrategy(BaseStrategy):
                     return self._generate_sell_signal(candle)
 
         return None
+
+    def _calculate_retest_tolerance(self, reference_price: float) -> float:
+        """
+        Calculate intelligent retest tolerance based on symbol parameters and price scale.
+
+        This method solves the issue where percentage-based tolerance creates
+        inappropriately large zones for high-value instruments (e.g., BTCJPY at 14M).
+
+        Modes:
+        - 'percent': Force percentage-based tolerance (good for forex)
+        - 'points': Force absolute point-based tolerance (good for crypto)
+        - 'auto': Intelligently choose based on price scale
+
+        Args:
+            reference_price: The breakout level price
+
+        Returns:
+            Absolute tolerance value in price units
+
+        Example:
+            For BTCJPY at 14,611,144:
+            - Old way: 0.5% = 73,056 points (TOO LARGE!)
+            - New way: 20,000 points (reasonable)
+        """
+        if not self.symbol_params:
+            # Fallback to legacy percentage-based
+            return reference_price * RETEST_RANGE_PERCENT
+
+        mode = self.symbol_params.retest_tolerance_mode
+
+        # Force percentage mode
+        if mode == 'percent':
+            tolerance = reference_price * self.symbol_params.retest_range_percent
+            self.logger.debug(
+                f"Retest tolerance (percent mode): {tolerance:.2f} "
+                f"({self.symbol_params.retest_range_percent*100:.3f}% of {reference_price:.2f})",
+                self.symbol
+            )
+            return tolerance
+
+        # Force points mode
+        if mode == 'points':
+            tolerance = self.symbol_params.retest_range_points
+            self.logger.debug(
+                f"Retest tolerance (points mode): {tolerance:.2f} points",
+                self.symbol
+            )
+            return tolerance
+
+        # Auto mode: Intelligent selection based on price scale
+        # Strategy: Use percentage for low-value instruments, but cap the absolute value
+        # to prevent huge tolerance zones on high-value instruments
+
+        # Calculate percentage-based tolerance
+        pct_tolerance = reference_price * self.symbol_params.retest_range_percent
+
+        # For high-value instruments (price > 1000), cap at configured points
+        if reference_price > 1000.0 and self.symbol_params.retest_range_points > 0:
+            # Use the SMALLER of: percentage-based OR fixed points
+            # This prevents huge zones on crypto like BTCJPY while allowing
+            # reasonable zones on ETHUSD
+            tolerance = min(pct_tolerance, self.symbol_params.retest_range_points)
+
+            if tolerance == self.symbol_params.retest_range_points:
+                self.logger.debug(
+                    f"Retest tolerance (auto→capped): {tolerance:.2f} points "
+                    f"(capped from {pct_tolerance:.2f}, price {reference_price:.2f})",
+                    self.symbol
+                )
+            else:
+                self.logger.debug(
+                    f"Retest tolerance (auto→percent): {tolerance:.2f} "
+                    f"({self.symbol_params.retest_range_percent*100:.3f}% of {reference_price:.2f})",
+                    self.symbol
+                )
+        else:
+            # Low-value instrument - use percentage
+            tolerance = pct_tolerance
+            self.logger.debug(
+                f"Retest tolerance (auto→percent): {tolerance:.2f} "
+                f"({self.symbol_params.retest_range_percent*100:.3f}% of {reference_price:.2f})",
+                self.symbol
+            )
+
+        return tolerance
 
     def _is_continuation_volume_high(self, continuation_volume: int) -> bool:
         """Check if continuation volume is high (tracked but not required)."""
@@ -952,7 +1049,7 @@ class TrueBreakoutStrategy(BaseStrategy):
 
     def _check_continuation_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
-        Check if continuation volume is acceptable (tracked but not strictly required).
+        Check if continuation volume meets configured requirements.
 
         Args:
             signal_data: Dictionary containing:
@@ -967,7 +1064,7 @@ class TrueBreakoutStrategy(BaseStrategy):
 
         if continuation_volume <= 0:
             return ValidationResult(
-                passed=True,  # Skip check if no volume data (not strictly required)
+                passed=True,  # Skip check if no volume data
                 method_name="_check_continuation_volume",
                 reason="No continuation volume data available, skipping"
             )
@@ -986,11 +1083,10 @@ class TrueBreakoutStrategy(BaseStrategy):
 
         direction_str = "BUY" if signal_direction > 0 else "SELL"
 
-        # Continuation volume is tracked but not required - always pass but log status
         return ValidationResult(
-            passed=True,  # Always pass (tracked but not required)
+            passed=volume_ok,
             method_name="_check_continuation_volume",
-            reason=f"Continuation volume for {direction_str} {'meets' if volume_ok else 'does not meet'} threshold (vol={continuation_volume:.0f}) [tracked only]"
+            reason=f"Continuation volume for {direction_str} {'meets' if volume_ok else 'does not meet'} threshold (vol={continuation_volume:.0f})"
         )
 
     def _generate_buy_signal(self, candle: CandleData) -> Optional[TradeSignal]:

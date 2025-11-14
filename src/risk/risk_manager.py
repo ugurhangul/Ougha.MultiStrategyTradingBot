@@ -436,7 +436,7 @@ class RiskManager:
                     # Check if position type matches
                     persisted_type = PositionType(pos_data['position_type'])
                     if persisted_type == position_type:
-                        # Extract strategy type from comment (format: "TB|BUY|V|4H5M")
+                        # Extract strategy type from comment (new format: "TB|15M_1M|BV" or "HFT|MV")
                         comment = pos_data.get('comment', '')
                         parts = comment.split('|') if '|' in comment else []
                         persisted_strategy = parts[0] if len(parts) > 0 else ''
@@ -456,7 +456,7 @@ class RiskManager:
             # Filter by symbol, position type, and strategy
             for pos in positions:
                 if pos.symbol == symbol and pos.position_type == position_type:
-                    # Extract strategy type from comment (format: "TB|BUY|V|4H5M")
+                    # Extract strategy type from comment (new format: "TB|15M_1M|BV" or "HFT|MV")
                     parts = pos.comment.split('|') if '|' in pos.comment else []
                     comment_strategy = parts[0] if len(parts) > 0 else ''
 

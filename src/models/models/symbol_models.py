@@ -30,6 +30,9 @@ class SymbolParameters:
 
     # True breakout retest parameters
     retest_range_percent: float = 0.0015  # Retest tolerance as percentage (0.15% default)
+    retest_range_points: float = 0.0  # Retest tolerance in absolute points (0 = use percentage)
+    # Tolerance mode: 'auto' (intelligent selection), 'percent' (force %), 'points' (force absolute)
+    retest_tolerance_mode: str = 'auto'
 
     # Divergence parameters
     rsi_period: int = 14

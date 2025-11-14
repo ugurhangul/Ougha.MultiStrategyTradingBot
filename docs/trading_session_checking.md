@@ -41,19 +41,22 @@ For each symbol:
 2. **Skip Immediately**: Symbol is skipped without waiting
 3. **Continue**: Bot proceeds to check next symbol
 
-### 4. Optional Waiting Mechanism
+### 4. Background Monitoring for Inactive Symbols
 
-**If enabled (`WAIT_FOR_SESSION=true`)**, the bot can wait for inactive symbols:
+**If enabled (`WAIT_FOR_SESSION=true`)**, the bot uses **non-blocking background monitoring**:
 
-1. **Log Status**: Record that symbol is waiting for session
-2. **Periodic Checks**: Check session status every N seconds (configurable)
-3. **Status Updates**: Log progress every 5 checks
-4. **Timeout Handling**:
-   - If timeout is set (>0): Skip symbol after timeout expires
-   - If timeout is 0: Wait indefinitely until session becomes active
-5. **Initialization**: Once session is active, initialize the symbol
+1. **Active Symbols**: Initialize and start trading immediately
+2. **Inactive Symbols**: Start background monitoring threads (one per symbol)
+3. **Background Monitoring**: Each thread independently waits for its symbol's session
+4. **Periodic Checks**: Check session status every N seconds (configurable)
+5. **Status Updates**: Log progress every 5 checks
+6. **Timeout Handling**:
+   - If timeout is set (>0): Stop monitoring after timeout expires
+   - If timeout is 0: Monitor indefinitely until session becomes active
+7. **Auto-Initialization**: When session becomes active, automatically initialize and start trading
+8. **No Blocking**: Active symbols trade while inactive symbols are monitored in background
 
-**Note**: Waiting is **not recommended** as it can delay bot startup significantly.
+**Key Advantage**: The bot starts trading immediately with active symbols while continuously monitoring inactive symbols in the background. When an inactive symbol's session starts, it's automatically added to the trading pool without any manual intervention.
 
 ## Configuration
 
@@ -116,7 +119,7 @@ Result:
 Bot starts trading with only EURUSD
 ```
 
-### Scenario 3: Some Symbols Inactive (Wait Enabled - Not Recommended)
+### Scenario 3: Some Symbols Inactive (Background Monitoring Enabled)
 
 ```
 Symbols: EURUSD, XAUUSD, BTCUSD
@@ -124,18 +127,22 @@ Status: EURUSD active, XAUUSD inactive, BTCUSD inactive
 Config: WAIT_FOR_SESSION=true
 
 Result:
-✓ EURUSD: In active trading session → Initialize immediately
-✗ XAUUSD: NOT in active trading session → Wait for session
-✗ BTCUSD: NOT in active trading session → Wait for session
+✓ EURUSD: In active trading session → Initialize immediately and start trading
+✗ XAUUSD: NOT in active trading session → Start background monitor
+✗ BTCUSD: NOT in active trading session → Start background monitor
 
+Bot starts trading EURUSD immediately (no delay!)
+
+[Background Thread for XAUUSD]
 Waiting for XAUUSD to enter active trading session...
 [After 5 minutes] Still waiting for XAUUSD trading session...
-[After 10 minutes] ✓ XAUUSD is now in active trading session → Initialize
+[After 10 minutes] ✓ XAUUSD is now in active trading session → Initialize and start trading
 
+[Background Thread for BTCUSD]
 Waiting for BTCUSD to enter active trading session...
-[After 30 minutes] Timeout waiting for BTCUSD trading session → Skip
+[After 30 minutes] Timeout waiting for BTCUSD trading session → Stop monitoring
 
-Note: This can significantly delay bot startup!
+Note: Active symbols trade immediately while inactive symbols are monitored in background!
 ```
 
 ### Scenario 4: Session Checking Disabled
@@ -154,7 +161,9 @@ Result:
 2. **Reduces Errors**: Eliminates errors from stale or missing tick data
 3. **Improves Reliability**: Ensures bot only trades when markets are active
 4. **Flexible Configuration**: Can be enabled/disabled per deployment
-5. **Smart Waiting**: Automatically waits for markets to open instead of failing
+5. **Non-Blocking Background Monitoring**: Active symbols trade immediately while inactive symbols are monitored
+6. **Automatic Symbol Addition**: Inactive symbols are automatically added when their sessions start
+7. **No Manual Intervention**: Fully automated session monitoring and symbol initialization
 
 ## Technical Details
 

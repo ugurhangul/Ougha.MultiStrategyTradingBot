@@ -37,12 +37,14 @@ The position limit check has been integrated into the order execution flow by:
 
 ### 2. Comment Parsing Logic
 
-Signal comments follow the format: `"STRATEGY|RANGE_ID|DIRECTION|VALIDATIONS"`
+Signal comments follow the format: `"STRATEGY|RANGE_ID|VALIDATIONS"` for TB/FB or `"STRATEGY|VALIDATIONS"` for HFT
+
+**Note:** Direction is not included in comments as it's already visible in MT5 position type (Buy/Sell).
 
 **Examples:**
-- `"HFT|buy|MV"` → strategy="HFT", range=None, direction="buy"
-- `"TB|15M_1M|sell|N"` → strategy="TB", range="15M_1M", direction="sell"
-- `"FB|4H_5M|buy|V"` → strategy="FB", range="4H_5M", direction="buy"
+- `"HFT|MV"` → strategy="HFT", range=None, confirmations="MV" (momentum+volume)
+- `"TB|15M_1M|BV"` → strategy="TB", range="15M_1M", confirmations="BV" (breakout volume)
+- `"FB|4H_5M|RT"` → strategy="FB", range="4H_5M", confirmations="RT" (retest)
 
 **Parsing Code:**
 ```python
@@ -53,7 +55,7 @@ if signal.comment:
     if parsed:
         strategy_type = parsed.strategy_type  # "HFT", "TB", "FB"
         range_id = parsed.range_id if parsed.range_id else None  # "15M_1M", "4H_5M", or None
-        direction = parsed.direction  # "buy" or "sell"
+        confirmations = parsed.confirmations  # "BV", "RT", "CV", "MV", etc.
 ```
 
 ### 3. Position Limit Check Flow

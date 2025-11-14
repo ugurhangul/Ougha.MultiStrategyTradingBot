@@ -30,6 +30,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.0, lowered to reduce rejections
             continuation_volume_min=1.3,   # Was 1.5, lowered for consistency
             retest_range_percent=0.0015,  # 0.15% - Major pairs moderate volatility
+            retest_range_points=0.0,  # Use percentage for forex
+            retest_tolerance_mode='percent',  # Force percentage-based for forex
             volume_average_period=20,
             rsi_period=14,
             macd_fast=12,
@@ -59,6 +61,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.2, lowered significantly
             continuation_volume_min=1.3,   # Was 1.6, lowered
             retest_range_percent=0.0020,  # 0.20% - Minor pairs higher volatility
+            retest_range_points=0.0,  # Use percentage for forex
+            retest_tolerance_mode='percent',  # Force percentage-based for forex
             volume_average_period=25,
             rsi_period=14,
             macd_fast=12,
@@ -88,6 +92,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.4,  # Was 2.8, lowered significantly
             continuation_volume_min=1.2,   # Was 1.8, lowered
             retest_range_percent=0.0030,  # 0.30% - Exotic pairs very high volatility
+            retest_range_points=0.0,  # Use percentage for forex
+            retest_tolerance_mode='percent',  # Force percentage-based for forex
             volume_average_period=30,
             rsi_period=14,
             macd_fast=12,
@@ -117,6 +123,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.5, lowered significantly
             continuation_volume_min=1.3,   # Was 1.7, lowered
             retest_range_percent=0.0025,  # 0.25% - Metals high volatility
+            retest_range_points=0.0,  # Use auto mode (will choose based on price scale)
+            retest_tolerance_mode='auto',  # Auto-detect best mode
             volume_average_period=20,
             rsi_period=14,
             macd_fast=12,
@@ -146,6 +154,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.5, lowered significantly
             continuation_volume_min=1.3,   # Was 1.8, lowered
             retest_range_percent=0.0020,  # 0.20% - Indices moderate-high volatility
+            retest_range_points=500.0,  # 500 points - Appropriate for indices (e.g., SPX ~4000)
+            retest_tolerance_mode='auto',  # Auto-detect best mode
             volume_average_period=25,
             rsi_period=14,
             macd_fast=12,
@@ -174,7 +184,9 @@ class SymbolParametersRepository:
             reversal_volume_min=1.4,   # Was 3.0, lowered significantly
             true_breakout_volume_min=1.4,  # Was 3.5, lowered significantly
             continuation_volume_min=1.2,   # Was 2.0, lowered
-            retest_range_percent=0.0050,  # 0.50% - Crypto extreme volatility
+            retest_range_percent=0.0015,  # 0.15% - Used for low-value crypto (XRPUSD, etc.)
+            retest_range_points=20000.0,  # 20,000 points - Used for high-value crypto (BTCJPY ~14M)
+            retest_tolerance_mode='auto',  # Auto-detect: price>1000 uses points, else uses %
             volume_average_period=30,
             rsi_period=14,
             macd_fast=12,
@@ -204,6 +216,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.6, lowered significantly
             continuation_volume_min=1.3,   # Was 1.8, lowered
             retest_range_percent=0.0030,  # 0.30% - Commodities high volatility
+            retest_range_points=0.0,  # Use auto mode (will choose based on price scale)
+            retest_tolerance_mode='auto',  # Auto-detect best mode
             volume_average_period=25,
             rsi_period=14,
             macd_fast=12,
@@ -233,6 +247,8 @@ class SymbolParametersRepository:
             true_breakout_volume_min=1.5,  # Was 2.5, lowered significantly
             continuation_volume_min=1.3,   # Was 1.8, lowered
             retest_range_percent=0.0025,  # 0.25% - Stocks moderate-high volatility
+            retest_range_points=0.0,  # Use auto mode (will choose based on price scale)
+            retest_tolerance_mode='auto',  # Auto-detect best mode
             volume_average_period=25,
             rsi_period=14,
             macd_fast=12,

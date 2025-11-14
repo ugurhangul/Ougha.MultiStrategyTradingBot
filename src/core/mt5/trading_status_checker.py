@@ -3,7 +3,7 @@ MT5 trading status checker.
 """
 
 import MetaTrader5 as mt5
-from typing import Optional
+from typing import Optional, Dict, Tuple
 from datetime import datetime, timezone
 
 from src.utils.logging import TradingLogger
@@ -24,6 +24,10 @@ class TradingStatusChecker:
         self.connection_manager = connection_manager
         self.symbol_cache = symbol_cache
         self.logger = logger
+
+        # Session state cache: symbol -> (is_in_session, last_check_time, consecutive_closed_count)
+        # This reduces repeated logging for symbols that are consistently closed
+        self._session_state_cache: Dict[str, Tuple[bool, datetime, int]] = {}
 
     def is_autotrading_enabled(self) -> bool:
         """
@@ -122,6 +126,9 @@ class TradingStatusChecker:
         - Recent tick data availability (market activity)
         - Tick freshness (not stale data)
 
+        Uses session state caching to reduce logging verbosity for symbols
+        that are consistently closed.
+
         Args:
             symbol: Symbol name
 
@@ -131,13 +138,13 @@ class TradingStatusChecker:
         try:
             # First check if trading is enabled for this symbol
             if not self.is_trading_enabled(symbol):
-                self.logger.debug(f"Trading is disabled for {symbol}", symbol)
+                self._update_session_cache(symbol, False, "Trading is disabled")
                 return False
 
             # Get current tick to check market activity
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
-                self.logger.debug(f"No tick data available for {symbol}", symbol)
+                self._update_session_cache(symbol, False, "No tick data available")
                 return False
 
             # Check if tick data is fresh (within last 60 seconds)
@@ -147,21 +154,83 @@ class TradingStatusChecker:
 
             # If tick is older than 60 seconds, market is likely closed
             if tick_age_seconds > 60:
-                self.logger.debug(
-                    f"Tick data is stale for {symbol} (age: {tick_age_seconds:.0f}s)",
-                    symbol
+                self._update_session_cache(
+                    symbol,
+                    False,
+                    f"Tick data is stale (age: {tick_age_seconds:.0f}s)"
                 )
                 return False
 
             # Check if bid and ask prices are valid (non-zero)
             if tick.bid <= 0 or tick.ask <= 0:
-                self.logger.debug(f"Invalid prices for {symbol} (bid: {tick.bid}, ask: {tick.ask})", symbol)
+                self._update_session_cache(
+                    symbol,
+                    False,
+                    f"Invalid prices (bid: {tick.bid}, ask: {tick.ask})"
+                )
                 return False
 
             # All checks passed - symbol is in active trading session
+            self._update_session_cache(symbol, True, "Session active")
             return True
 
         except Exception as e:
-            self.logger.debug(f"Error checking trading session for {symbol}: {e}", symbol)
+            self._update_session_cache(symbol, False, f"Error: {e}")
             return False
+
+    def _update_session_cache(self, symbol: str, is_in_session: bool, reason: str):
+        """
+        Update session state cache and log appropriately.
+
+        This method reduces logging verbosity by only logging:
+        - When session state changes (open -> closed or closed -> open)
+        - Every 10th consecutive check when market is closed
+
+        Args:
+            symbol: Symbol name
+            is_in_session: Whether symbol is in active trading session
+            reason: Reason for the session state
+        """
+        now = datetime.now(timezone.utc)
+
+        # Get previous state
+        if symbol in self._session_state_cache:
+            prev_in_session, last_check, consecutive_closed = self._session_state_cache[symbol]
+        else:
+            prev_in_session = None
+            last_check = now
+            consecutive_closed = 0
+
+        # Update consecutive closed count
+        if not is_in_session:
+            consecutive_closed += 1
+        else:
+            consecutive_closed = 0
+
+        # Update cache
+        self._session_state_cache[symbol] = (is_in_session, now, consecutive_closed)
+
+        # Determine if we should log
+        should_log = False
+        log_level = "debug"
+
+        if prev_in_session is None:
+            # First check for this symbol
+            should_log = True
+        elif prev_in_session != is_in_session:
+            # State changed
+            should_log = True
+            if is_in_session:
+                log_level = "info"  # Market opened - more important
+        elif not is_in_session and consecutive_closed % 10 == 0:
+            # Market still closed, log every 10th check to reduce spam
+            should_log = True
+            reason = f"{reason} (checked {consecutive_closed} times)"
+
+        # Log if needed
+        if should_log:
+            if log_level == "info":
+                self.logger.info(f"{symbol}: {reason}", symbol)
+            else:
+                self.logger.debug(f"{symbol}: {reason}", symbol)
 

@@ -110,8 +110,8 @@ class OrderExecutor:
         # Check position limits (1 position per strategy and direction)
         if self.risk_manager is not None:
             # Parse strategy type and range_id from signal comment
-            # Comment format: "STRATEGY|DIRECTION|VALIDATIONS|RANGE"
-            # Examples: "HFT|BUY|MV|" or "TB|SELL|V|4H5M"
+            # New comment format: "STRATEGY|RANGE_ID|VALIDATIONS" for TB/FB or "STRATEGY|VALIDATIONS" for HFT
+            # Examples: "HFT|MV" or "TB|15M_1M|BV" or "FB|4H_5M|RT"
             strategy_type = None
             range_id = None
 
@@ -119,8 +119,10 @@ class OrderExecutor:
                 parts = signal.comment.split('|')
                 if len(parts) > 0 and parts[0]:
                     strategy_type = parts[0]  # "HFT", "TB", "FB"
-                if len(parts) > 3:
-                    range_id = parts[3] if parts[3] else None  # "4H5M", "15M1M", or None for empty
+                # For TB/FB: parts[1] is range_id, parts[2] is confirmations
+                # For HFT: parts[1] is confirmations (no range_id)
+                if len(parts) >= 3 and strategy_type in ["TB", "FB"]:
+                    range_id = parts[1] if parts[1] else None  # "15M_1M", "4H_5M", etc.
 
             # Check if we can open a new position
             can_open, reason = self.risk_manager.can_open_new_position(

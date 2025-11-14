@@ -31,8 +31,10 @@ class UnifiedBreakoutState:
     false_buy_reversal_detected: bool = False  # Reversed back above
     false_buy_reversal_confirmed: bool = False  # Next candle confirmed reversal direction
     false_buy_reversal_volume: int = 0
+    false_buy_reversal_time: Optional[datetime] = None  # Time of reversal candle
     false_buy_confirmation_detected: bool = False  # Confirmation candle detected
     false_buy_confirmation_volume: int = 0  # Confirmation candle volume
+    false_buy_confirmation_time: Optional[datetime] = None  # Time of confirmation candle
     false_buy_volume_ok: bool = False  # Breakout volume was low (tracked, not required)
     false_buy_reversal_volume_ok: bool = False  # Reversal volume was high (tracked, not required)
     false_buy_confirmation_volume_ok: bool = False  # Confirmation volume was high (tracked, not required)
@@ -44,8 +46,10 @@ class UnifiedBreakoutState:
     false_sell_reversal_detected: bool = False  # Reversed back below
     false_sell_reversal_confirmed: bool = False  # Next candle confirmed reversal direction
     false_sell_reversal_volume: int = 0
+    false_sell_reversal_time: Optional[datetime] = None  # Time of reversal candle
     false_sell_confirmation_detected: bool = False  # Confirmation candle detected
     false_sell_confirmation_volume: int = 0  # Confirmation candle volume
+    false_sell_confirmation_time: Optional[datetime] = None  # Time of confirmation candle
     false_sell_volume_ok: bool = False  # Breakout volume was low (tracked, not required)
     false_sell_reversal_volume_ok: bool = False  # Reversal volume was high (tracked, not required)
     false_sell_confirmation_volume_ok: bool = False  # Confirmation volume was high (tracked, not required)
@@ -102,9 +106,15 @@ class UnifiedBreakoutState:
         self.true_buy_rejected = False
         self.false_sell_qualified = False
         self.false_sell_reversal_detected = False
+        self.false_sell_reversal_confirmed = False
         self.false_sell_reversal_volume = 0
+        self.false_sell_reversal_time = None
+        self.false_sell_confirmation_detected = False
+        self.false_sell_confirmation_volume = 0
+        self.false_sell_confirmation_time = None
         self.false_sell_volume_ok = False
         self.false_sell_reversal_volume_ok = False
+        self.false_sell_confirmation_volume_ok = False
         self.false_sell_divergence_ok = False
         self.false_sell_rejected = False
 
@@ -124,9 +134,15 @@ class UnifiedBreakoutState:
         self.true_sell_rejected = False
         self.false_buy_qualified = False
         self.false_buy_reversal_detected = False
+        self.false_buy_reversal_confirmed = False
         self.false_buy_reversal_volume = 0
+        self.false_buy_reversal_time = None
+        self.false_buy_confirmation_detected = False
+        self.false_buy_confirmation_volume = 0
+        self.false_buy_confirmation_time = None
         self.false_buy_volume_ok = False
         self.false_buy_reversal_volume_ok = False
+        self.false_buy_confirmation_volume_ok = False
         self.false_buy_divergence_ok = False
         self.false_buy_rejected = False
 
