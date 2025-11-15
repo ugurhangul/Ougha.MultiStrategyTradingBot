@@ -771,12 +771,6 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_sell_retest_ok = True
                     vol_status = "✓" if retest_volume_ok else "✗"
                     self.logger.info(f">>> TRUE SELL RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Candle High: {candle.high:.5f} | Close: {candle.close:.5f}", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol, strategy_key=self.key)
-                    # CRITICAL FIX: Return early to wait for next candle before checking continuation
-                    # This prevents executing trade on the same candle that detected the retest
                     return None
 
             # After retest detected on previous candle, check for continuation on current candle
@@ -791,10 +785,6 @@ class TrueBreakoutStrategy(BaseStrategy):
 
                     vol_status = "✓" if continuation_volume_ok else "✗"
                     self.logger.info(f">>> TRUE SELL CONTINUATION DETECTED [{self.config.range_config.range_id}] (Cont Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Breakout Close: {candle.close:.5f}", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol, strategy_key=self.key)
-                    self.logger.info(f"Continuation Volume: {candle.volume}", self.symbol, strategy_key=self.key)
-
                     self.logger.info(f"*** TRUE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol, strategy_key=self.key)
                     return self._generate_sell_signal(candle)
 

@@ -117,7 +117,7 @@ class TradingStatusChecker:
             self.logger.debug(f"Error checking market status for {symbol}: {e}")
             return False
 
-    def is_in_trading_session(self, symbol: str) -> bool:
+    def is_in_trading_session(self, symbol: str, suppress_logs: bool = False) -> bool:
         """
         Check if the symbol is currently within its active trading session.
 
@@ -131,6 +131,7 @@ class TradingStatusChecker:
 
         Args:
             symbol: Symbol name
+            suppress_logs: If True, suppress repetitive stale tick warnings during sleep mode checks
 
         Returns:
             True if symbol is in active trading session, False otherwise
@@ -138,13 +139,13 @@ class TradingStatusChecker:
         try:
             # First check if trading is enabled for this symbol
             if not self.is_trading_enabled(symbol):
-                self._update_session_cache(symbol, False, "Trading is disabled")
+                self._update_session_cache(symbol, False, "Trading is disabled", suppress_logs)
                 return False
 
             # Get current tick to check market activity
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
-                self._update_session_cache(symbol, False, "No tick data available")
+                self._update_session_cache(symbol, False, "No tick data available", suppress_logs)
                 return False
 
             # Check if tick data is fresh (within last 60 seconds)
@@ -157,7 +158,8 @@ class TradingStatusChecker:
                 self._update_session_cache(
                     symbol,
                     False,
-                    f"Tick data is stale (age: {tick_age_seconds:.0f}s)"
+                    f"Tick data is stale (age: {tick_age_seconds:.0f}s)",
+                    suppress_logs
                 )
                 return False
 
@@ -166,30 +168,32 @@ class TradingStatusChecker:
                 self._update_session_cache(
                     symbol,
                     False,
-                    f"Invalid prices (bid: {tick.bid}, ask: {tick.ask})"
+                    f"Invalid prices (bid: {tick.bid}, ask: {tick.ask})",
+                    suppress_logs
                 )
                 return False
 
             # All checks passed - symbol is in active trading session
-            self._update_session_cache(symbol, True, "Session active")
+            self._update_session_cache(symbol, True, "Session active", suppress_logs)
             return True
 
         except Exception as e:
-            self._update_session_cache(symbol, False, f"Error: {e}")
+            self._update_session_cache(symbol, False, f"Error: {e}", suppress_logs)
             return False
 
-    def _update_session_cache(self, symbol: str, is_in_session: bool, reason: str):
+    def _update_session_cache(self, symbol: str, is_in_session: bool, reason: str, suppress_logs: bool = False):
         """
         Update session state cache and log appropriately.
 
         This method reduces logging verbosity by only logging:
         - When session state changes (open -> closed or closed -> open)
-        - Every 10th consecutive check when market is closed
+        - Every 10th consecutive check when market is closed (unless suppress_logs=True)
 
         Args:
             symbol: Symbol name
             is_in_session: Whether symbol is in active trading session
             reason: Reason for the session state
+            suppress_logs: If True, suppress repetitive stale tick warnings during sleep mode checks
         """
         now = datetime.now(timezone.utc)
 
@@ -215,15 +219,16 @@ class TradingStatusChecker:
         log_level = "debug"
 
         if prev_in_session is None:
-            # First check for this symbol
+            # First check for this symbol - always log
             should_log = True
         elif prev_in_session != is_in_session:
-            # State changed
+            # State changed - always log
             should_log = True
             if is_in_session:
                 log_level = "info"  # Market opened - more important
-        elif not is_in_session and consecutive_closed % 10 == 0:
+        elif not is_in_session and consecutive_closed % 10 == 0 and not suppress_logs:
             # Market still closed, log every 10th check to reduce spam
+            # But skip if suppress_logs=True (during sleep mode)
             should_log = True
             reason = f"{reason} (checked {consecutive_closed} times)"
 

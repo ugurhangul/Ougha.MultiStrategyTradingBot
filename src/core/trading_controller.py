@@ -479,16 +479,20 @@ class TradingController:
 
         self.logger.info(f"Worker thread stopped for {symbol}", symbol)
 
-    def _is_symbol_in_active_session(self, symbol: str) -> bool:
+    def _is_symbol_in_active_session(self, symbol: str, suppress_logs: bool = False) -> bool:
         """Determine if a symbol is currently in an active trading session.
 
         Uses broker's actual market hours from MT5 (CHECK_SYMBOL_SESSION).
+
+        Args:
+            symbol: Symbol name
+            suppress_logs: If True, suppress repetitive stale tick warnings during sleep mode checks
         """
         trading_hours_config = config.trading_hours
 
         # Check MT5-based session status if enabled in config
         if trading_hours_config.check_symbol_session:
-            in_session = self.session_monitor.check_symbol_session(symbol)
+            in_session = self.session_monitor.check_symbol_session(symbol, suppress_logs)
             if not in_session:
                 return False
 
@@ -553,7 +557,8 @@ class TradingController:
                 elapsed_since_check = 0.0
 
                 # Wake up early if the session became active sooner than expected
-                if self._is_symbol_in_active_session(symbol):
+                # Suppress logs during sleep mode to avoid repetitive stale tick warnings
+                if self._is_symbol_in_active_session(symbol, suppress_logs=True):
                     self.logger.info(
                         f"{symbol}: Trading session became active earlier than expected - Resuming.",
                         symbol

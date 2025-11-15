@@ -33,17 +33,18 @@ class SymbolSessionMonitor:
         self.check_interval_seconds = check_interval_seconds
         self.logger = get_logger()
         
-    def check_symbol_session(self, symbol: str) -> bool:
+    def check_symbol_session(self, symbol: str, suppress_logs: bool = False) -> bool:
         """
         Check if a symbol is currently in its active trading session.
-        
+
         Args:
             symbol: Symbol name
-            
+            suppress_logs: If True, suppress repetitive stale tick warnings during sleep mode checks
+
         Returns:
             True if symbol is in active trading session, False otherwise
         """
-        return self.connector.is_in_trading_session(symbol)
+        return self.connector.is_in_trading_session(symbol, suppress_logs)
     
     def wait_for_trading_session(self, symbol: str, max_wait_minutes: Optional[int] = None) -> bool:
         """

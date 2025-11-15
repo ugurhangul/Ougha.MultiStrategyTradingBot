@@ -131,9 +131,9 @@ class MT5Connector:
         """Check if market is open. Delegates to TradingStatusChecker."""
         return self.trading_status_checker.is_market_open(symbol)
 
-    def is_in_trading_session(self, symbol: str) -> bool:
+    def is_in_trading_session(self, symbol: str, suppress_logs: bool = False) -> bool:
         """Check if symbol is in active trading session. Delegates to TradingStatusChecker."""
-        return self.trading_status_checker.is_in_trading_session(symbol)
+        return self.trading_status_checker.is_in_trading_session(symbol, suppress_logs)
 
     def get_market_watch_symbols(self) -> List[str]:
         """Get Market Watch symbols. Delegates to MarketWatchProvider."""
