@@ -630,7 +630,7 @@ class FakeoutStrategy(BaseStrategy):
         df = self.connector.get_candles(
             self.symbol,
             self.config.range_config.breakout_timeframe,
-            count=100
+            count=20
         )
         if df is None:
             return
@@ -776,7 +776,7 @@ class FakeoutStrategy(BaseStrategy):
         df = self.connector.get_candles(
             self.symbol,
             self.config.range_config.breakout_timeframe,
-            count=100
+            count=20
         )
         if df is None:
             return False

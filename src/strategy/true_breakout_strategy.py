@@ -36,6 +36,9 @@ from src.utils.logger import get_logger
 from src.utils.timeframe_converter import TimeframeConverter
 from src.constants import RETEST_RANGE_PERCENT
 
+# Constants
+DEFAULT_INITIALIZATION_SL_POINTS = 100  # Default stop loss points for position sizer initialization
+
 
 @register_strategy(
     "true_breakout",
@@ -46,13 +49,18 @@ from src.constants import RETEST_RANGE_PERCENT
 class TrueBreakoutStrategy(BaseStrategy):
     """
     True Breakout Strategy - Continuation after retest.
-    
+
     Strategy Logic:
     1. Detect valid breakout (open INSIDE range, close OUTSIDE)
     2. Verify high volume on breakout candle
     3. Wait for retest of breakout level
     4. Confirm continuation with volume
     5. Enter trade with stop loss below/above pattern low/high
+
+    Thread Safety:
+    This strategy is NOT thread-safe. Each instance should only be called from a single thread.
+    The current architecture ensures this by having one strategy instance per symbol, with each
+    symbol processed in its own thread or sequentially by the orchestrator.
     """
     
     def __init__(self, symbol: str, connector: MT5Connector,
@@ -106,6 +114,7 @@ class TrueBreakoutStrategy(BaseStrategy):
         # Last processed candle times
         self.last_reference_candle_time: Optional[datetime] = None
         self.last_confirmation_candle_time: Optional[datetime] = None
+        self.last_signal_time: Optional[datetime] = None
 
         # All validations must pass (AND logic)
         self._validation_mode = "all"
@@ -160,17 +169,17 @@ class TrueBreakoutStrategy(BaseStrategy):
                 # Get current price for initial calculation
                 current_price = self.connector.get_current_price(self.symbol)
                 if current_price is None:
-                    self.logger.error(f"Failed to get current price for {self.symbol}", strategy_key=self.key)
+                    self.logger.error(f"Failed to get current price for {self.symbol}", self.symbol, strategy_key=self.key)
                     return False
 
                 # Calculate a default stop loss for initialization (100 points)
                 symbol_info = self.connector.get_symbol_info(self.symbol)
                 if symbol_info is None:
-                    self.logger.error(f"Failed to get symbol info for {self.symbol}", strategy_key=self.key)
+                    self.logger.error(f"Failed to get symbol info for {self.symbol}", self.symbol, strategy_key=self.key)
                     return False
 
                 point = symbol_info['point']
-                default_sl = current_price - (100 * point)  # Assume BUY for initialization
+                default_sl = current_price - (DEFAULT_INITIALIZATION_SL_POINTS * point)  # Assume BUY for initialization
 
                 initial_lot = self.risk_manager.calculate_lot_size(
                     symbol=self.symbol,
@@ -201,6 +210,11 @@ class TrueBreakoutStrategy(BaseStrategy):
         if not self.is_initialized:
             return None
 
+        # Check if symbol is in active trading session (defensive check)
+        # Note: TradingController already handles session checking, but this provides defense-in-depth
+        if not self.connector.is_in_trading_session(self.symbol, suppress_logs=True):
+            return None
+
         try:
             # Check for new reference candle
             self._check_reference_candle()
@@ -212,7 +226,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
     def _check_reference_candle(self) -> Optional[ReferenceCandle]:
@@ -261,7 +275,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error checking reference candle: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error checking reference candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
     def _get_reference_candle_with_fallback(self) -> Optional[ReferenceCandle]:
@@ -328,16 +342,14 @@ class TrueBreakoutStrategy(BaseStrategy):
                         self.last_reference_candle_time = candle_time
 
                         # Calculate days ago
-                        from datetime import timezone
                         now = datetime.now(timezone.utc)
                         days_ago = (now.date() - candle_time.date()).days
 
-
                         self.logger.info(
                             f"*** FALLBACK (PRIMARY TIME): Using reference candle from {days_ago} day(s) ago [{self.config.range_config.range_id}] ***",
-                            self.symbol
+                            self.symbol,
+                            strategy_key=self.key
                         )
-
 
                         return self.current_reference_candle
 
@@ -369,16 +381,14 @@ class TrueBreakoutStrategy(BaseStrategy):
                             self.last_reference_candle_time = candle_time
 
                             # Calculate days ago
-                            from datetime import timezone
                             now = datetime.now(timezone.utc)
                             days_ago = (now.date() - candle_time.date()).days
 
-
                             self.logger.info(
                                 f"*** FALLBACK (FALLBACK TIME): Using reference candle from {days_ago} day(s) ago [{self.config.range_config.range_id}] ***",
-                                self.symbol
+                                self.symbol,
+                                strategy_key=self.key
                             )
-
 
                             return self.current_reference_candle
 
@@ -411,19 +421,18 @@ class TrueBreakoutStrategy(BaseStrategy):
                 )
                 self.last_reference_candle_time = candle_time
 
-
                 self.logger.info(
                     f"*** FALLBACK: Using most recent reference candle [{self.config.range_config.range_id}] ***",
-                    self.symbol, strategy_key=self.key
+                    self.symbol,
+                    strategy_key=self.key
                 )
-
 
                 return self.current_reference_candle
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
     def _update_reference_candle(self, candle_data, candle_time: datetime) -> ReferenceCandle:
@@ -451,12 +460,11 @@ class TrueBreakoutStrategy(BaseStrategy):
         # Reset unified breakout state
         self.state.reset_all()
 
-
         self.logger.info(
             f"*** NEW REFERENCE CANDLE [{self.config.range_config.range_id}] ***",
-            self.symbol, strategy_key=self.key
+            self.symbol,
+            strategy_key=self.key
         )
-
 
         return self.current_reference_candle
 
@@ -482,7 +490,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return False
 
         except Exception as e:
-            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return False
 
     def _process_confirmation_candle(self) -> Optional[TradeSignal]:
@@ -546,7 +554,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
     def _check_breakout_timeout(self, current_time: datetime):
@@ -609,9 +617,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                 self.state.breakout_above_volume = candle.volume
                 self.state.breakout_above_time = candle.time
 
-
-                self.logger.info(f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
-
+                self.logger.info(
+                    f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<",
+                    self.symbol,
+                    strategy_key=self.key
+                )
 
         # Check for breakout BELOW reference low
         if not self.state.breakout_below_detected:
@@ -624,9 +634,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                 self.state.breakout_below_volume = candle.volume
                 self.state.breakout_below_time = candle.time
 
-
-                self.logger.info(f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
-
+                self.logger.info(
+                    f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<",
+                    self.symbol,
+                    strategy_key=self.key
+                )
 
     def _classify_true_breakout_strategy(self, candle: CandleData):
         """
@@ -637,7 +649,7 @@ class TrueBreakoutStrategy(BaseStrategy):
         df = self.connector.get_candles(
             self.symbol,
             self.config.range_config.breakout_timeframe,
-            count=100
+            count=20
         )
         if df is None:
             return
@@ -880,7 +892,7 @@ class TrueBreakoutStrategy(BaseStrategy):
         df = self.connector.get_candles(
             self.symbol,
             self.config.range_config.breakout_timeframe,
-            count=100
+            count=20
         )
         if df is None:
             return False
@@ -1049,7 +1061,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                 # Fallback to original SL calculation
                 symbol_info = self.connector.get_symbol_info(self.symbol)
                 if symbol_info is None:
-                    self.logger.error(f"Failed to get symbol info for {self.symbol}")
+                    self.logger.error(
+                        f"Failed to get symbol info for {self.symbol}",
+                        self.symbol,
+                        strategy_key=self.key
+                    )
                     return None
 
                 point = symbol_info['point']
@@ -1108,10 +1124,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                 comment=self.generate_trade_comment(PositionType.BUY)
             )
 
+            # Update last signal time
+            self.last_signal_time = datetime.now(timezone.utc)
+
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
@@ -1135,7 +1154,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                 # Fallback to original SL calculation
                 symbol_info = self.connector.get_symbol_info(self.symbol)
                 if symbol_info is None:
-                    self.logger.error(f"Failed to get symbol info for {self.symbol}")
+                    self.logger.error(
+                        f"Failed to get symbol info for {self.symbol}",
+                        self.symbol,
+                        strategy_key=self.key
+                    )
                     return None
 
                 point = symbol_info['point']
@@ -1194,10 +1217,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                 comment=self.generate_trade_comment(PositionType.SELL)
             )
 
+            # Update last signal time
+            self.last_signal_time = datetime.now(timezone.utc)
+
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
             return None
 
 
