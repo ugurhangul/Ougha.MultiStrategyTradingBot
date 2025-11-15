@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.strategy.base_strategy import BaseStrategy, ValidationResult
 from src.strategy.strategy_factory import register_strategy
+from src.strategy.validation_decorator import validation_check, auto_register_validations
 from src.models.data_models import (
     TradeSignal, PositionType, SymbolCategory, CandleData, ReferenceCandle,
     UnifiedBreakoutState
@@ -104,29 +105,16 @@ class FakeoutStrategy(BaseStrategy):
         self.last_confirmation_candle_time: Optional[datetime] = None
         self.key = f"FB|{self.config.range_config.range_id}"  # Format: "FB|15M_1M"
 
-        # Configure validation methods registry (extensible)
-        # Subclasses can override or extend this list
-        self._validation_methods = [
-            "_check_breakout_volume",
-            "_check_reversal_confirmation",
-            "_check_reversal_volume"
-        ]
-
-        # Add divergence check if enabled
-        if self.config.check_divergence:
-            self._validation_methods.append("_check_divergence_confirmation")
-
         # All validations must pass (AND logic)
         self._validation_mode = "all"
 
-        # Configure validation abbreviations for trade comments
-        # Maps validation method names to short codes (for MT5 31-char limit)
-        self._validation_abbreviations = {
-            "_check_breakout_volume": "BV",           # Breakout Volume (low)
-            "_check_reversal_confirmation": "RV",     # Reversal
-            "_check_reversal_volume": "RVol",         # Reversal Volume
-            "_check_divergence_confirmation": "DIV"   # Divergence
-        }
+        # Auto-register validation methods using decorator
+        auto_register_validations(self)
+
+        # Add divergence check if enabled (conditional validation - hybrid approach)
+        if self.config.check_divergence:
+            self._validation_methods.append("_check_divergence_confirmation")
+            self._validation_abbreviations["_check_divergence_confirmation"] = "DIV"
 
         self.logger.info(
             f"Fakeout Strategy initialized for {symbol} [{self.config.range_config.range_id}]",
@@ -157,7 +145,7 @@ class FakeoutStrategy(BaseStrategy):
             
             self.logger.info(
                 f"Category: {self.category.value} | Range: {self.config.range_config.range_id}",
-                self.symbol
+                self.symbol, strategy_key=self.key
             )
 
             # Initialize position sizer with base lot size from risk manager
@@ -193,7 +181,7 @@ class FakeoutStrategy(BaseStrategy):
             return True
 
         except Exception as e:
-            self.logger.error(f"Error initializing Fakeout strategy: {e}", self.symbol)
+            self.logger.error(f"Error initializing Fakeout strategy: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def on_tick(self) -> Optional[TradeSignal]:
@@ -217,7 +205,7 @@ class FakeoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in on_tick: {e}", self.symbol)
+            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_reference_candle(self) -> Optional[ReferenceCandle]:
@@ -266,7 +254,7 @@ class FakeoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error checking reference candle: {e}", self.symbol)
+            self.logger.error(f"Error checking reference candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _get_reference_candle_with_fallback(self) -> Optional[ReferenceCandle]:
@@ -307,7 +295,7 @@ class FakeoutStrategy(BaseStrategy):
             if df is None or len(df) < 2:
                 self.logger.warning(
                     f"Could not retrieve {self.config.range_config.reference_timeframe} candles for fallback [{self.config.range_config.range_id}]",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
                 return None
 
@@ -351,7 +339,7 @@ class FakeoutStrategy(BaseStrategy):
                     self.logger.info(
                         f"Primary reference time {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} not found, "
                         f"searching for fallback time {self.config.range_config.fallback_reference_time.hour:02d}:{self.config.range_config.fallback_reference_time.minute:02d} [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
 
                     for i in range(1, min(lookback_count, len(df))):
@@ -393,13 +381,13 @@ class FakeoutStrategy(BaseStrategy):
                         f"No reference candle found for primary time {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} "
                         f"or fallback time {self.config.range_config.fallback_reference_time.hour:02d}:{self.config.range_config.fallback_reference_time.minute:02d} "
                         f"in last {lookback_count} candles [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
                 else:
                     self.logger.warning(
                         f"No reference candle found for {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} UTC "
                         f"in last {lookback_count} candles [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
             else:
                 # use_specific_time=False: Use the most recent closed candle
@@ -416,23 +404,19 @@ class FakeoutStrategy(BaseStrategy):
                 )
                 self.last_reference_candle_time = candle_time
 
-                self.logger.info("=" * 60, self.symbol)
+
                 self.logger.info(
                     f"*** FALLBACK: Using most recent reference candle [{self.config.range_config.range_id}] ***",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
-                self.logger.info(f"Time: {candle_time} (UTC)", self.symbol)
-                self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-                self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-                self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
 
                 return self.current_reference_candle
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol)
+            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _update_reference_candle(self, candle_data, candle_time: datetime) -> ReferenceCandle:
@@ -460,18 +444,12 @@ class FakeoutStrategy(BaseStrategy):
         # Reset unified breakout state
         self.state.reset_all()
 
-        self.logger.info("=" * 60, self.symbol)
+
         self.logger.info(
             f"*** NEW REFERENCE CANDLE [{self.config.range_config.range_id}] ***",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
-        self.logger.info(f"Time: {candle_time}", self.symbol)
-        self.logger.info(f"Open: {self.current_reference_candle.open:.5f}", self.symbol)
-        self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-        self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-        self.logger.info(f"Close: {self.current_reference_candle.close:.5f}", self.symbol)
-        self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-        self.logger.info("=" * 60, self.symbol)
+
 
         return self.current_reference_candle
 
@@ -497,7 +475,7 @@ class FakeoutStrategy(BaseStrategy):
             return False
 
         except Exception as e:
-            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol)
+            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def _process_confirmation_candle(self) -> Optional[TradeSignal]:
@@ -555,13 +533,13 @@ class FakeoutStrategy(BaseStrategy):
             # Note: In multi-range engine, this checks both_strategies_rejected()
             # For single strategy, we just check if our strategy was rejected
             if self.state.false_buy_rejected or self.state.false_sell_rejected:
-                self.logger.info(f">>> FALSE BREAKOUT REJECTED [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
+                self.logger.info(f">>> FALSE BREAKOUT REJECTED [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
                 self.state.reset_all()
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol)
+            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_breakout_timeout(self, current_time: datetime):
@@ -582,15 +560,13 @@ class FakeoutStrategy(BaseStrategy):
             age_minutes = int(age.total_seconds() / 60)
 
             if age.total_seconds() < 0:
-                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol)
+                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol, strategy_key=self.key)
                 return
 
             if age > timeout_delta:
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT ABOVE TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
-                self.logger.info(f"Breakout Age: {age_minutes} minutes", self.symbol)
-                self.logger.info(f"Timeout Limit: {timeout_minutes} minutes", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
+                self.logger.info(f">>> BREAKOUT ABOVE TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
+
                 self.state.reset_breakout_above()
 
         # Check breakout BELOW timeout
@@ -599,15 +575,13 @@ class FakeoutStrategy(BaseStrategy):
             age_minutes = int(age.total_seconds() / 60)
 
             if age.total_seconds() < 0:
-                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol)
+                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol, strategy_key=self.key)
                 return
 
             if age > timeout_delta:
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT BELOW TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
-                self.logger.info(f"Breakout Age: {age_minutes} minutes", self.symbol)
-                self.logger.info(f"Timeout Limit: {timeout_minutes} minutes", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
+                self.logger.info(f">>> BREAKOUT BELOW TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
+
                 self.state.reset_breakout_below()
 
     def _detect_breakout(self, candle: CandleData):
@@ -628,15 +602,9 @@ class FakeoutStrategy(BaseStrategy):
                 self.state.breakout_above_volume = candle.volume
                 self.state.breakout_above_time = candle.time
 
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
 
+                self.logger.info(f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
 
-                # Calculate timeout
-                minutes_per_candle = TimeframeConverter.get_minutes_per_candle(self.config.range_config.breakout_timeframe)
-                timeout_minutes = self.config.breakout_timeout_candles * minutes_per_candle
-                self.logger.info(f"Timeout at: {candle.time + timedelta(minutes=timeout_minutes)}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
 
         # Check for breakout BELOW reference low
         if not self.state.breakout_below_detected:
@@ -649,15 +617,9 @@ class FakeoutStrategy(BaseStrategy):
                 self.state.breakout_below_volume = candle.volume
                 self.state.breakout_below_time = candle.time
 
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
 
+                self.logger.info(f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
 
-                # Calculate timeout
-                minutes_per_candle = TimeframeConverter.get_minutes_per_candle(self.config.range_config.breakout_timeframe)
-                timeout_minutes = self.config.breakout_timeout_candles * minutes_per_candle
-                self.logger.info(f"Timeout at: {candle.time + timedelta(minutes=timeout_minutes)}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
 
     def _classify_false_breakout_strategy(self, candle: CandleData):
         """
@@ -694,7 +656,7 @@ class FakeoutStrategy(BaseStrategy):
             self.state.false_sell_volume_ok = is_low_volume
 
             vol_status = "✓" if is_low_volume else "✗"
-            self.logger.info(f">>> FALSE SELL QUALIFIED [{self.config.range_config.range_id}] (Low Vol {vol_status}) <<<", self.symbol)
+            self.logger.info(f">>> FALSE SELL QUALIFIED [{self.config.range_config.range_id}] (Low Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
 
         # === CLASSIFY BREAKOUT BELOW (FALSE BUY - reversal up) ===
         if self.state.breakout_below_detected and not self.state.false_buy_qualified:
@@ -711,7 +673,7 @@ class FakeoutStrategy(BaseStrategy):
             self.state.false_buy_volume_ok = is_low_volume
 
             vol_status = "✓" if is_low_volume else "✗"
-            self.logger.info(f">>> FALSE BUY QUALIFIED [{self.config.range_config.range_id}] (Low Vol {vol_status}) <<<", self.symbol)
+            self.logger.info(f">>> FALSE BUY QUALIFIED [{self.config.range_config.range_id}] (Low Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
 
     def _check_false_breakout_signals(self, candle: CandleData) -> Optional[TradeSignal]:
         """
@@ -734,7 +696,7 @@ class FakeoutStrategy(BaseStrategy):
                     self.state.false_sell_reversal_detected = True
                     self.state.false_sell_reversal_ok = True
                     self.state.false_sell_reversal_time = candle.time
-                    self.logger.info(f">>> FALSE SELL REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
+                    self.logger.info(f">>> FALSE SELL REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
                     # Return early to wait for next candle before checking confirmation
                     return None
 
@@ -760,7 +722,7 @@ class FakeoutStrategy(BaseStrategy):
                         f">>> FALSE SELL CONFIRMATION DETECTED [{self.config.range_config.range_id}] (Conf Vol {vol_status}) <<<",
                         self.symbol,
                     )
-                    self.logger.info(f"*** FALSE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
+                    self.logger.info(f"*** FALSE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol, strategy_key=self.key)
                     return self._generate_sell_signal(candle)
 
         # === FALSE BUY: Check for reversal and confirmation ===
@@ -777,7 +739,7 @@ class FakeoutStrategy(BaseStrategy):
                     self.state.false_buy_reversal_detected = True
                     self.state.false_buy_reversal_ok = True
                     self.state.false_buy_reversal_time = candle.time
-                    self.logger.info(f">>> FALSE BUY REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
+                    self.logger.info(f">>> FALSE BUY REVERSAL DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
                     # Return early to wait for next candle before checking confirmation
                     return None
 
@@ -804,7 +766,7 @@ class FakeoutStrategy(BaseStrategy):
                         self.symbol,
                     )
 
-                    self.logger.info(f"*** FALSE BUY SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
+                    self.logger.info(f"*** FALSE BUY SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol, strategy_key=self.key)
                     return self._generate_buy_signal(candle)
 
         return None
@@ -826,6 +788,7 @@ class FakeoutStrategy(BaseStrategy):
 
         return reversal_volume >= (avg_volume * self.config.min_reversal_volume_multiplier)
 
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is low (weak breakout)")
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had LOW volume (required for fakeout).
@@ -870,6 +833,7 @@ class FakeoutStrategy(BaseStrategy):
             reason=f"Breakout volume for {direction_str} {'is low' if volume_ok else 'is too high'} (fakeout requires low volume, vol={breakout_volume:.0f})"
         )
 
+    @validation_check(abbreviation="RV", order=2, description="Check reversal back into range")
     def _check_reversal_confirmation(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if reversal back into range was detected and confirmed.
@@ -912,6 +876,7 @@ class FakeoutStrategy(BaseStrategy):
             reason=f"Reversal {'confirmed' if reversal_ok else 'failed'} for {direction_str} signal"
         )
 
+    @validation_check(abbreviation="RVol", order=3, description="Check reversal volume meets threshold")
     def _check_reversal_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if reversal/confirmation volume meets configured requirements.
@@ -1074,13 +1039,13 @@ class FakeoutStrategy(BaseStrategy):
                 for result in failed_checks:
                     self.logger.debug(
                         f"FALSE BUY signal rejected by {result.method_name}: {result.reason}",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
-                self.logger.warning("FALSE BUY signal validation failed", self.symbol)
+                self.logger.warning("FALSE BUY signal validation failed", self.symbol, strategy_key=self.key)
                 self.state.false_buy_rejected = True
                 return None
             else:
-                self.logger.info("✓ FALSE BUY signal passed all validation filters", self.symbol)
+                self.logger.info("✓ FALSE BUY signal passed all validation filters", self.symbol, strategy_key=self.key)
 
             # Create signal
             signal = TradeSignal(
@@ -1099,7 +1064,7 @@ class FakeoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating BUY signal: {e}", self.symbol)
+            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
@@ -1160,13 +1125,13 @@ class FakeoutStrategy(BaseStrategy):
                 for result in failed_checks:
                     self.logger.debug(
                         f"FALSE SELL signal rejected by {result.method_name}: {result.reason}",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
-                self.logger.warning("FALSE SELL signal validation failed", self.symbol)
+                self.logger.warning("FALSE SELL signal validation failed", self.symbol, strategy_key=self.key)
                 self.state.false_sell_rejected = True
                 return None
             else:
-                self.logger.info("✓ FALSE SELL signal passed all validation filters", self.symbol)
+                self.logger.info("✓ FALSE SELL signal passed all validation filters", self.symbol, strategy_key=self.key)
 
             # Create signal
             signal = TradeSignal(
@@ -1185,7 +1150,7 @@ class FakeoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating SELL signal: {e}", self.symbol)
+            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_divergence(self, df: pd.DataFrame, direction: str) -> bool:
@@ -1226,12 +1191,12 @@ class FakeoutStrategy(BaseStrategy):
                 if divergence_detected:
                     self.logger.info(
                         "✓ Bullish RSI divergence confirmed for BUY signal",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
                 else:
                     self.logger.debug(
                         "No bullish RSI divergence detected",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
 
                 return divergence_detected
@@ -1249,12 +1214,12 @@ class FakeoutStrategy(BaseStrategy):
                 if divergence_detected:
                     self.logger.info(
                         "✓ Bearish RSI divergence confirmed for SELL signal",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
                 else:
                     self.logger.debug(
                         "No bearish RSI divergence detected",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
 
                 return divergence_detected
@@ -1262,14 +1227,14 @@ class FakeoutStrategy(BaseStrategy):
             else:
                 self.logger.warning(
                     f"Unknown breakout direction for divergence check: {direction}",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
                 return False
 
         except Exception as e:
             self.logger.error(
                 f"Error checking divergence: {e}",
-                self.symbol
+                self.symbol, strategy_key=self.key
             )
             return False
 
@@ -1291,7 +1256,7 @@ class FakeoutStrategy(BaseStrategy):
         is_win = profit > 0
         self.logger.info(
             f"Position closed: {'WIN' if is_win else 'LOSS'} ${profit:.2f}",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
 
         # Delegate to position sizer
@@ -1338,6 +1303,6 @@ class FakeoutStrategy(BaseStrategy):
         """Cleanup and shutdown the strategy."""
         self.logger.info(
             f"Fakeout strategy shutdown for {self.symbol} [{self.config.range_config.range_id}]",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
 

@@ -209,7 +209,8 @@ class BaseStrategy(ABC):
             # Fallback to risk manager if no position sizer
             self.logger.warning(
                 f"No position sizer configured for {self.symbol}, using risk manager default",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
             return 0.0  # Strategy should handle this case
 
@@ -322,7 +323,8 @@ class BaseStrategy(ABC):
         else:
             self.logger.warning(
                 f"Invalid format '{format}' for get_validations_for_comment, using 'compact'",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
             return self.get_validations_for_comment(format="compact")
 
@@ -369,7 +371,8 @@ class BaseStrategy(ABC):
         if not self._validation_methods:
             self.logger.debug(
                 f"No validation methods configured for {self.get_strategy_name()}, signal passes by default",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
             return True, validation_results
 
@@ -383,7 +386,8 @@ class BaseStrategy(ABC):
                 if validation_method is None:
                     self.logger.warning(
                         f"Validation method '{method_name}' not found in {self.get_strategy_name()}, skipping",
-                        self.symbol
+                        self.symbol,
+                        strategy_key=self.key
                     )
                     # Create a result indicating the method was skipped
                     validation_results.append(ValidationResult(
@@ -397,7 +401,8 @@ class BaseStrategy(ABC):
                 if not callable(validation_method):
                     self.logger.warning(
                         f"Validation method '{method_name}' is not callable in {self.get_strategy_name()}, skipping",
-                        self.symbol
+                        self.symbol,
+                        strategy_key=self.key
                     )
                     validation_results.append(ValidationResult(
                         passed=True,
@@ -422,7 +427,8 @@ class BaseStrategy(ABC):
                 else:
                     self.logger.warning(
                         f"Validation method '{method_name}' returned unexpected type {type(result)}, treating as False",
-                        self.symbol
+                        self.symbol,
+                        strategy_key=self.key
                     )
                     validation_results.append(ValidationResult(
                         passed=False,
@@ -433,7 +439,8 @@ class BaseStrategy(ABC):
             except Exception as e:
                 self.logger.error(
                     f"Error executing validation method '{method_name}': {e}",
-                    self.symbol
+                    self.symbol,
+                    strategy_key=self.key
                 )
                 validation_results.append(ValidationResult(
                     passed=False,
@@ -451,7 +458,8 @@ class BaseStrategy(ABC):
         else:
             self.logger.error(
                 f"Invalid validation mode '{self._validation_mode}', defaulting to 'all'",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
             is_valid = all(result.passed for result in validation_results)
 
@@ -462,13 +470,15 @@ class BaseStrategy(ABC):
         if is_valid:
             self.logger.debug(
                 f"✓ Signal passed validation ({len([r for r in validation_results if r.passed])}/{len(validation_results)} checks)",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
         else:
             failed_checks = [r for r in validation_results if not r.passed]
             self.logger.debug(
                 f"✗ Signal failed validation: {', '.join([f'{r.method_name}: {r.reason}' for r in failed_checks])}",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
 
         return is_valid, validation_results

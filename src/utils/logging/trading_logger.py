@@ -159,50 +159,80 @@ class TradingLogger:
             )
             handler.emit(record)
 
-    def info(self, message: str, symbol: Optional[str] = None):
+    def info(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log info message"""
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.INFO, message, symbol)
             # Add symbol prefix for master log
-            message = f"[{symbol}] {message}"
+            if strategy_key:
+                message = f"[{symbol}] [{strategy_key}] {message}"
+            else:
+                message = f"[{symbol}] {message}"
+        elif strategy_key:
+            # Add strategy key prefix even without symbol
+            message = f"[{strategy_key}] {message}"
         self.logger.info(message)
 
-    def debug(self, message: str, symbol: Optional[str] = None):
+    def debug(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log debug message (only if detailed logging enabled)"""
         if self.enable_detailed:
             if symbol:
                 # Log to symbol-specific file
                 self._log_to_symbol_file(logging.DEBUG, message, symbol)
                 # Add symbol prefix for master log
-                message = f"[{symbol}] {message}"
+                if strategy_key:
+                    message = f"[{symbol}] [{strategy_key}] {message}"
+                else:
+                    message = f"[{symbol}] {message}"
+            elif strategy_key:
+                # Add strategy key prefix even without symbol
+                message = f"[{strategy_key}] {message}"
             self.logger.debug(message)
 
-    def warning(self, message: str, symbol: Optional[str] = None):
+    def warning(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log warning message"""
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.WARNING, message, symbol)
             # Add symbol prefix for master log
-            message = f"[{symbol}] {message}"
+            if strategy_key:
+                message = f"[{symbol}] [{strategy_key}] {message}"
+            else:
+                message = f"[{symbol}] {message}"
+        elif strategy_key:
+            # Add strategy key prefix even without symbol
+            message = f"[{strategy_key}] {message}"
         self.logger.warning(message)
 
-    def error(self, message: str, symbol: Optional[str] = None):
+    def error(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log error message"""
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.ERROR, message, symbol)
             # Add symbol prefix for master log
-            message = f"[{symbol}] {message}"
+            if strategy_key:
+                message = f"[{symbol}] [{strategy_key}] {message}"
+            else:
+                message = f"[{symbol}] {message}"
+        elif strategy_key:
+            # Add strategy key prefix even without symbol
+            message = f"[{strategy_key}] {message}"
         self.logger.error(message)
 
-    def critical(self, message: str, symbol: Optional[str] = None):
+    def critical(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log critical message"""
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.CRITICAL, message, symbol)
             # Add symbol prefix for master log
-            message = f"[{symbol}] {message}"
+            if strategy_key:
+                message = f"[{symbol}] [{strategy_key}] {message}"
+            else:
+                message = f"[{symbol}] {message}"
+        elif strategy_key:
+            # Add strategy key prefix even without symbol
+            message = f"[{strategy_key}] {message}"
         self.logger.critical(message)
 
     def separator(self, char: str = "=", length: int = 60):

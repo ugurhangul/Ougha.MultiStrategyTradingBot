@@ -167,23 +167,27 @@ class MultiStrategyOrchestrator:
                     if range_id:
                         self.logger.info(
                             f"✓ {strategy_name} ({range_id}) initialized",
-                            self.symbol
+                            self.symbol,
+                            strategy_key=strategy_key
                         )
                     else:
                         self.logger.info(
                             f"✓ {strategy_name} initialized",
-                            self.symbol
+                            self.symbol,
+                            strategy_key=strategy_key
                         )
                 else:
                     self.logger.warning(
                         f"✗ {strategy_name} ({range_id}) initialization failed",
-                        self.symbol
+                        self.symbol,
+                        strategy_key=strategy_key
                     )
 
             except Exception as e:
                 self.logger.error(
                     f"Error creating {strategy_name} ({range_id}): {e}",
-                    self.symbol
+                    self.symbol,
+                    strategy_key=strategy_key
                 )
 
         if success_count == 0:
@@ -224,7 +228,8 @@ class MultiStrategyOrchestrator:
                 if signal is not None:
                     self.logger.info(
                         f"Signal received from {strategy_key}: {signal.signal_type.value} @ {signal.entry_price:.5f}",
-                        self.symbol
+                        self.symbol,
+                        strategy_key=strategy_key
                     )
 
                     # Execute the signal via order manager
@@ -233,18 +238,21 @@ class MultiStrategyOrchestrator:
                     if ticket:
                         self.logger.info(
                             f"✓ Signal executed successfully by {strategy_key} - Ticket: {ticket}",
-                            self.symbol
+                            self.symbol,
+                            strategy_key=strategy_key
                         )
                     else:
                         self.logger.warning(
                             f"✗ Signal execution failed for {strategy_key}",
-                            self.symbol
+                            self.symbol,
+                            strategy_key=strategy_key
                         )
 
             except Exception as e:
                 self.logger.error(
                     f"Error in {strategy_key}.on_tick(): {e}",
-                    self.symbol
+                    self.symbol,
+                    strategy_key=strategy_key
                 )
 
     def on_position_closed(self, symbol: str, profit: float,
@@ -316,12 +324,14 @@ class MultiStrategyOrchestrator:
             except Exception as e:
                 self.logger.error(
                     f"Error in {strategy_key}.on_position_closed(): {e}",
-                    symbol
+                    symbol,
+                    strategy_key=strategy_key
                 )
         else:
             self.logger.warning(
                 f"Strategy not found for key: {strategy_key}",
-                symbol
+                symbol,
+                strategy_key=strategy_key
             )
 
     def get_status(self) -> Dict:
@@ -353,11 +363,12 @@ class MultiStrategyOrchestrator:
         for strategy_key, strategy in self.strategies.items():
             try:
                 strategy.shutdown()
-                self.logger.info(f"✓ {strategy_key} shutdown", self.symbol)
+                self.logger.info(f"✓ {strategy_key} shutdown", self.symbol, strategy_key=strategy_key)
             except Exception as e:
                 self.logger.error(
                     f"Error shutting down {strategy_key}: {e}",
-                    self.symbol
+                    self.symbol,
+                    strategy_key=strategy_key
                 )
 
         self.strategies.clear()

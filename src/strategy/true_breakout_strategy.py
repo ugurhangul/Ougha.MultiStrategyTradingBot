@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.strategy.base_strategy import BaseStrategy, ValidationResult
 from src.strategy.strategy_factory import register_strategy
+from src.strategy.validation_decorator import validation_check, auto_register_validations
 from src.models.data_models import (
     TradeSignal, PositionType, SymbolCategory, SymbolParameters, CandleData, ReferenceCandle,
     UnifiedBreakoutState
@@ -106,27 +107,16 @@ class TrueBreakoutStrategy(BaseStrategy):
         self.last_reference_candle_time: Optional[datetime] = None
         self.last_confirmation_candle_time: Optional[datetime] = None
 
-        # Configure validation methods registry (extensible)
-        # Subclasses can override or extend this list
-        self._validation_methods = [
-            "_check_breakout_volume",
-            "_check_retest_confirmation",
-            "_check_continuation_volume"
-        ]
         # All validations must pass (AND logic)
         self._validation_mode = "all"
 
-        # Configure validation abbreviations for trade comments
-        # Maps validation method names to short codes (for MT5 31-char limit)
-        self._validation_abbreviations = {
-            "_check_breakout_volume": "BV",      # Breakout Volume
-            "_check_retest_confirmation": "RT",  # Retest
-            "_check_continuation_volume": "CV"   # Continuation Volume
-        }
+        # Auto-register validation methods using decorator
+        auto_register_validations(self)
 
         self.logger.info(
             f"True Breakout Strategy initialized for {symbol} [{self.config.range_config.range_id}]",
-            symbol
+            symbol,
+            strategy_key=self.key
         )
     
     def initialize(self) -> bool:
@@ -160,7 +150,8 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.logger.info(
                 f"Category: {self.category.value} | Range: {self.config.range_config.range_id} | "
                 f"Retest Tolerance: {self.symbol_params.retest_range_percent:.4f} ({self.symbol_params.retest_range_percent*100:.2f}%)",
-                self.symbol
+                self.symbol,
+                strategy_key=self.key
             )
 
             # Initialize position sizer with base lot size from risk manager
@@ -169,13 +160,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                 # Get current price for initial calculation
                 current_price = self.connector.get_current_price(self.symbol)
                 if current_price is None:
-                    self.logger.error(f"Failed to get current price for {self.symbol}")
+                    self.logger.error(f"Failed to get current price for {self.symbol}", strategy_key=self.key)
                     return False
 
                 # Calculate a default stop loss for initialization (100 points)
                 symbol_info = self.connector.get_symbol_info(self.symbol)
                 if symbol_info is None:
-                    self.logger.error(f"Failed to get symbol info for {self.symbol}")
+                    self.logger.error(f"Failed to get symbol info for {self.symbol}", strategy_key=self.key)
                     return False
 
                 point = symbol_info['point']
@@ -189,14 +180,15 @@ class TrueBreakoutStrategy(BaseStrategy):
                 self.position_sizer.initialize(initial_lot)
                 self.logger.info(
                     f"Position sizer initialized: {self.position_sizer.get_name()} with {initial_lot:.2f} lots",
-                    self.symbol
+                    self.symbol,
+                    strategy_key=self.key
                 )
 
             self.is_initialized = True
             return True
 
         except Exception as e:
-            self.logger.error(f"Error initializing True Breakout strategy: {e}", self.symbol)
+            self.logger.error(f"Error initializing True Breakout strategy: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def on_tick(self) -> Optional[TradeSignal]:
@@ -220,7 +212,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in on_tick: {e}", self.symbol)
+            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_reference_candle(self) -> Optional[ReferenceCandle]:
@@ -269,7 +261,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error checking reference candle: {e}", self.symbol)
+            self.logger.error(f"Error checking reference candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _get_reference_candle_with_fallback(self) -> Optional[ReferenceCandle]:
@@ -310,7 +302,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             if df is None or len(df) < 2:
                 self.logger.warning(
                     f"Could not retrieve {self.config.range_config.reference_timeframe} candles for fallback [{self.config.range_config.range_id}]",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
                 return None
 
@@ -340,17 +332,12 @@ class TrueBreakoutStrategy(BaseStrategy):
                         now = datetime.now(timezone.utc)
                         days_ago = (now.date() - candle_time.date()).days
 
-                        self.logger.info("=" * 60, self.symbol)
+
                         self.logger.info(
                             f"*** FALLBACK (PRIMARY TIME): Using reference candle from {days_ago} day(s) ago [{self.config.range_config.range_id}] ***",
                             self.symbol
                         )
-                        self.logger.info(f"Time: {candle_time} (UTC)", self.symbol)
-                        self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-                        self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-                        self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-                        self.logger.info(f"Note: Today's reference candle at {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} UTC hasn't formed yet", self.symbol)
-                        self.logger.info("=" * 60, self.symbol)
+
 
                         return self.current_reference_candle
 
@@ -359,7 +346,7 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.logger.info(
                         f"Primary reference time {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} not found, "
                         f"searching for fallback time {self.config.range_config.fallback_reference_time.hour:02d}:{self.config.range_config.fallback_reference_time.minute:02d} [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
 
                     for i in range(1, min(lookback_count, len(df))):
@@ -386,21 +373,12 @@ class TrueBreakoutStrategy(BaseStrategy):
                             now = datetime.now(timezone.utc)
                             days_ago = (now.date() - candle_time.date()).days
 
-                            self.logger.info("=" * 60, self.symbol)
+
                             self.logger.info(
                                 f"*** FALLBACK (FALLBACK TIME): Using reference candle from {days_ago} day(s) ago [{self.config.range_config.range_id}] ***",
                                 self.symbol
                             )
-                            self.logger.info(f"Fallback Time: {candle_time} (UTC)", self.symbol)
-                            self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-                            self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-                            self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-                            self.logger.info(
-                                f"Note: Using fallback time {self.config.range_config.fallback_reference_time.hour:02d}:{self.config.range_config.fallback_reference_time.minute:02d} "
-                                f"(primary time {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} not available)",
-                                self.symbol
-                            )
-                            self.logger.info("=" * 60, self.symbol)
+
 
                             return self.current_reference_candle
 
@@ -410,13 +388,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                         f"No reference candle found for primary time {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} "
                         f"or fallback time {self.config.range_config.fallback_reference_time.hour:02d}:{self.config.range_config.fallback_reference_time.minute:02d} "
                         f"in last {lookback_count} candles [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
                 else:
                     self.logger.warning(
                         f"No reference candle found for {self.config.range_config.reference_time.hour:02d}:{self.config.range_config.reference_time.minute:02d} UTC "
                         f"in last {lookback_count} candles [{self.config.range_config.range_id}]",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
             else:
                 # use_specific_time=False: Use the most recent closed candle
@@ -433,23 +411,19 @@ class TrueBreakoutStrategy(BaseStrategy):
                 )
                 self.last_reference_candle_time = candle_time
 
-                self.logger.info("=" * 60, self.symbol)
+
                 self.logger.info(
                     f"*** FALLBACK: Using most recent reference candle [{self.config.range_config.range_id}] ***",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
-                self.logger.info(f"Time: {candle_time} (UTC)", self.symbol)
-                self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-                self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-                self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
 
                 return self.current_reference_candle
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol)
+            self.logger.error(f"Error in fallback reference candle retrieval: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _update_reference_candle(self, candle_data, candle_time: datetime) -> ReferenceCandle:
@@ -477,18 +451,12 @@ class TrueBreakoutStrategy(BaseStrategy):
         # Reset unified breakout state
         self.state.reset_all()
 
-        self.logger.info("=" * 60, self.symbol)
+
         self.logger.info(
             f"*** NEW REFERENCE CANDLE [{self.config.range_config.range_id}] ***",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
-        self.logger.info(f"Time: {candle_time}", self.symbol)
-        self.logger.info(f"Open: {self.current_reference_candle.open:.5f}", self.symbol)
-        self.logger.info(f"High: {self.current_reference_candle.high:.5f}", self.symbol)
-        self.logger.info(f"Low: {self.current_reference_candle.low:.5f}", self.symbol)
-        self.logger.info(f"Close: {self.current_reference_candle.close:.5f}", self.symbol)
-        self.logger.info(f"Range: {self.current_reference_candle.range:.5f}", self.symbol)
-        self.logger.info("=" * 60, self.symbol)
+
 
         return self.current_reference_candle
 
@@ -514,7 +482,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return False
 
         except Exception as e:
-            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol)
+            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def _process_confirmation_candle(self) -> Optional[TradeSignal]:
@@ -572,13 +540,13 @@ class TrueBreakoutStrategy(BaseStrategy):
             # Note: In multi-range engine, this checks both_strategies_rejected()
             # For single strategy, we just check if our strategy was rejected
             if self.state.true_buy_rejected or self.state.true_sell_rejected:
-                self.logger.info(f">>> TRUE BREAKOUT REJECTED [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
+                self.logger.info(f">>> TRUE BREAKOUT REJECTED [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
                 self.state.reset_all()
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol)
+            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_breakout_timeout(self, current_time: datetime):
@@ -599,15 +567,13 @@ class TrueBreakoutStrategy(BaseStrategy):
             age_minutes = int(age.total_seconds() / 60)
 
             if age.total_seconds() < 0:
-                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol)
+                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol, strategy_key=self.key)
                 return
 
             if age > timeout_delta:
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT ABOVE TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
-                self.logger.info(f"Breakout Age: {age_minutes} minutes", self.symbol)
-                self.logger.info(f"Timeout Limit: {timeout_minutes} minutes", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
+                self.logger.info(f">>> BREAKOUT ABOVE TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
+
                 self.state.reset_breakout_above()
 
         # Check breakout BELOW timeout
@@ -616,15 +582,13 @@ class TrueBreakoutStrategy(BaseStrategy):
             age_minutes = int(age.total_seconds() / 60)
 
             if age.total_seconds() < 0:
-                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol)
+                self.logger.warning(f"Negative breakout age detected: {age.total_seconds()}s - possible timezone issue", self.symbol, strategy_key=self.key)
                 return
 
             if age > timeout_delta:
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT BELOW TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol)
-                self.logger.info(f"Breakout Age: {age_minutes} minutes", self.symbol)
-                self.logger.info(f"Timeout Limit: {timeout_minutes} minutes", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+
+                self.logger.info(f">>> BREAKOUT BELOW TIMEOUT [{self.config.range_config.range_id}] - Resetting <<<", self.symbol, strategy_key=self.key)
+
                 self.state.reset_breakout_below()
 
     def _detect_breakout(self, candle: CandleData):
@@ -646,14 +610,8 @@ class TrueBreakoutStrategy(BaseStrategy):
                 self.state.breakout_above_time = candle.time
 
 
-                self.logger.info(f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
+                self.logger.info(f">>> BREAKOUT ABOVE HIGH DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
 
-
-                # Calculate timeout
-                minutes_per_candle = TimeframeConverter.get_minutes_per_candle(self.config.range_config.breakout_timeframe)
-                timeout_minutes = self.config.breakout_timeout_candles * minutes_per_candle
-                self.logger.info(f"Timeout at: {candle.time + timedelta(minutes=timeout_minutes)}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
 
         # Check for breakout BELOW reference low
         if not self.state.breakout_below_detected:
@@ -666,21 +624,9 @@ class TrueBreakoutStrategy(BaseStrategy):
                 self.state.breakout_below_volume = candle.volume
                 self.state.breakout_below_time = candle.time
 
-                self.logger.info("=" * 60, self.symbol)
-                self.logger.info(f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<", self.symbol)
-                self.logger.info(f"Breakout Open: {candle.open:.5f} (inside range ✓)", self.symbol)
-                self.logger.info(f"Breakout Close: {candle.close:.5f} (below low ✓)", self.symbol)
-                self.logger.info(f"Reference High: {candle_ref.high:.5f}", self.symbol)
-                self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol)
-                self.logger.info(f"Reference Time: {candle_ref.time}", self.symbol)
-                self.logger.info(f"Breakout Time: {candle.time}", self.symbol)
-                self.logger.info(f"Breakout Volume: {candle.volume}", self.symbol)
 
-                # Calculate timeout
-                minutes_per_candle = TimeframeConverter.get_minutes_per_candle(self.config.range_config.breakout_timeframe)
-                timeout_minutes = self.config.breakout_timeout_candles * minutes_per_candle
-                self.logger.info(f"Timeout at: {candle.time + timedelta(minutes=timeout_minutes)}", self.symbol)
-                self.logger.info("=" * 60, self.symbol)
+                self.logger.info(f">>> BREAKOUT BELOW LOW DETECTED [{self.config.range_config.range_id}] <<<", self.symbol, strategy_key=self.key)
+
 
     def _classify_true_breakout_strategy(self, candle: CandleData):
         """
@@ -717,8 +663,8 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.state.true_buy_volume_ok = is_high_volume
 
             vol_status = "✓" if is_high_volume else "✗"
-            self.logger.info(f">>> TRUE BUY QUALIFIED [{self.config.range_config.range_id}] (High Vol {vol_status}) <<<", self.symbol)
-            self.logger.info("Waiting for continuation above reference high...", self.symbol)
+            self.logger.info(f">>> TRUE BUY QUALIFIED [{self.config.range_config.range_id}] (High Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
+            self.logger.info("Waiting for continuation above reference high...", self.symbol, strategy_key=self.key)
 
         # === CLASSIFY BREAKOUT BELOW (TRUE SELL) ===
         if self.state.breakout_below_detected and not self.state.true_sell_qualified:
@@ -735,8 +681,8 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.state.true_sell_volume_ok = is_high_volume
 
             vol_status = "✓" if is_high_volume else "✗"
-            self.logger.info(f">>> TRUE SELL QUALIFIED [{self.config.range_config.range_id}] (High Vol {vol_status}) <<<", self.symbol)
-            self.logger.info("Waiting for continuation below reference low...", self.symbol)
+            self.logger.info(f">>> TRUE SELL QUALIFIED [{self.config.range_config.range_id}] (High Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
+            self.logger.info("Waiting for continuation below reference low...", self.symbol, strategy_key=self.key)
 
     def _check_true_breakout_signals(self, candle: CandleData) -> Optional[TradeSignal]:
         """
@@ -773,11 +719,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_buy_retest_detected = True
                     self.state.true_buy_retest_ok = True
                     vol_status = "✓" if retest_volume_ok else "✗"
-                    self.logger.info(f">>> TRUE BUY RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol)
-                    self.logger.info(f"Candle Low: {candle.low:.5f} | Close: {candle.close:.5f}", self.symbol)
-                    self.logger.info(f"Reference High: {candle_ref.high:.5f}", self.symbol)
-                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol)
-                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol)
+                    self.logger.info(f">>> TRUE BUY RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Candle Low: {candle.low:.5f} | Close: {candle.close:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Reference High: {candle_ref.high:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol, strategy_key=self.key)
                     return None
 
             # After retest detected on previous candle, check for continuation on current candle
@@ -791,9 +737,9 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_buy_continuation_volume_ok = continuation_volume_ok
 
                     vol_status = "✓" if continuation_volume_ok else "✗"
-                    self.logger.info(f">>> TRUE BUY CONTINUATION DETECTED [{self.config.range_config.range_id}] (Cont Vol {vol_status}) <<<", self.symbol)
+                    self.logger.info(f">>> TRUE BUY CONTINUATION DETECTED [{self.config.range_config.range_id}] (Cont Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
 
-                    self.logger.info(f"*** TRUE BUY SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
+                    self.logger.info(f"*** TRUE BUY SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol, strategy_key=self.key)
                     return self._generate_buy_signal(candle)
 
         # === TRUE SELL: Check for retest and continuation ===
@@ -824,11 +770,11 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_sell_retest_detected = True
                     self.state.true_sell_retest_ok = True
                     vol_status = "✓" if retest_volume_ok else "✗"
-                    self.logger.info(f">>> TRUE SELL RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol)
-                    self.logger.info(f"Candle High: {candle.high:.5f} | Close: {candle.close:.5f}", self.symbol)
-                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol)
-                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol)
-                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol)
+                    self.logger.info(f">>> TRUE SELL RETEST DETECTED [{self.config.range_config.range_id}] (Retest Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Candle High: {candle.high:.5f} | Close: {candle.close:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Retest Range: {retest_range:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Retest Volume: {candle.volume} | Breakout Volume: {breakout_volume} | Ratio: {volume_ratio:.2f}x", self.symbol, strategy_key=self.key)
                     # CRITICAL FIX: Return early to wait for next candle before checking continuation
                     # This prevents executing trade on the same candle that detected the retest
                     return None
@@ -844,12 +790,12 @@ class TrueBreakoutStrategy(BaseStrategy):
                     self.state.true_sell_continuation_volume_ok = continuation_volume_ok
 
                     vol_status = "✓" if continuation_volume_ok else "✗"
-                    self.logger.info(f">>> TRUE SELL CONTINUATION DETECTED [{self.config.range_config.range_id}] (Cont Vol {vol_status}) <<<", self.symbol)
-                    self.logger.info(f"Breakout Close: {candle.close:.5f}", self.symbol)
-                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol)
-                    self.logger.info(f"Continuation Volume: {candle.volume}", self.symbol)
+                    self.logger.info(f">>> TRUE SELL CONTINUATION DETECTED [{self.config.range_config.range_id}] (Cont Vol {vol_status}) <<<", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Breakout Close: {candle.close:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Reference Low: {candle_ref.low:.5f}", self.symbol, strategy_key=self.key)
+                    self.logger.info(f"Continuation Volume: {candle.volume}", self.symbol, strategy_key=self.key)
 
-                    self.logger.info(f"*** TRUE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol)
+                    self.logger.info(f"*** TRUE SELL SIGNAL GENERATED [{self.config.range_config.range_id}] ***", self.symbol, strategy_key=self.key)
                     return self._generate_sell_signal(candle)
 
         return None
@@ -960,6 +906,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.symbol
         )
 
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high")
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had high volume (required for true breakout).
@@ -1005,6 +952,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             reason=f"Breakout volume for {direction_str} {'meets' if volume_ok else 'does not meet'} minimum threshold (vol={breakout_volume:.0f})"
         )
 
+    @validation_check(abbreviation="RT", order=2, description="Check retest of breakout level")
     def _check_retest_confirmation(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if retest of breakout level was detected and confirmed.
@@ -1047,6 +995,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             reason=f"Retest {'confirmed' if retest_ok else 'failed'} for {direction_str} signal"
         )
 
+    @validation_check(abbreviation="CV", order=3, description="Check continuation volume meets threshold")
     def _check_continuation_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if continuation volume meets configured requirements.
@@ -1147,13 +1096,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                 for result in failed_checks:
                     self.logger.debug(
                         f"TRUE BUY signal rejected by {result.method_name}: {result.reason}",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
-                self.logger.warning("TRUE BUY signal validation failed", self.symbol)
+                self.logger.warning("TRUE BUY signal validation failed", self.symbol, strategy_key=self.key)
                 self.state.true_buy_rejected = True
                 return None
             else:
-                self.logger.info("✓ TRUE BUY signal passed all validation filters", self.symbol)
+                self.logger.info("✓ TRUE BUY signal passed all validation filters", self.symbol, strategy_key=self.key)
 
             # Create signal
             signal = TradeSignal(
@@ -1172,7 +1121,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating BUY signal: {e}", self.symbol)
+            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
@@ -1233,13 +1182,13 @@ class TrueBreakoutStrategy(BaseStrategy):
                 for result in failed_checks:
                     self.logger.debug(
                         f"TRUE SELL signal rejected by {result.method_name}: {result.reason}",
-                        self.symbol
+                        self.symbol, strategy_key=self.key
                     )
-                self.logger.warning("TRUE SELL signal validation failed", self.symbol)
+                self.logger.warning("TRUE SELL signal validation failed", self.symbol, strategy_key=self.key)
                 self.state.true_sell_rejected = True
                 return None
             else:
-                self.logger.info("✓ TRUE SELL signal passed all validation filters", self.symbol)
+                self.logger.info("✓ TRUE SELL signal passed all validation filters", self.symbol, strategy_key=self.key)
 
             # Create signal
             signal = TradeSignal(
@@ -1258,7 +1207,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating SELL signal: {e}", self.symbol)
+            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
 
@@ -1281,7 +1230,7 @@ class TrueBreakoutStrategy(BaseStrategy):
         is_win = profit > 0
         self.logger.info(
             f"Position closed: {'WIN' if is_win else 'LOSS'} ${profit:.2f}",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
 
         # Delegate to position sizer
@@ -1327,6 +1276,6 @@ class TrueBreakoutStrategy(BaseStrategy):
         """Cleanup and shutdown the strategy."""
         self.logger.info(
             f"True Breakout strategy shutdown for {self.symbol} [{self.config.range_config.range_id}]",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
 

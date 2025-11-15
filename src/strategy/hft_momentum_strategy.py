@@ -31,6 +31,7 @@ from src.indicators.spread_indicator import SpreadIndicator
 from src.risk.risk_manager import RiskManager
 from src.strategy.base_strategy import BaseStrategy, ValidationResult
 from src.strategy.strategy_factory import register_strategy
+from src.strategy.validation_decorator import validation_check, auto_register_validations
 from src.strategy.symbol_performance_persistence import SymbolPerformancePersistence
 from src.config.configs import HFTMomentumConfig
 from src.config.strategies import MartingaleType
@@ -129,27 +130,12 @@ class HFTMomentumStrategy(BaseStrategy):
         self.atr_avg_indicator = ATRAverageIndicator()
         self.spread_indicator = SpreadIndicator()
 
-        # Configure validation methods registry (extensible)
-        # Subclasses can override or extend this list
-        self._validation_methods = [
-            "_check_momentum_strength",
-            "_check_volume_confirmation",
-            "_check_volatility_filter",
-            "_check_trend_alignment",
-            "_check_spread_filter"
-        ]
         # All validations must pass (AND logic)
         self._validation_mode = "all"
         self.key = "HFT"  # Format: "HFT" (no range_id)
-        # Configure validation abbreviations for trade comments
-        # Maps validation method names to short codes (for MT5 31-char limit)
-        self._validation_abbreviations = {
-            "_check_momentum_strength": "M",  # Momentum
-            "_check_volume_confirmation": "V",  # Volume
-            "_check_volatility_filter": "A",  # ATR/Volatility
-            "_check_trend_alignment": "T",  # Trend
-            "_check_spread_filter": "S"  # Spread
-        }
+
+        # Auto-register validation methods using decorator
+        auto_register_validations(self)
 
     def initialize(self) -> bool:
         """
@@ -232,7 +218,7 @@ class HFTMomentumStrategy(BaseStrategy):
         if symbol_info is None:
             self.logger.warning(
                 f"Could not get symbol info for auto-optimization, using defaults",
-                self.symbol
+                self.symbol, strategy_key=self.key
             )
             return
 
@@ -263,7 +249,7 @@ class HFTMomentumStrategy(BaseStrategy):
             f"min_momentum={self.config.min_momentum_strength:.6f}, "
             f"volume_mult={self.config.min_volume_multiplier:.1f}, "
             f"atr_range=[{self.config.min_atr_multiplier:.1f}, {self.config.max_atr_multiplier:.1f}]",
-            self.symbol
+            self.symbol, strategy_key=self.key
         )
 
     def _calculate_average_spread(self) -> Optional[float]:
@@ -329,11 +315,11 @@ class HFTMomentumStrategy(BaseStrategy):
             for result in failed_checks:
                 self.logger.debug(
                     f"Signal rejected by {result.method_name}: {result.reason}",
-                    self.symbol
+                    self.symbol, strategy_key=self.key
                 )
             return None
         else:
-            self.logger.info("✓ Signal passed all validation filters", self.symbol)
+            self.logger.info("✓ Signal passed all validation filters", self.symbol, strategy_key=self.key)
         return self._generate_signal(signal_direction)
 
     def _check_cooldown(self) -> bool:
@@ -370,7 +356,7 @@ class HFTMomentumStrategy(BaseStrategy):
             return True
 
         except Exception as e:
-            self.logger.error(f"Error updating tick buffer: {e}", self.symbol)
+            self.logger.error(f"Error updating tick buffer: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def _detect_tick_momentum(self) -> int:
@@ -414,6 +400,7 @@ class HFTMomentumStrategy(BaseStrategy):
 
         return 0  # No clear momentum
 
+    @validation_check(abbreviation="M", order=1, description="Check momentum strength")
     def _check_momentum_strength(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if momentum strength exceeds minimum threshold.
@@ -452,6 +439,7 @@ class HFTMomentumStrategy(BaseStrategy):
             reason="Momentum strength sufficient" if passed else f"Momentum strength below threshold ({self.config.min_momentum_strength})"
         )
 
+    @validation_check(abbreviation="V", order=2, description="Check volume confirmation")
     def _check_volume_confirmation(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if recent volume exceeds average using M1 candle tick_volume data.
@@ -513,6 +501,7 @@ class HFTMomentumStrategy(BaseStrategy):
             reason=f"M1 volume ratio {volume_ratio:.2f} {'≥' if passed else '<'} {self.config.min_volume_multiplier} (recent={recent_volume:.0f}, avg={avg_volume:.0f})"
         )
 
+    @validation_check(abbreviation="A", order=3, description="Check volatility (ATR) filter")
     def _check_volatility_filter(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if current volatility (ATR) is within acceptable range.
@@ -591,13 +580,14 @@ class HFTMomentumStrategy(BaseStrategy):
             )
 
         except Exception as e:
-            self.logger.error(f"Error checking volatility filter: {e}", self.symbol)
+            self.logger.error(f"Error checking volatility filter: {e}", self.symbol, strategy_key=self.key)
             return ValidationResult(
                 passed=True,
                 method_name="_check_volatility_filter",
                 reason=f"Exception occurred: {str(e)}, skipping"
             )
 
+    @validation_check(abbreviation="T", order=4, description="Check trend alignment")
     def _check_trend_alignment(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if signal aligns with higher timeframe trend (EMA).
@@ -684,13 +674,14 @@ class HFTMomentumStrategy(BaseStrategy):
             )
 
         except Exception as e:
-            self.logger.error(f"Error checking trend alignment: {e}", self.symbol)
+            self.logger.error(f"Error checking trend alignment: {e}", self.symbol, strategy_key=self.key)
             return ValidationResult(
                 passed=True,
                 method_name="_check_trend_alignment",
                 reason=f"Exception occurred: {str(e)}, skipping"
             )
 
+    @validation_check(abbreviation="S", order=5, description="Check spread filter")
     def _check_spread_filter(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if current spread is within acceptable limits.
@@ -794,17 +785,12 @@ class HFTMomentumStrategy(BaseStrategy):
             range_id=None
         )
         if not can_open:
-            self.logger.warning(f"Position limit check failed: {reason}", self.symbol)
+            self.logger.warning(f"Position limit check failed: {reason}", self.symbol, strategy_key=self.key)
             return None
 
-        self.logger.info("=" * 60, self.symbol)
-        self.logger.info("*** HFT MOMENTUM SIGNAL GENERATED ***", self.symbol)
-        self.logger.info(f"Direction: {signal_type.value.upper()}", self.symbol)
-        self.logger.info(f"Entry: {entry_price:.5f}", self.symbol)
-        self.logger.info(f"Stop Loss: {stop_loss:.5f}", self.symbol)
-        self.logger.info(f"Take Profit: {take_profit:.5f}", self.symbol)
-        self.logger.info(f"R:R Ratio: 1:{self.config.risk_reward_ratio:.1f}", self.symbol)
-        self.logger.info("=" * 60, self.symbol)
+
+        self.logger.info("*** HFT MOMENTUM SIGNAL GENERATED ***", self.symbol, strategy_key=self.key)
+
 
         return signal
 
@@ -849,7 +835,7 @@ class HFTMomentumStrategy(BaseStrategy):
                         period=self.config.atr_period
                     )
             except Exception as e:
-                self.logger.error(f"Error getting ATR for SL calculation: {e}", self.symbol)
+                self.logger.error(f"Error getting ATR for SL calculation: {e}", self.symbol, strategy_key=self.key)
 
         # Use shared StopLossCalculator to get SL distance in points
         sl_points = StopLossCalculator.calculate_dynamic_stop_loss(
@@ -907,7 +893,7 @@ class HFTMomentumStrategy(BaseStrategy):
         """Reset position sizer state (called on new day or manual reset)"""
         if self.position_sizer is not None:
             self.position_sizer.reset()
-            self.logger.info("Position sizer reset", self.symbol)
+            self.logger.info("Position sizer reset", self.symbol, strategy_key=self.key)
 
     def get_status(self) -> Dict[str, Any]:
         """

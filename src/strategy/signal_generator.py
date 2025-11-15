@@ -133,7 +133,7 @@ class SignalGenerator:
         lowest_low = self.find_lowest_low_in_pattern(candles_df, reference_low)
         
         if lowest_low is None:
-            self.logger.warning(f"No valid lowest low found for BUY signal [{range_id}]", self.symbol)
+            self.logger.warning(f"No valid lowest low found for BUY signal [{range_id}]", self.symbol, strategy_key=range_id)
             lowest_low = reference_low  # Fallback to reference low
         
         # Calculate entry, SL, and TP
@@ -145,11 +145,11 @@ class SignalGenerator:
         reward = risk * DEFAULT_RISK_REWARD_RATIO
         tp = entry + reward
         
-        self.logger.info(f"BUY Signal Generated [{range_id}]:", self.symbol)
-        self.logger.info(f"  Entry: {entry:.5f}", self.symbol)
-        self.logger.info(f"  SL: {sl:.5f} (Lowest Low: {lowest_low:.5f})", self.symbol)
-        self.logger.info(f"  TP: {tp:.5f}", self.symbol)
-        self.logger.info(f"  Risk: {risk:.5f}, Reward: {reward:.5f}, R:R: {DEFAULT_RISK_REWARD_RATIO}", self.symbol)
+        self.logger.info(f"BUY Signal Generated [{range_id}]:", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  Entry: {entry:.5f}", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  SL: {sl:.5f} (Lowest Low: {lowest_low:.5f})", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  TP: {tp:.5f}", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  Risk: {risk:.5f}, Reward: {reward:.5f}, R:R: {DEFAULT_RISK_REWARD_RATIO}", self.symbol, strategy_key=range_id)
         
         return TradeSignal(
             symbol=self.symbol,
@@ -190,7 +190,7 @@ class SignalGenerator:
         highest_high = self.find_highest_high_in_pattern(candles_df, reference_high)
         
         if highest_high is None:
-            self.logger.warning(f"No valid highest high found for SELL signal [{range_id}]", self.symbol)
+            self.logger.warning(f"No valid highest high found for SELL signal [{range_id}]", self.symbol, strategy_key=range_id)
             highest_high = reference_high  # Fallback to reference high
         
         # Calculate entry, SL, and TP
@@ -202,11 +202,11 @@ class SignalGenerator:
         reward = risk * DEFAULT_RISK_REWARD_RATIO
         tp = entry - reward
         
-        self.logger.info(f"SELL Signal Generated [{range_id}]:", self.symbol)
-        self.logger.info(f"  Entry: {entry:.5f}", self.symbol)
-        self.logger.info(f"  SL: {sl:.5f} (Highest High: {highest_high:.5f})", self.symbol)
-        self.logger.info(f"  TP: {tp:.5f}", self.symbol)
-        self.logger.info(f"  Risk: {risk:.5f}, Reward: {reward:.5f}, R:R: {DEFAULT_RISK_REWARD_RATIO}", self.symbol)
+        self.logger.info(f"SELL Signal Generated [{range_id}]:", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  Entry: {entry:.5f}", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  SL: {sl:.5f} (Highest High: {highest_high:.5f})", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  TP: {tp:.5f}", self.symbol, strategy_key=range_id)
+        self.logger.info(f"  Risk: {risk:.5f}, Reward: {reward:.5f}, R:R: {DEFAULT_RISK_REWARD_RATIO}", self.symbol, strategy_key=range_id)
         
         return TradeSignal(
             symbol=self.symbol,
