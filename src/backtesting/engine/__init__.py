@@ -1,14 +1,9 @@
 ﻿"""
-Backtesting engine and execution simulator.
+Backtesting engine (deprecated - use backtesting.py library instead).
 
-This module provides:
-- Multi-strategy backtest engine
-- Order execution simulator with slippage
-- Position management for backtesting
-- Event-driven backtesting framework
+This module is kept for reference but is no longer used.
+Use the backtesting.py library with adapters in src/backtesting/adapters/ instead.
 """
 
-from .backtest_engine import BacktestEngine, BacktestConfig
-
-__all__ = ['BacktestEngine', 'BacktestConfig']
+__all__ = []
 

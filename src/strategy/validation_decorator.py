@@ -27,35 +27,45 @@ class ValidationMetadata:
     abbreviation: str
     order: int
     description: str
+    required: bool = True  # Whether validation failure blocks signal generation
 
 
 def validation_check(
     abbreviation: str = "",
     order: int = 0,
-    description: str = ""
+    description: str = "",
+    required: bool = True
 ) -> Callable:
     """
     Decorator for strategy validation methods.
-    
+
     This decorator:
     1. Marks methods as validation checks
-    2. Stores metadata (abbreviation, order, description)
+    2. Stores metadata (abbreviation, order, description, required)
     3. Enables automatic discovery via get_validation_methods()
     4. Integrates with BaseStrategy's _validation_methods list
-    
+
     Args:
         abbreviation: Short code for trade comments (e.g., "M" for momentum)
         order: Execution order (lower numbers execute first)
         description: Human-readable description of the validation
-    
+        required: Whether validation failure blocks signal generation (default: True)
+                 - If True: validation failure prevents signal generation
+                 - If False: validation failure is logged but doesn't block signal
+
     Returns:
         Decorated validation method
-    
+
     Example:
         @validation_check(abbreviation="M", order=1, description="Check momentum strength")
         def _check_momentum_strength(self, signal_data: Dict[str, Any]) -> ValidationResult:
             # validation logic
             return ValidationResult(passed=True, method_name="_check_momentum_strength", reason="OK")
+
+        @validation_check(abbreviation="V", order=2, required=False, description="Optional volume check")
+        def _check_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
+            # optional validation - failure won't block signal
+            return ValidationResult(passed=True, method_name="_check_volume", reason="OK")
     """
     def decorator(func: Callable) -> Callable:
         # Store metadata as function attributes
@@ -64,7 +74,8 @@ def validation_check(
             method_name=func.__name__,
             abbreviation=abbreviation,
             order=order,
-            description=description or func.__doc__ or ""
+            description=description or func.__doc__ or "",
+            required=required
         )
         
         @wraps(func)
@@ -148,37 +159,50 @@ def get_validation_methods(instance: object) -> Dict[str, ValidationMetadata]:
 def auto_register_validations(instance: object) -> None:
     """
     Automatically register all decorated validation methods in a strategy instance.
-    
+
     This function should be called during strategy initialization (typically in __init__)
-    to automatically populate the _validation_methods and _validation_abbreviations
-    attributes based on decorated methods.
-    
+    to automatically populate the _validation_methods, _validation_abbreviations,
+    and _validation_requirements attributes based on decorated methods.
+
     Args:
         instance: Strategy instance (must have _validation_methods and _validation_abbreviations)
-    
+
     Example:
         class MyStrategy(BaseStrategy):
             def __init__(self, ...):
                 super().__init__(...)
-                
+
                 # Automatically discover and register validation methods
                 auto_register_validations(self)
     """
     # Get all validation methods
     methods = get_validation_methods(instance)
-    
+
     # Sort by order
     sorted_methods = sorted(methods.values(), key=lambda m: m.order)
-    
+
     # Populate _validation_methods list
     if hasattr(instance, '_validation_methods'):
         instance._validation_methods = [m.method_name for m in sorted_methods]
-    
+
     # Populate _validation_abbreviations dict
     if hasattr(instance, '_validation_abbreviations'):
         instance._validation_abbreviations = {
             m.method_name: m.abbreviation
             for m in sorted_methods
             if m.abbreviation  # Only include if abbreviation is provided
+        }
+
+    # Populate _validation_requirements dict (maps method_name -> required bool)
+    if hasattr(instance, '_validation_requirements'):
+        instance._validation_requirements = {
+            m.method_name: m.required
+            for m in sorted_methods
+        }
+    elif not hasattr(instance, '_validation_requirements'):
+        # Create the attribute if it doesn't exist
+        instance._validation_requirements = {
+            m.method_name: m.required
+            for m in sorted_methods
         }
 

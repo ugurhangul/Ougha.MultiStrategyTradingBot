@@ -181,9 +181,9 @@ class SymbolParametersRepository:
             enable_true_breakout_strategy=True,
             # Data-driven: Avg gap 0.65-0.90x, widened significantly
             breakout_volume_max=1.0,   # Was 0.6, increased significantly
-            reversal_volume_min=1.4,   # Was 3.0, lowered significantly
-            true_breakout_volume_min=1.4,  # Was 3.5, lowered significantly
-            continuation_volume_min=1.2,   # Was 2.0, lowered
+            reversal_volume_min=1,   # Was 3.0, lowered significantly
+            true_breakout_volume_min=1,  # Was 3.5, lowered significantly
+            continuation_volume_min=1,   # Was 2.0, lowered
             retest_range_percent=0.0015,  # 0.15% - Used for low-value crypto (XRPUSD, etc.)
             retest_range_points=20000.0,  # 20,000 points - Used for high-value crypto (BTCJPY ~14M)
             retest_tolerance_mode='auto',  # Auto-detect: price>1000 uses points, else uses %

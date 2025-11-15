@@ -27,5 +27,9 @@ python-dateutil>=2.8.2
 pytz>=2023.3
 
 # Backtesting
-hftbacktest>=2.4.3
+backtesting>=0.3.3
+
+# Jupyter support
+jupyter>=1.0.0
+notebook>=7.0.0
 

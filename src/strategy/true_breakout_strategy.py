@@ -863,28 +863,9 @@ class TrueBreakoutStrategy(BaseStrategy):
             # This prevents huge zones on crypto like BTCJPY while allowing
             # reasonable zones on ETHUSD
             tolerance = min(pct_tolerance, self.symbol_params.retest_range_points)
-
-            if tolerance == self.symbol_params.retest_range_points:
-                self.logger.debug(
-                    f"Retest tolerance (auto→capped): {tolerance:.2f} points "
-                    f"(capped from {pct_tolerance:.2f}, price {reference_price:.2f})",
-                    self.symbol
-                )
-            else:
-                self.logger.debug(
-                    f"Retest tolerance (auto→percent): {tolerance:.2f} "
-                    f"({self.symbol_params.retest_range_percent*100:.3f}% of {reference_price:.2f})",
-                    self.symbol
-                )
         else:
             # Low-value instrument - use percentage
             tolerance = pct_tolerance
-            self.logger.debug(
-                f"Retest tolerance (auto→percent): {tolerance:.2f} "
-                f"({self.symbol_params.retest_range_percent*100:.3f}% of {reference_price:.2f})",
-                self.symbol
-            )
-
         return tolerance
 
     def _is_continuation_volume_high(self, continuation_volume: int) -> bool:
@@ -908,7 +889,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.symbol
         )
 
-    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high")
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high", required=False)
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had high volume (required for true breakout).

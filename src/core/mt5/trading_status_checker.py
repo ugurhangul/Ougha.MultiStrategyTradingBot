@@ -235,7 +235,4 @@ class TradingStatusChecker:
         # Log if needed
         if should_log:
             if log_level == "info":
-                self.logger.info(f"{symbol}: {reason}", symbol)
-            else:
-                self.logger.debug(f"{symbol}: {reason}", symbol)
-
+                self.logger.verbose(f"{symbol}: {reason}", symbol)

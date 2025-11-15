@@ -1,29 +1,19 @@
 ﻿"""
-Strategy adapters for backtesting.
+Strategy adapters for backtesting.py.
 
 This module provides adapters to make live trading strategies
-compatible with the backtesting engine:
-- Base strategy adapter interface
-- True Breakout strategy adapter
+compatible with the backtesting.py library:
+- Base strategy adapter for backtesting.py
 - Fakeout strategy adapter
-- HFT Momentum strategy adapter
 """
 
-from .base_strategy_adapter import (
-    BaseStrategyAdapter,
-    BacktestOrder,
-    BacktestPosition
+from .backtesting_py_strategy_adapter import (
+    BacktestingPyStrategyAdapter,
+    FakeoutStrategyAdapter
 )
-from .fakeout_strategy_adapter import FakeoutStrategyAdapter
-from .true_breakout_strategy_adapter import TrueBreakoutStrategyAdapter
-from .hft_momentum_strategy_adapter import HFTMomentumStrategyAdapter
 
 __all__ = [
-    'BaseStrategyAdapter',
-    'BacktestOrder',
-    'BacktestPosition',
+    'BacktestingPyStrategyAdapter',
     'FakeoutStrategyAdapter',
-    'TrueBreakoutStrategyAdapter',
-    'HFTMomentumStrategyAdapter',
 ]
 

@@ -91,6 +91,12 @@ class BaseStrategy(ABC):
         # Example: {"_check_momentum_strength": "M", "_check_volume": "V"}
         self._validation_abbreviations: Dict[str, str] = {}
 
+        # Validation requirements - maps method names to required status
+        # If True (default), validation failure blocks signal generation
+        # If False, validation failure is logged but doesn't block signal
+        # Example: {"_check_momentum_strength": True, "_check_volume": False}
+        self._validation_requirements: Dict[str, bool] = {}
+
     @abstractmethod
     def initialize(self) -> bool:
         """
@@ -448,35 +454,74 @@ class BaseStrategy(ABC):
                     reason=f"Exception: {str(e)}"
                 ))
 
+        # Separate required and optional validation results
+        required_results = []
+        optional_results = []
+
+        for result in validation_results:
+            # Check if this validation is required (default to True if not specified)
+            is_required = self._validation_requirements.get(result.method_name, True)
+
+            if is_required:
+                required_results.append(result)
+            else:
+                optional_results.append(result)
+                # Log optional validation failures for visibility
+                if not result.passed:
+                    self.logger.debug(
+                        f"Optional validation '{result.method_name}' failed: {result.reason} (not blocking signal)",
+                        self.symbol,
+                        strategy_key=self.key
+                    )
+
         # Aggregate results based on validation mode
+        # Only required validations affect signal validity
         if self._validation_mode == "all":
-            # All validations must pass (AND logic)
-            is_valid = all(result.passed for result in validation_results)
+            # All REQUIRED validations must pass (AND logic)
+            # Optional validations don't affect the outcome
+            is_valid = all(result.passed for result in required_results) if required_results else True
         elif self._validation_mode == "any":
-            # At least one validation must pass (OR logic)
-            is_valid = any(result.passed for result in validation_results)
+            # At least one REQUIRED validation must pass (OR logic)
+            # If no required validations, signal is valid
+            is_valid = any(result.passed for result in required_results) if required_results else True
         else:
             self.logger.error(
                 f"Invalid validation mode '{self._validation_mode}', defaulting to 'all'",
                 self.symbol,
                 strategy_key=self.key
             )
-            is_valid = all(result.passed for result in validation_results)
+            is_valid = all(result.passed for result in required_results) if required_results else True
 
         # Store validation results for later use (e.g., in trade comments)
         self._last_validation_results = validation_results
 
         # Log validation summary
         if is_valid:
+            passed_count = len([r for r in validation_results if r.passed])
+            total_count = len(validation_results)
+            required_count = len(required_results)
+            optional_count = len(optional_results)
+
+            summary_parts = [f"{passed_count}/{total_count} checks"]
+            if optional_count > 0:
+                summary_parts.append(f"{required_count} required, {optional_count} optional")
+
             self.logger.debug(
-                f"✓ Signal passed validation ({len([r for r in validation_results if r.passed])}/{len(validation_results)} checks)",
+                f"✓ Signal passed validation ({', '.join(summary_parts)})",
                 self.symbol,
                 strategy_key=self.key
             )
         else:
-            failed_checks = [r for r in validation_results if not r.passed]
+            # Only show failed REQUIRED checks in the error message
+            failed_required = [r for r in required_results if not r.passed]
+            failed_optional = [r for r in optional_results if not r.passed]
+
+            failure_msg = f"✗ Signal failed validation: {', '.join([f'{r.method_name}: {r.reason}' for r in failed_required])}"
+            if failed_optional:
+                failure_msg += f" (optional failures: {', '.join([r.method_name for r in failed_optional])})"
+
             self.logger.debug(
-                f"✗ Signal failed validation: {', '.join([f'{r.method_name}: {r.reason}' for r in failed_checks])}",
+                failure_msg,
                 self.symbol,
                 strategy_key=self.key
             )

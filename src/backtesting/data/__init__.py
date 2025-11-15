@@ -1,14 +1,14 @@
 ﻿"""
-Data export and conversion utilities for backtesting.
+Data loading utilities for backtesting.
 
 This module provides tools to:
-- Export historical data from MT5
-- Convert MT5 data to hftbacktest format
-- Handle tick data and OHLCV data
-- Manage data storage and caching
+- Load historical data from MT5
+- Load data from CSV files
+- Convert data to pandas DataFrame format for backtesting.py
+- Handle OHLCV data formatting
 """
 
-from .mt5_data_exporter import MT5DataExporter
+from .backtesting_py_data_loader import BacktestingPyDataLoader
 
-__all__ = ['MT5DataExporter']
+__all__ = ['BacktestingPyDataLoader']
 
