@@ -6,7 +6,7 @@ based on symbol capabilities.
 """
 import MetaTrader5 as mt5
 from typing import Optional, TYPE_CHECKING
-from src.constants import FILLING_MODE_PREFERENCE, FILLING_MODE_FOK
+from src.constants import FILLING_MODE_PREFERENCE, FILLING_MODE_FOK, ORDER_FILLING_FOK
 
 if TYPE_CHECKING:
     from src.utils.logger import TradingLogger
@@ -57,13 +57,13 @@ class FillingModeResolver:
         """
         # Get symbol's filling mode flags
         filling_mode_flags = symbol_info.get('filling_mode', 0)
-        
+
         # If filling_mode is 0, it means it wasn't retrieved - default to FOK
         if filling_mode_flags == 0:
             self.logger.warning(
                 f"Filling mode not available for {symbol}, defaulting to FOK"
             )
-            return mt5.ORDER_FILLING_FOK
+            return ORDER_FILLING_FOK  # Use constant instead of mt5.ORDER_FILLING_FOK
         
         # Check supported modes in order of preference (from constants)
         for bit_flag, mode_constant, mode_name in FILLING_MODE_PREFERENCE:
@@ -79,7 +79,7 @@ class FillingModeResolver:
             f"No filling mode supported for {symbol} (flags: {filling_mode_flags}), "
             f"defaulting to FOK"
         )
-        return mt5.ORDER_FILLING_FOK
+        return ORDER_FILLING_FOK  # Use constant instead of mt5.ORDER_FILLING_FOK
     
     def get_filling_mode_name(self, mode_constant: int) -> str:
         """

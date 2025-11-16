@@ -34,6 +34,7 @@ from src.utils.strategy import (
 )
 from src.utils.logger import get_logger
 from src.utils.timeframe_converter import TimeframeConverter
+from src.utils.volume_cache import VolumeCache  # OPTIMIZATION #5: Phase 2
 from src.constants import RETEST_RANGE_PERCENT
 
 # Constants
@@ -115,6 +116,10 @@ class TrueBreakoutStrategy(BaseStrategy):
         self.last_reference_candle_time: Optional[datetime] = None
         self.last_confirmation_candle_time: Optional[datetime] = None
         self.last_signal_time: Optional[datetime] = None
+
+        # OPTIMIZATION #5 (Phase 2): Volume cache for efficient calculations
+        # Provides O(1) rolling average instead of O(N) Pandas operations
+        self.volume_cache = VolumeCache(lookback=20)  # 20-period volume average
 
         # All validations must pass (AND logic)
         self._validation_mode = "all"
@@ -226,7 +231,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_reference_candle(self) -> Optional[ReferenceCandle]:
@@ -439,6 +444,8 @@ class TrueBreakoutStrategy(BaseStrategy):
         """
         Update reference candle with complete OHLCV data and reset state.
 
+        OPTIMIZATION #5 (Phase 2): Resets volume cache when reference changes.
+
         Args:
             candle_data: Pandas Series containing candle data
             candle_time: Candle timestamp
@@ -460,6 +467,9 @@ class TrueBreakoutStrategy(BaseStrategy):
         # Reset unified breakout state
         self.state.reset_all()
 
+        # OPTIMIZATION #5: Reset volume cache when reference candle changes
+        self.volume_cache.reset()
+
         self.logger.info(
             f"*** NEW REFERENCE CANDLE [{self.config.range_config.range_id}] ***",
             self.symbol,
@@ -469,7 +479,11 @@ class TrueBreakoutStrategy(BaseStrategy):
         return self.current_reference_candle
 
     def _is_new_confirmation_candle(self) -> bool:
-        """Check if a new confirmation candle has formed."""
+        """
+        Check if a new confirmation candle has formed.
+
+        OPTIMIZATION #5 (Phase 2): Updates volume cache when new candle detected.
+        """
         try:
             df = self.connector.get_candles(
                 self.symbol,
@@ -485,12 +499,17 @@ class TrueBreakoutStrategy(BaseStrategy):
 
             if self.last_confirmation_candle_time is None or candle_time > self.last_confirmation_candle_time:
                 self.last_confirmation_candle_time = candle_time
+
+                # OPTIMIZATION #5: Update volume cache with new candle
+                volume = last_candle['tick_volume']
+                self.volume_cache.update(volume)
+
                 return True
 
             return False
 
         except Exception as e:
-            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def _process_confirmation_candle(self) -> Optional[TradeSignal]:
@@ -554,7 +573,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_breakout_timeout(self, current_time: datetime):
@@ -644,21 +663,28 @@ class TrueBreakoutStrategy(BaseStrategy):
         """
         STAGE 2: Strategy classification for TRUE BREAKOUT.
         Matches logic from multi_range_strategy_engine.py
-        """
-        # Get breakout candles for average volume calculation
-        df = self.connector.get_candles(
-            self.symbol,
-            self.config.range_config.breakout_timeframe,
-            count=20
-        )
-        if df is None:
-            return
 
-        # Calculate average volume
-        avg_volume = self.indicators.calculate_average_volume(
-            df['tick_volume'],
-            period=20
-        )
+        OPTIMIZATION #5 (Phase 2): Uses cached volume average if available.
+        """
+        # OPTIMIZATION #5: Use cached average if available
+        if not self.volume_cache.is_ready():
+            # Fallback to Pandas for first few candles
+            df = self.connector.get_candles(
+                self.symbol,
+                self.config.range_config.breakout_timeframe,
+                count=20
+            )
+            if df is None:
+                return
+
+            # Calculate average volume using Pandas
+            avg_volume = self.indicators.calculate_average_volume(
+                df['tick_volume'],
+                period=20
+            )
+        else:
+            # Use cached average (much faster - O(1) instead of O(N))
+            avg_volume = self.volume_cache.get_average()
 
         # === CLASSIFY BREAKOUT ABOVE (TRUE BUY) ===
         if self.state.breakout_above_detected and not self.state.true_buy_qualified:
@@ -978,7 +1004,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             reason=f"Retest {'confirmed' if retest_ok else 'failed'} for {direction_str} signal"
         )
 
-    @validation_check(abbreviation="CV", order=3, description="Check continuation volume meets threshold")
+    @validation_check(abbreviation="CV", order=3, description="Check continuation volume meets threshold", required=False)
     def _check_continuation_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if continuation volume meets configured requirements.
@@ -1111,7 +1137,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
@@ -1204,7 +1230,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
 

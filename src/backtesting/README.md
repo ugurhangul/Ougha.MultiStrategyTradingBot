@@ -1,175 +1,167 @@
-﻿# Backtesting Package
+﻿# Custom Backtesting Engine
 
-Simple, Jupyter-friendly backtesting infrastructure for the Multi-Strategy Trading Bot using `backtesting.py` library.
+A high-fidelity backtesting engine that simulates the exact live trading architecture.
 
 ## Overview
 
-This package provides comprehensive backtesting capabilities that allow you to:
-- Test strategies before live deployment
-- Optimize parameters per symbol
-- Assess risk and drawdown patterns
-- Compare strategy combinations
-- Analyze market regime performance
-- Interactive visualization in Jupyter notebooks
+This custom backtesting engine is designed to:
+- **Run the exact same code** as live trading (no strategy rewrites needed)
+- **Simulate concurrent execution** of multiple symbols and strategies
+- **Accurately model** position limits, risk management, and order execution
+- **Provide realistic results** that closely match live trading behavior
 
-## Features
+## Key Components
 
-### ✅ Completed
-- [x] **backtesting.py integration** - Simple, powerful backtesting library
-- [x] **Package structure** - Organized module hierarchy
-- [x] **MT5 data loader** - Load historical data from MetaTrader 5
-  - OHLCV candle data loading
-  - CSV data loading
-  - Automatic data formatting
-  - Data validation
-- [x] **Strategy adapters** - Convert live strategies to backtesting format
-  - Base adapter class
-  - Fakeout strategy adapter
-- [x] **Jupyter notebook** - Interactive backtesting environment
-- [x] **Test script** - Quick testing without Jupyter
-- [x] **Documentation** - Complete usage guide
+### 1. SimulatedBroker
+Replaces `MT5Connector` with historical data replay:
+- Loads historical OHLC data for each symbol and timeframe from MT5
+- **Multi-timeframe support** (M1, M5, M15, H4) - fetches actual data, no resampling
+- Simulates order execution with realistic slippage and spread
+- Tracks positions, balance, and equity
+- Provides the same interface as `MT5Connector`
 
-### 📋 Future Enhancements
-- [ ] Additional strategy adapters (TrueBreakout, HFT Momentum)
-- [ ] Advanced parameter optimization
-- [ ] Walk-forward analysis
-- [ ] Multi-symbol backtesting
-- [ ] Custom performance metrics
+### 2. BacktestController
+Orchestrates the backtest execution:
+- Initializes `TradingController` with `SimulatedBroker`
+- Advances time synchronously across all symbols
+- Calls `strategy.on_tick()` for each symbol at each time step
+- Records equity curve and trade log
 
-## Package Structure
+### 3. TimeController
+Manages time synchronization:
+- Ensures all symbols advance time together
+- Supports different time modes (REALTIME, FAST, MAX_SPEED)
+- Prevents race conditions in concurrent execution
 
-```
-src/backtesting/
-├── __init__.py                              # Package initialization
-├── README.md                                # This file
-├── data/                                    # Data loading
-│   ├── __init__.py
-│   └── backtesting_py_data_loader.py       # MT5 and CSV data loader
-├── adapters/                                # Strategy adapters
-│   ├── __init__.py
-│   └── backtesting_py_strategy_adapter.py  # backtesting.py adapters
-├── metrics/                                 # Performance metrics
-│   └── __init__.py
-└── visualization/                           # Results visualization
-    └── __init__.py
-```
+### 4. BacktestDataLoader
+Loads historical data from MT5:
+- Fetches OHLC data using `copy_rates_range()`
+- Extracts symbol information (point, digits, tick_value, etc.)
+- Validates data quality
+- Supports loading extra historical context for lookback periods
+
+### 5. ResultsAnalyzer
+Analyzes backtest results:
+- Calculates performance metrics (return, Sharpe ratio, max drawdown, etc.)
+- Generates equity curves
+- Provides trade-by-trade analysis
+- Exports results to CSV/JSON
 
 ## Quick Start
 
-### 1. Using Jupyter Notebook (Recommended)
+### Option 1: Use the Production Entry Point (Recommended)
 
 ```bash
-jupyter notebook
-# Open notebooks/backtest_fakeout_strategy.ipynb
+python backtest.py
 ```
 
-### 2. Using Python Script
+This is the easiest way to run backtests. Simply edit the CONFIGURATION section at the top of `backtest.py`:
 
+```python
+# Date Range
+START_DATE = datetime(2024, 11, 1, tzinfo=timezone.utc)
+END_DATE = datetime(2024, 11, 15, tzinfo=timezone.utc)
+
+# Initial Balance
+INITIAL_BALANCE = 10000.0
+
+# Symbols (None = load from active.set)
+SYMBOLS = None  # or ["EURUSD", "GBPUSD"]
+
+# Time Mode
+TIME_MODE = TimeMode.MAX_SPEED
+```
+
+Then run:
 ```bash
-python examples/test_backtesting_py.py
+python backtest.py
 ```
 
-### 3. Load Data from MT5
+### Option 2: Use the API Directly
 
 ```python
-from src.backtesting.data import BacktestingPyDataLoader
-from datetime import datetime
-
-# Create loader
-loader = BacktestingPyDataLoader()
-
-# Load data
-data = loader.load_from_mt5(
-    symbol='EURUSD',
-    timeframe='M5',
-    start_date=datetime(2024, 11, 1),
-    end_date=datetime(2024, 11, 15)
+from datetime import datetime, timedelta, timezone
+from src.backtesting import (
+    SimulatedBroker,
+    TimeController,
+    TimeMode,
+    BacktestController,
+    BacktestDataLoader,
+    ResultsAnalyzer
 )
+from src.execution.order_manager import OrderManager
+from src.risk.risk_manager import RiskManager
+from src.execution.trade_manager import TradeManager
+from src.indicators.technical_indicators import TechnicalIndicators
+from src.config import config
 
-print(f"Loaded {len(data)} candles")
-print(data.head())
+# 1. Load historical data
+loader = BacktestDataLoader()
+symbols = ["EURUSD", "GBPUSD"]
+timeframe = "M1"
+end_date = datetime.now(timezone.utc)
+start_date = end_date - timedelta(days=7)
+
+broker = SimulatedBroker(initial_balance=10000.0)
+for symbol in symbols:
+    data, symbol_info = loader.load_from_mt5(symbol, timeframe, start_date, end_date)
+    if data is not None:
+        broker.load_symbol_data(symbol, data[0], data[1])
+
+# 2. Initialize components
+time_controller = TimeController(symbols, mode=TimeMode.MAX_SPEED)
+order_manager = OrderManager(broker, config.advanced.magic_number, config.advanced.trade_comment)
+risk_manager = RiskManager(broker, config.risk)
+indicators = TechnicalIndicators()
+trade_manager = TradeManager(broker, order_manager, config.trailing_stop,
+                             config.advanced.use_breakeven,
+                             config.advanced.breakeven_trigger_rr, indicators)
+
+# 3. Run backtest
+backtest = BacktestController(broker, time_controller, order_manager, risk_manager, trade_manager, indicators)
+backtest.initialize(symbols)
+backtest.run()
+
+# 4. Analyze results
+results = backtest.get_results()
+analyzer = ResultsAnalyzer()
+metrics = analyzer.analyze(results)
 ```
-
-### 4. Run Backtest
-
-```python
-from backtesting import Backtest
-from src.backtesting.adapters import FakeoutStrategyAdapter
-
-# Create backtest
-bt = Backtest(
-    data,
-    FakeoutStrategyAdapter,
-    cash=10000,
-    commission=0.0
-)
-
-# Run backtest
-stats = bt.run()
-print(stats)
-
-# Plot results
-bt.plot()
-```
-
-### 5. Optimize Parameters
-
-```python
-# Optimize strategy parameters
-optimization_stats = bt.optimize(
-    reference_lookback=range(3, 10, 1),
-    max_breakout_volume_multiplier=[0.6, 0.7, 0.8, 0.9],
-    risk_reward_ratio=[1.5, 2.0, 2.5, 3.0],
-    maximize='Sharpe Ratio'
-)
-
-print(optimization_stats)
-```
-
-## Data Format
-
-The loader converts MT5 data to pandas DataFrame format required by backtesting.py:
-
-### Required Columns
-- **Open** - Opening price
-- **High** - Highest price
-- **Low** - Lowest price
-- **Close** - Closing price
-- **Volume** - Trading volume
-
-### Index
-- **DatetimeIndex** - Timestamp for each candle
 
 ## Examples
 
-See the following for complete working examples:
-- `examples/test_backtesting_py.py` - Python script example
-- `notebooks/backtest_fakeout_strategy.ipynb` - Jupyter notebook example
-- `notebooks/README.md` - Complete documentation
+- **`backtest.py`** - Production-ready main entry point (recommended)
+- **`examples/test_custom_backtest_engine.py`** - Complete API example for learning
 
-## Dependencies
+## Documentation
 
-- `backtesting>=0.3.3` - Simple backtesting library
-- `MetaTrader5>=5.0.45` - MT5 API
-- `numpy>=1.24.0` - Numerical computing
-- `pandas>=2.0.0` - Data manipulation
-- `jupyter>=1.0.0` - Jupyter notebook support
-- `notebook>=7.0.0` - Notebook interface
+- **[CUSTOM_BACKTEST_ENGINE.md](../../docs/CUSTOM_BACKTEST_ENGINE.md)** - Detailed architecture and usage guide
+- **[BACKTESTING_RESEARCH_AND_IMPLEMENTATION.md](../../docs/BACKTESTING_RESEARCH_AND_IMPLEMENTATION.md)** - Research and design decisions
 
-## Next Steps
+## Advantages Over Third-Party Libraries
 
-1. **Create additional strategy adapters** - TrueBreakout, HFT Momentum
-2. **Advanced parameter optimization** - Walk-forward analysis
-3. **Multi-symbol backtesting** - Portfolio-level testing
-4. **Custom performance metrics** - Strategy-specific metrics
+1. **Architectural Fidelity**: Runs the exact same code as live trading
+2. **Multi-Timeframe Support**: Fetches actual M1, M5, M15, H4 data from MT5 (no resampling)
+3. **Concurrent Execution**: Simulates how strategies compete for positions
+4. **Position Limits**: Accurately models global and per-symbol position limits
+5. **Risk Management**: Tests the actual risk management logic
+6. **No Code Duplication**: Strategies work unchanged in both live and backtest
+7. **Realistic Results**: Closely matches live trading behavior
 
-## Resources
+## Time Modes
 
-- [backtesting.py Documentation](https://kernc.github.io/backtesting.py/)
-- [backtesting.py GitHub](https://github.com/kernc/backtesting.py)
-- [Jupyter Notebook Documentation](https://jupyter.org/documentation)
+- **REALTIME**: 1x speed (1 second per bar) - for visual debugging
+- **FAST**: 10x speed (100ms per bar) - for faster testing
+- **MAX_SPEED**: As fast as possible - for production backtests
 
-## License
+## Logging
 
-Part of the Ougha Multi-Strategy Trading Bot project.
+Backtest logs are saved to `logs/backtest/<timestamp>/` with:
+- Simulated timestamps in log messages
+- Separate log files per symbol
+- Same log format as live trading
+
+## Version
+
+Current version: 1.0.0
 

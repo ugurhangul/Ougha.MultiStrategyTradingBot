@@ -8,6 +8,7 @@ from typing import Optional, Dict
 import colorlog
 
 from src.utils.logging.formatters import UTCFormatter
+from src.utils.logging.time_provider import get_current_time, get_log_directory
 
 
 class TradingLogger:
@@ -15,7 +16,7 @@ class TradingLogger:
 
     def __init__(self, name: str = "TradingBot", log_to_file: bool = True,
                  log_to_console: bool = True, log_level: str = "INFO",
-                 enable_detailed: bool = True):
+                 enable_detailed: bool = True, backtest_date: Optional[datetime] = None):
         """
         Initialize the trading logger.
 
@@ -25,62 +26,96 @@ class TradingLogger:
             log_to_console: Enable console logging
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
             enable_detailed: Enable detailed logging
+            backtest_date: Optional datetime for backtesting (uses this date instead of current date for log files)
         """
         self.logger = logging.getLogger(name)
         self.logger.setLevel(getattr(logging, log_level.upper()))
         self.logger.handlers.clear()  # Clear existing handlers
 
         self.enable_detailed = enable_detailed
-        self.log_dir = Path("logs")
         self.symbol_handlers: Dict[str, logging.FileHandler] = {}
         self.disable_log_handler: Optional[logging.FileHandler] = None
         self.disabled_symbols: set = set()  # Track disabled symbols to avoid duplicates
+        self.backtest_date = backtest_date  # Store backtest date for log file naming (deprecated, use time_provider)
+        self._log_to_file = log_to_file  # Store flag for later use
+        self._log_to_console = log_to_console  # Store flag for later use
+        self._log_level = log_level  # Store log level for later use
+        self._current_log_dir: Optional[Path] = None  # Track current log directory
+        self._master_file_handler: Optional[logging.FileHandler] = None  # Track master file handler
+        self._console_handler: Optional[logging.Handler] = None  # Track console handler
 
-        # Create logs directory if it doesn't exist
+        # Disable propagation to avoid duplicate logs from parent loggers
+        self.logger.propagate = False
+
+        # Create custom colored formatter with UTC (or simulated time in backtest mode)
+        class UTCColoredFormatter(colorlog.ColoredFormatter):
+            def formatTime(self, record, datefmt=None):
+                """
+                Override formatTime to use time from global time provider.
+
+                This allows logs to show simulated time during backtesting
+                instead of the current system time.
+                """
+                # Get time from global time provider (real or simulated)
+                dt = get_current_time()
+
+                if datefmt:
+                    s = dt.strftime(datefmt)
+                else:
+                    s = dt.isoformat(timespec='seconds')
+                return s
+
+        # Store the formatter class for later use
+        self._UTCColoredFormatter = UTCColoredFormatter
+
+        # Setup console handler
+        self._setup_console_handler()
+
+        # Create logs directory and file handlers if file logging is enabled
         if log_to_file:
-            self.log_dir.mkdir(exist_ok=True)
+            self._setup_file_handlers()
 
-            # Create date-based directory structure: logs/YYYY-MM-DD/
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            date_dir = self.log_dir / date_str
-            date_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create master log file: logs/YYYY-MM-DD/main.log
-            master_log_file = date_dir / "main.log"
+    @property
+    def log_dir(self) -> Path:
+        """
+        Get the current log directory dynamically.
 
-            file_handler = logging.FileHandler(master_log_file, encoding='utf-8')
-            file_handler.setLevel(logging.DEBUG)
+        This property evaluates the log directory at access time, allowing it to
+        change when switching between live and backtest modes, or when the date
+        changes (midnight crossing). If the directory changes, file handlers are
+        recreated automatically.
 
-            # Use UTC formatter for file logs
-            file_formatter = UTCFormatter(
-                '%(asctime)s UTC | %(levelname)-8s | %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-            file_handler.setFormatter(file_formatter)
-            self.logger.addHandler(file_handler)
+        Returns:
+            Path: Current log directory (logs/live/YYYY-MM-DD/ or logs/backtest/YYYY-MM-DD/)
+        """
+        current_dir = get_log_directory()
 
-            # Create disable log file: logs/YYYY-MM-DD/disable.log
-            disable_log_file = date_dir / "disable.log"
-            self.disable_log_handler = logging.FileHandler(disable_log_file, encoding='utf-8')
-            self.disable_log_handler.setLevel(logging.INFO)
-            self.disable_log_handler.setFormatter(file_formatter)
+        # Check if log directory has changed (e.g., switched modes or date changed)
+        if self._log_to_file and self._current_log_dir != current_dir:
+            # Log directory changed - recreate file handlers
+            self._setup_file_handlers()
+
+        return current_dir
+
+    def _setup_console_handler(self):
+        """
+        Setup or recreate console handler.
+
+        This method is called during initialization.
+        """
+        # Remove old console handler if it exists
+        if self._console_handler:
+            self.logger.removeHandler(self._console_handler)
+            self._console_handler = None
 
         # Create console handler with colors (still using UTC)
-        if log_to_console:
+        if self._log_to_console:
+            # Full console logging - all levels
             console_handler = colorlog.StreamHandler()
-            console_handler.setLevel(getattr(logging, log_level.upper()))
+            console_handler.setLevel(getattr(logging, self._log_level.upper()))
 
-            # Create custom colored formatter with UTC
-            class UTCColoredFormatter(colorlog.ColoredFormatter):
-                def formatTime(self, record, datefmt=None):
-                    dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
-                    if datefmt:
-                        s = dt.strftime(datefmt)
-                    else:
-                        s = dt.isoformat(timespec='seconds')
-                    return s
-
-            console_formatter = UTCColoredFormatter(
+            console_formatter = self._UTCColoredFormatter(
                 '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
                 datefmt='%H:%M:%S',
                 log_colors={
@@ -93,6 +128,87 @@ class TradingLogger:
             )
             console_handler.setFormatter(console_formatter)
             self.logger.addHandler(console_handler)
+            self._console_handler = console_handler
+        else:
+            # Console logging disabled, but ALWAYS show errors and critical
+            console_handler = colorlog.StreamHandler()
+            console_handler.setLevel(logging.ERROR)  # Only ERROR and CRITICAL
+
+            console_formatter = self._UTCColoredFormatter(
+                '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                datefmt='%H:%M:%S',
+                log_colors={
+                    'ERROR': 'red',
+                    'CRITICAL': 'red,bg_white',
+                }
+            )
+            console_handler.setFormatter(console_formatter)
+            self.logger.addHandler(console_handler)
+            self._console_handler = console_handler
+
+    def _setup_file_handlers(self):
+        """
+        Setup or recreate file handlers for the current log directory.
+
+        This method is called:
+        1. During initialization
+        2. When the log directory changes (e.g., switching from live to backtest mode)
+        """
+        # Get current log directory
+        log_dir = get_log_directory()
+
+        # If directory hasn't changed, no need to recreate handlers
+        if self._current_log_dir == log_dir:
+            return
+
+        # Update current log directory
+        self._current_log_dir = log_dir
+
+        # Create log directory if it doesn't exist
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Remove old master file handler if it exists
+        if self._master_file_handler:
+            self.logger.removeHandler(self._master_file_handler)
+            self._master_file_handler.close()
+
+        # Create new master log file handler: logs/<mode>/main.log
+        master_log_file = log_dir / "main.log"
+        self._master_file_handler = logging.FileHandler(master_log_file, encoding='utf-8')
+        self._master_file_handler.setLevel(logging.DEBUG)
+
+        # Use UTC formatter for file logs
+        file_formatter = UTCFormatter(
+            '%(asctime)s UTC | %(levelname)-8s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        self._master_file_handler.setFormatter(file_formatter)
+        self.logger.addHandler(self._master_file_handler)
+
+        # Remove old disable log handler if it exists
+        if self.disable_log_handler:
+            self.disable_log_handler.close()
+
+        # Create new disable log file: logs/<mode>/disable.log
+        disable_log_file = log_dir / "disable.log"
+        self.disable_log_handler = logging.FileHandler(disable_log_file, encoding='utf-8')
+        self.disable_log_handler.setLevel(logging.INFO)
+        self.disable_log_handler.setFormatter(file_formatter)
+
+        # Clear symbol handlers (they will be recreated on demand with new paths)
+        for handler in self.symbol_handlers.values():
+            handler.close()
+        self.symbol_handlers.clear()
+
+    def _check_date_change(self):
+        """
+        Check if the log directory has changed (e.g., date changed at midnight).
+
+        This method should be called before each log operation to ensure that
+        file handlers are recreated when the date changes.
+        """
+        # Access log_dir property to trigger date change detection
+        _ = self.log_dir
 
     def _get_symbol_handler(self, symbol: str) -> Optional[logging.FileHandler]:
         """
@@ -110,13 +226,12 @@ class TradingLogger:
 
         # Create new handler for this symbol
         try:
-            # Create date-based directory structure: logs/YYYY-MM-DD/
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            date_dir = self.log_dir / date_str
-            date_dir.mkdir(parents=True, exist_ok=True)
+            # Get log directory from time provider (logs/live/YYYY-MM-DD/ or logs/backtest/YYYY-MM-DD/)
+            log_dir = get_log_directory()
+            log_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create symbol-specific log file: logs/YYYY-MM-DD/SYMBOL.log
-            log_file = date_dir / f"{symbol}.log"
+            # Create symbol-specific log file: logs/<mode>/YYYY-MM-DD/SYMBOL.log
+            log_file = log_dir / f"{symbol}.log"
 
             handler = logging.FileHandler(log_file, encoding='utf-8')
             handler.setLevel(logging.DEBUG)
@@ -161,6 +276,7 @@ class TradingLogger:
 
     def info(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log info message"""
+        self._check_date_change()
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.INFO, message, symbol)
@@ -176,6 +292,7 @@ class TradingLogger:
 
     def debug(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log debug message (only if detailed logging enabled)"""
+        self._check_date_change()
         if self.enable_detailed:
             if symbol:
                 # Log to symbol-specific file
@@ -192,6 +309,7 @@ class TradingLogger:
 
     def warning(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log warning message"""
+        self._check_date_change()
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.WARNING, message, symbol)
@@ -207,6 +325,7 @@ class TradingLogger:
 
     def error(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log error message"""
+        self._check_date_change()
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.ERROR, message, symbol)
@@ -222,6 +341,7 @@ class TradingLogger:
 
     def critical(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log critical message"""
+        self._check_date_change()
         if symbol:
             # Log to symbol-specific file
             self._log_to_symbol_file(logging.CRITICAL, message, symbol)

@@ -82,6 +82,9 @@ class PositionPersistence:
         NOTE: This method does NOT acquire the lock - it must be called
         from a method that already holds the lock.
         """
+        import time
+        import sys
+
         try:
             # Write to temporary file first (atomic write)
             temp_file = self.positions_file.with_suffix('.json.tmp')
@@ -91,14 +94,47 @@ class PositionPersistence:
 
             with open(temp_file, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
+            # File handle is now closed
 
-            # Atomic rename (replaces old file)
-            temp_file.replace(self.positions_file)
+            # Windows-compatible atomic rename with retry logic
+            max_retries = 3
+            retry_delay = 0.1  # 100ms
 
-            self.logger.debug(f"Saved {len(self.positions_cache)} positions to persistence file")
+            for attempt in range(max_retries):
+                try:
+                    if sys.platform == 'win32':
+                        # On Windows, we need to delete the target file first
+                        # because replace() can fail with "Access is denied"
+                        if self.positions_file.exists():
+                            self.positions_file.unlink()
+                        # Now rename temp file to target
+                        temp_file.rename(self.positions_file)
+                    else:
+                        # On Unix-like systems, replace() is truly atomic
+                        temp_file.replace(self.positions_file)
+
+                    # Success
+                    self.logger.debug(f"Saved {len(self.positions_cache)} positions to persistence file")
+                    break
+
+                except (PermissionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        # Retry after a short delay
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        # Final attempt failed
+                        raise
 
         except Exception as e:
             self.logger.error(f"Error saving positions: {e}")
+            # Clean up temp file if it still exists
+            try:
+                temp_file = self.positions_file.with_suffix('.json.tmp')
+                if temp_file.exists():
+                    temp_file.unlink()
+            except:
+                pass
     
     def _add_position_internal(self, position: PositionInfo):
         """

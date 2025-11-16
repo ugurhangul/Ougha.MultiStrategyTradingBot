@@ -33,6 +33,7 @@ from src.utils.strategy import (
 )
 from src.utils.logger import get_logger
 from src.utils.timeframe_converter import TimeframeConverter
+from src.utils.volume_cache import VolumeCache  # OPTIMIZATION #5: Phase 2
 
 # Constants
 DEFAULT_INIT_SL_POINTS = 100  # Default stop loss points for initialization
@@ -109,6 +110,10 @@ class FakeoutStrategy(BaseStrategy):
         self.last_reference_candle_time: Optional[datetime] = None
         self.last_confirmation_candle_time: Optional[datetime] = None
         self.key = f"FB|{self.config.range_config.range_id}"  # Format: "FB|15M_1M"
+
+        # OPTIMIZATION #5 (Phase 2): Volume cache for efficient calculations
+        # Provides O(1) rolling average instead of O(N) Pandas operations
+        self.volume_cache = VolumeCache(lookback=VOLUME_CALCULATION_PERIOD)
 
         # All validations must pass (AND logic)
         self._validation_mode = "all"
@@ -504,6 +509,8 @@ class FakeoutStrategy(BaseStrategy):
         """
         Update reference candle with complete OHLCV data and reset state.
 
+        OPTIMIZATION #5 (Phase 2): Resets volume cache when reference changes.
+
         Args:
             candle_data: Pandas Series containing candle data
             candle_time: Candle timestamp
@@ -525,6 +532,10 @@ class FakeoutStrategy(BaseStrategy):
         # Reset unified breakout state
         self.state.reset_all()
 
+        # OPTIMIZATION #5: Reset volume cache when reference candle changes
+        # This ensures we calculate volume for the new range
+        self.volume_cache.reset()
+
         self.logger.info(
             f"*** NEW REFERENCE CANDLE [{self.config.range_config.range_id}] ***",
             self.symbol, strategy_key=self.key
@@ -533,7 +544,11 @@ class FakeoutStrategy(BaseStrategy):
         return self.current_reference_candle
 
     def _is_new_confirmation_candle(self) -> bool:
-        """Check if a new confirmation candle has formed."""
+        """
+        Check if a new confirmation candle has formed.
+
+        OPTIMIZATION #5 (Phase 2): Updates volume cache when new candle detected.
+        """
         try:
             df = self.connector.get_candles(
                 self.symbol,
@@ -549,6 +564,11 @@ class FakeoutStrategy(BaseStrategy):
 
             if self.last_confirmation_candle_time is None or candle_time > self.last_confirmation_candle_time:
                 self.last_confirmation_candle_time = candle_time
+
+                # OPTIMIZATION #5: Update volume cache with new candle
+                volume = last_candle['tick_volume']
+                self.volume_cache.update(volume)
+
                 return True
 
             return False
@@ -720,25 +740,32 @@ class FakeoutStrategy(BaseStrategy):
         """
         STAGE 2: Strategy classification for FALSE BREAKOUT.
         Matches logic from multi_range_strategy_engine.py
-        """
-        # Get breakout candles for average volume calculation
-        df = self.connector.get_candles(
-            self.symbol,
-            self.config.range_config.breakout_timeframe,
-            count=VOLUME_CALCULATION_PERIOD
-        )
-        if df is None:
-            self.logger.warning(
-                f"Failed to fetch candles for volume calculation",
-                self.symbol, strategy_key=self.key
-            )
-            return
 
-        # Calculate average volume
-        avg_volume = self.indicators.calculate_average_volume(
-            df['tick_volume'],
-            period=VOLUME_CALCULATION_PERIOD
-        )
+        OPTIMIZATION #5 (Phase 2): Uses cached volume average if available.
+        """
+        # OPTIMIZATION #5: Use cached average if available
+        if not self.volume_cache.is_ready():
+            # Fallback to Pandas for first few candles
+            df = self.connector.get_candles(
+                self.symbol,
+                self.config.range_config.breakout_timeframe,
+                count=VOLUME_CALCULATION_PERIOD
+            )
+            if df is None:
+                self.logger.warning(
+                    f"Failed to fetch candles for volume calculation",
+                    self.symbol, strategy_key=self.key
+                )
+                return
+
+            # Calculate average volume using Pandas
+            avg_volume = self.indicators.calculate_average_volume(
+                df['tick_volume'],
+                period=VOLUME_CALCULATION_PERIOD
+            )
+        else:
+            # Use cached average (much faster - O(1) instead of O(N))
+            avg_volume = self.volume_cache.get_average()
 
         # === CLASSIFY BREAKOUT ABOVE (FALSE SELL - reversal down) ===
         if self.state.breakout_above_detected and not self.state.false_sell_qualified:
@@ -880,19 +907,29 @@ class FakeoutStrategy(BaseStrategy):
         return None
 
     def _is_reversal_volume_high(self, reversal_volume: int) -> bool:
-        """Check if reversal volume is high (tracked but not required)."""
-        df = self.connector.get_candles(
-            self.symbol,
-            self.config.range_config.breakout_timeframe,
-            count=20
-        )
-        if df is None:
-            return False
+        """
+        Check if reversal volume is high (tracked but not required).
 
-        avg_volume = self.indicators.calculate_average_volume(
-            df['tick_volume'],
-            period=20
-        )
+        OPTIMIZATION #5 (Phase 2): Uses cached volume average if available.
+        """
+        # OPTIMIZATION #5: Use cached average if available
+        if not self.volume_cache.is_ready():
+            # Fallback to Pandas for first few candles
+            df = self.connector.get_candles(
+                self.symbol,
+                self.config.range_config.breakout_timeframe,
+                count=20
+            )
+            if df is None:
+                return False
+
+            avg_volume = self.indicators.calculate_average_volume(
+                df['tick_volume'],
+                period=20
+            )
+        else:
+            # Use cached average (much faster)
+            avg_volume = self.volume_cache.get_average()
 
         return reversal_volume >= (avg_volume * self.config.min_reversal_volume_multiplier)
 

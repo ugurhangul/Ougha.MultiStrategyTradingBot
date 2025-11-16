@@ -10,6 +10,14 @@ from src.utils.logging.formatters import UTCFormatter
 from src.utils.logging.handlers import SymbolFileHandler
 from src.utils.logging.trading_logger import TradingLogger
 from src.utils.logging.logger_factory import get_logger, init_logger
+from src.utils.logging.time_provider import (
+    get_time_provider,
+    set_live_mode,
+    set_backtest_mode,
+    get_current_time,
+    get_log_directory,
+    is_backtest_mode,
+)
 
 __all__ = [
     'UTCFormatter',
@@ -17,5 +25,11 @@ __all__ = [
     'TradingLogger',
     'get_logger',
     'init_logger',
+    'get_time_provider',
+    'set_live_mode',
+    'set_backtest_mode',
+    'get_current_time',
+    'get_log_directory',
+    'is_backtest_mode',
 ]
 
