@@ -1,6 +1,6 @@
 ﻿import pickle
 
-trades = pickle.load(open('backtest_trades.pkl', 'rb'))
+trades = pickle.load(open('../backtest_trades.pkl', 'rb'))
 
 print(f"Total trades: {len(trades)}")
 print("\nSample comments:")

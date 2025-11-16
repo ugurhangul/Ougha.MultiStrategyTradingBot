@@ -18,6 +18,11 @@ ORDER_TYPE_SELL = 1
 ORDER_TIME_GTC = 0
 TRADE_RETCODE_DONE = 10009
 
+# Filling mode constants (matching real MT5)
+ORDER_FILLING_FOK = 1  # Fill or Kill
+ORDER_FILLING_IOC = 2  # Immediate or Cancel
+ORDER_FILLING_RETURN = 4  # Return (partial fills allowed)
+
 
 class OrderSendResult(NamedTuple):
     """Result of order_send (matching MT5 structure)."""

@@ -73,7 +73,7 @@ from src.core.mt5_connector import MT5Connector
 # Use recent dates for quick testing, or longer periods for comprehensive analysis
 # IMPORTANT: Use recent dates (2025)! Some symbols are new and don't have 2024 data
 # Recommended: Last 7-14 days for testing, last 1-3 months for full backtest
-START_DATE = datetime(2025, 11, 10, tzinfo=timezone.utc)
+START_DATE = datetime(2025, 10, 1, tzinfo=timezone.utc)
 END_DATE = datetime(2025, 11, 15, tzinfo=timezone.utc)
 
 # Initial Balance
@@ -108,6 +108,27 @@ HISTORICAL_BUFFER_DAYS = 10
 USE_CACHE = True  # Set to False to always download from MT5
 CACHE_DIR = "data"  # Directory for cached data
 FORCE_REFRESH = False  # Set to True to re-download all data even if cached
+
+# Slippage Simulation (for realistic backtest results)
+# Slippage simulates the difference between expected and actual execution price
+ENABLE_SLIPPAGE = False  # Set to False to disable slippage (optimistic results)
+SLIPPAGE_POINTS = 0.5  # Base slippage in points (0.5 = half a pip for 5-digit quotes)
+# Note: Actual slippage varies based on:
+#   - Order volume (larger orders = more slippage)
+#   - Market volatility (high volume bars = more slippage)
+#   - Typical values: 0.3-1.0 points for majors, 1.0-3.0 for exotics
+
+# Leverage (for margin calculation)
+# Leverage determines how much margin is required to open positions
+# Higher leverage = less margin required per trade (more positions possible)
+# Lower leverage = more margin required per trade (fewer positions possible)
+LEVERAGE = 2000  # 100:1 leverage (typical for forex)
+# Common leverage values:
+#   - 30:1  (conservative, US retail forex limit)
+#   - 100:1 (standard for most forex brokers)
+#   - 200:1 (aggressive)
+#   - 500:1 (very aggressive, common for offshore brokers)
+# Example: With 100:1 leverage, controlling $10,000 worth of currency requires $100 margin
 
 
 # ============================================================================
@@ -225,6 +246,9 @@ def main():
     progress_print(f"  Timeframes:       {', '.join(TIMEFRAMES)}", logger)
     progress_print(f"  Time Mode:        {TIME_MODE.value}", logger)
     progress_print(f"  Spreads:          Read from MT5 (per-symbol actual spreads)", logger)
+    slippage_status = f"ENABLED ({SLIPPAGE_POINTS} points base)" if ENABLE_SLIPPAGE else "DISABLED"
+    progress_print(f"  Slippage:         {slippage_status}", logger)
+    progress_print(f"  Leverage:         {LEVERAGE:.0f}:1", logger)
     progress_print("", logger)
 
     # Validate date range
@@ -469,7 +493,10 @@ def main():
     # This ensures backtest behavior matches live trading
     broker = SimulatedBroker(
         initial_balance=INITIAL_BALANCE,
-        persistence=backtest_persistence
+        persistence=backtest_persistence,
+        enable_slippage=ENABLE_SLIPPAGE,
+        slippage_points=SLIPPAGE_POINTS,
+        leverage=LEVERAGE
     )
 
     # Load data for trading symbols (all timeframes) and conversion pairs (M1 only)

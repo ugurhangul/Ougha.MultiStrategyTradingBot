@@ -65,11 +65,18 @@ FILLING_MODE_FOK: Final[int] = 1   # Fill or Kill (bit 0)
 FILLING_MODE_IOC: Final[int] = 2   # Immediate or Cancel (bit 1)
 FILLING_MODE_RETURN: Final[int] = 4  # Can remain in order book (bit 2)
 
+# MT5 order filling mode constants (hardcoded to avoid import-time dependency on MT5)
+# These match the MT5 constants but are defined here to work in backtest mode
+ORDER_FILLING_FOK: Final[int] = 1      # Fill or Kill
+ORDER_FILLING_IOC: Final[int] = 2      # Immediate or Cancel
+ORDER_FILLING_RETURN: Final[int] = 4   # Return (partial fills allowed)
+
 # Filling mode preference order (most restrictive to least)
+# Uses our constants instead of mt5.ORDER_FILLING_* to avoid import-time issues
 FILLING_MODE_PREFERENCE: Final[list] = [
-    (FILLING_MODE_FOK, mt5.ORDER_FILLING_FOK, "FOK"),
-    (FILLING_MODE_IOC, mt5.ORDER_FILLING_IOC, "IOC"),
-    (FILLING_MODE_RETURN, mt5.ORDER_FILLING_RETURN, "RETURN"),
+    (FILLING_MODE_FOK, ORDER_FILLING_FOK, "FOK"),
+    (FILLING_MODE_IOC, ORDER_FILLING_IOC, "IOC"),
+    (FILLING_MODE_RETURN, ORDER_FILLING_RETURN, "RETURN"),
 ]
 
 

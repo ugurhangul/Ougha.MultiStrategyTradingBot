@@ -915,7 +915,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.symbol
         )
 
-    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high")
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high", required=False)
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had high volume (required for true breakout).
@@ -1004,7 +1004,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             reason=f"Retest {'confirmed' if retest_ok else 'failed'} for {direction_str} signal"
         )
 
-    @validation_check(abbreviation="CV", order=3, description="Check continuation volume meets threshold")
+    @validation_check(abbreviation="CV", order=3, description="Check continuation volume meets threshold", required=False)
     def _check_continuation_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if continuation volume meets configured requirements.

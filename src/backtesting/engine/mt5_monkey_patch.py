@@ -18,6 +18,11 @@ _original_last_error = mt5.last_error
 _original_positions_get = mt5.positions_get
 _original_symbol_info_tick = mt5.symbol_info_tick
 
+# Store original MT5 constants (in case MT5 isn't initialized)
+_original_ORDER_FILLING_FOK = getattr(mt5, 'ORDER_FILLING_FOK', None)
+_original_ORDER_FILLING_IOC = getattr(mt5, 'ORDER_FILLING_IOC', None)
+_original_ORDER_FILLING_RETURN = getattr(mt5, 'ORDER_FILLING_RETURN', None)
+
 # Global reference to SimulatedBroker (set by apply_mt5_patch)
 _simulated_broker: Optional[SimulatedBroker] = None
 
@@ -264,6 +269,15 @@ def apply_mt5_patch(broker: SimulatedBroker):
     mt5.positions_get = _patched_positions_get
     mt5.symbol_info_tick = _patched_symbol_info_tick
 
+    # Ensure filling mode constants are set (in case MT5 isn't initialized)
+    # These are needed by FillingModeResolver
+    if not hasattr(mt5, 'ORDER_FILLING_FOK') or mt5.ORDER_FILLING_FOK is None:
+        mt5.ORDER_FILLING_FOK = 1
+    if not hasattr(mt5, 'ORDER_FILLING_IOC') or mt5.ORDER_FILLING_IOC is None:
+        mt5.ORDER_FILLING_IOC = 2
+    if not hasattr(mt5, 'ORDER_FILLING_RETURN') or mt5.ORDER_FILLING_RETURN is None:
+        mt5.ORDER_FILLING_RETURN = 4
+
 
 def restore_mt5_functions():
     """
@@ -280,4 +294,12 @@ def restore_mt5_functions():
     mt5.last_error = _original_last_error
     mt5.positions_get = _original_positions_get
     mt5.symbol_info_tick = _original_symbol_info_tick
+
+    # Restore original filling mode constants (if they were stored)
+    if _original_ORDER_FILLING_FOK is not None:
+        mt5.ORDER_FILLING_FOK = _original_ORDER_FILLING_FOK
+    if _original_ORDER_FILLING_IOC is not None:
+        mt5.ORDER_FILLING_IOC = _original_ORDER_FILLING_IOC
+    if _original_ORDER_FILLING_RETURN is not None:
+        mt5.ORDER_FILLING_RETURN = _original_ORDER_FILLING_RETURN
 

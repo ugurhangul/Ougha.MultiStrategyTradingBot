@@ -89,7 +89,9 @@ class SimulatedBroker:
     can run without modification.
     """
     
-    def __init__(self, initial_balance: float = 10000.0, spread_points: float = 10.0, persistence=None):
+    def __init__(self, initial_balance: float = 10000.0, spread_points: float = 10.0,
+                 persistence=None, enable_slippage: bool = True, slippage_points: float = 0.5,
+                 leverage: float = 100.0):
         """
         Initialize simulated broker.
 
@@ -97,6 +99,9 @@ class SimulatedBroker:
             initial_balance: Starting account balance
             spread_points: Default spread in points (used as fallback if symbol has no spread info)
             persistence: Optional PositionPersistence instance for tracking positions
+            enable_slippage: Whether to simulate slippage on order execution (default: True)
+            slippage_points: Base slippage in points for normal market conditions (default: 0.5)
+            leverage: Leverage ratio (e.g., 100.0 for 100:1 leverage, default: 100.0)
         """
         self.logger = get_logger()
 
@@ -114,6 +119,13 @@ class SimulatedBroker:
 
         # Per-symbol spread tracking (loaded from MT5 symbol_info)
         self.symbol_spreads: Dict[str, float] = {}
+
+        # Slippage simulation
+        self.enable_slippage = enable_slippage
+        self.base_slippage_points = slippage_points  # Base slippage for normal conditions
+
+        # Leverage (for margin calculation)
+        self.leverage = leverage
 
         # Position persistence (optional, for synchronization with live trading behavior)
         self.persistence = persistence
@@ -661,6 +673,59 @@ class SimulatedBroker:
     # Order Execution Methods (Simulated)
     # ========================================================================
 
+    def _calculate_slippage(self, symbol: str, volume: float) -> float:
+        """
+        Calculate realistic slippage in points based on volume and market conditions.
+
+        Slippage factors:
+        - Base slippage: 0.5 points for normal conditions
+        - Volume impact: Larger orders get more slippage
+        - Volatility impact: Higher volatility = more slippage (simulated via volume)
+
+        Args:
+            symbol: Symbol name
+            volume: Order volume in lots
+
+        Returns:
+            Slippage in points (always >= 0)
+        """
+        if not self.enable_slippage:
+            return 0.0
+
+        try:
+            # Base slippage for normal market conditions
+            slippage = self.base_slippage_points
+
+            # Volume impact: Larger orders experience more slippage
+            # Standard lot = 1.0, mini lot = 0.1, micro lot = 0.01
+            # For every 1.0 lot, add 0.3 points of slippage
+            volume_impact = (volume - 0.01) * 0.3  # Subtract micro lot baseline
+            slippage += max(0, volume_impact)
+
+            # Get current candle to check for volatility (high volume = high volatility)
+            candle = self.get_latest_candle(symbol, "M1")
+            if candle and candle.volume > 0:
+                # Get average volume from recent bars
+                candles = self.get_candles(symbol, "M1", count=20)
+                if candles is not None and len(candles) >= 10:
+                    # Use 'tick_volume' or 'volume' column (MT5 uses 'tick_volume')
+                    volume_col = 'tick_volume' if 'tick_volume' in candles.columns else 'volume'
+                    avg_volume = candles[volume_col].mean()
+
+                    # If current volume is significantly higher than average, add volatility slippage
+                    if candle.volume > avg_volume * 1.5:
+                        volatility_multiplier = min(candle.volume / avg_volume, 3.0)  # Cap at 3x
+                        slippage *= volatility_multiplier
+
+            # Round to 1 decimal place
+            return round(slippage, 1)
+
+        except Exception as e:
+            # If slippage calculation fails, fall back to base slippage
+            # This ensures order execution continues even if there's a data issue
+            self.logger.debug(f"[BACKTEST] Slippage calculation failed for {symbol}: {e}. Using base slippage.")
+            return self.base_slippage_points
+
     def place_market_order(self, symbol: str, order_type: PositionType, volume: float,
                           sl: float, tp: float, magic_number: int, comment: str = "") -> OrderResult:
         """
@@ -678,6 +743,25 @@ class SimulatedBroker:
         Returns:
             OrderResult with execution details
         """
+        try:
+            return self._place_market_order_impl(symbol, order_type, volume, sl, tp, magic_number, comment)
+        except Exception as e:
+            self.logger.error(
+                f"[BACKTEST] EXCEPTION in place_market_order for {symbol}: {type(e).__name__}: {e}"
+            )
+            import traceback
+            self.logger.error(f"[BACKTEST] Traceback:\n{traceback.format_exc()}")
+            return OrderResult(
+                success=False,
+                order=None,
+                price=None,
+                retcode=10018,
+                comment=f"Exception: {type(e).__name__}: {e}"
+            )
+
+    def _place_market_order_impl(self, symbol: str, order_type: PositionType, volume: float,
+                                 sl: float, tp: float, magic_number: int, comment: str = "") -> OrderResult:
+        """Internal implementation of place_market_order with exception handling wrapper."""
         with self.position_lock:
             # Check if autotrading is enabled
             if not self.autotrading_enabled:
@@ -699,6 +783,41 @@ class SimulatedBroker:
                     comment=f"Trading disabled for {symbol}"
                 )
 
+            # Validate symbol info exists
+            if symbol not in self.symbol_info:
+                return OrderResult(
+                    success=False,
+                    order=None,
+                    price=None,
+                    retcode=10018,  # TRADE_RETCODE_MARKET_CLOSED
+                    comment=f"Symbol info not available for {symbol}"
+                )
+
+            info = self.symbol_info[symbol]
+
+            # Validate volume
+            if volume < info.min_lot:
+                error_msg = f"Volume {volume} below minimum {info.min_lot}"
+                self.logger.warning(f"[BACKTEST] Order rejected: {error_msg}")
+                return OrderResult(
+                    success=False,
+                    order=None,
+                    price=None,
+                    retcode=10014,  # TRADE_RETCODE_INVALID_VOLUME
+                    comment=error_msg
+                )
+
+            if volume > info.max_lot:
+                error_msg = f"Volume {volume} above maximum {info.max_lot}"
+                self.logger.warning(f"[BACKTEST] Order rejected: {error_msg}")
+                return OrderResult(
+                    success=False,
+                    order=None,
+                    price=None,
+                    retcode=10014,  # TRADE_RETCODE_INVALID_VOLUME
+                    comment=error_msg
+                )
+
             # Get execution price
             price_type = 'ask' if order_type == PositionType.BUY else 'bid'
             execution_price = self.get_current_price(symbol, price_type)
@@ -710,6 +829,114 @@ class SimulatedBroker:
                     price=None,
                     retcode=10018,  # TRADE_RETCODE_MARKET_CLOSED
                     comment="No price data available"
+                )
+
+            # Validate SL/TP distance (stops_level check)
+            if info.stops_level > 0:
+                min_distance = info.stops_level * info.point
+
+                # Check SL distance
+                if sl > 0:
+                    sl_distance = abs(execution_price - sl)
+                    if sl_distance < min_distance:
+                        error_msg = f"SL too close: {sl_distance:.5f} < min {min_distance:.5f} ({info.stops_level} points)"
+                        self.logger.warning(f"[BACKTEST] Order rejected for {symbol}: {error_msg}")
+                        return OrderResult(
+                            success=False,
+                            order=None,
+                            price=None,
+                            retcode=10016,  # TRADE_RETCODE_INVALID_STOPS
+                            comment=error_msg
+                        )
+
+                # Check TP distance
+                if tp > 0:
+                    tp_distance = abs(execution_price - tp)
+                    if tp_distance < min_distance:
+                        error_msg = f"TP too close: {tp_distance:.5f} < min {min_distance:.5f} ({info.stops_level} points)"
+                        self.logger.warning(f"[BACKTEST] Order rejected for {symbol}: {error_msg}")
+                        return OrderResult(
+                            success=False,
+                            order=None,
+                            price=None,
+                            retcode=10016,  # TRADE_RETCODE_INVALID_STOPS
+                            comment=error_msg
+                        )
+
+            # Check for sufficient margin (simplified)
+            # Margin is calculated in BASE currency, then converted to account currency
+            # For EURUSD: margin in EUR, convert to USD
+            # For CHFJPY: margin in CHF, convert to USD
+            # Uses configurable leverage (e.g., 100:1, 200:1, 500:1)
+
+            # Calculate margin in base currency
+            # Margin = (volume * contract_size) / leverage
+            margin_in_base_currency = (volume * info.contract_size) / self.leverage
+
+            # Convert to account currency (USD)
+            # For simplicity, use a rough conversion rate
+            # In reality, we'd need to get the conversion rate from broker
+            base_currency = info.currency_base
+
+            if base_currency == "USD":
+                # Already in USD
+                required_margin = margin_in_base_currency
+            elif base_currency in ["EUR", "GBP", "AUD", "NZD"]:
+                # These are typically worth more than USD
+                # Rough estimate: 1 EUR/GBP/AUD/NZD ≈ 1.0-1.5 USD
+                required_margin = margin_in_base_currency * 1.1
+            elif base_currency == "CHF":
+                # CHF ≈ 1.1 USD
+                required_margin = margin_in_base_currency * 1.1
+            elif base_currency == "JPY":
+                # JPY ≈ 0.0067 USD (1 USD ≈ 150 JPY)
+                required_margin = margin_in_base_currency * 0.0067
+            elif base_currency == "CAD":
+                # CAD ≈ 0.72 USD
+                required_margin = margin_in_base_currency * 0.72
+            else:
+                # Default: assume 1:1
+                required_margin = margin_in_base_currency
+                self.logger.warning(
+                    f"[BACKTEST] Unknown base currency {base_currency} for {symbol}, "
+                    f"assuming 1:1 conversion to USD"
+                )
+
+            # Check if we have enough free margin (balance - used margin)
+            # Allow using up to 95% of balance for margin
+            # This leaves 5% as safety buffer (more aggressive but realistic for backtest)
+            max_margin = self.balance * 0.95
+
+            if required_margin > max_margin:
+                error_msg = f"Insufficient margin: required ${required_margin:.2f}, available ${max_margin:.2f}"
+                self.logger.warning(f"[BACKTEST] Order rejected for {symbol}: {error_msg}")
+                self.logger.warning(
+                    f"[BACKTEST]   Balance: ${self.balance:.2f}, Volume: {volume}, "
+                    f"Contract Size: {info.contract_size}, Price: {execution_price:.5f}"
+                )
+                return OrderResult(
+                    success=False,
+                    order=None,
+                    price=None,
+                    retcode=10019,  # TRADE_RETCODE_NO_MONEY
+                    comment=error_msg
+                )
+
+            # Apply slippage (realistic market execution)
+            slippage_points = self._calculate_slippage(symbol, volume)
+            if slippage_points > 0 and symbol in self.symbol_info:
+                point = self.symbol_info[symbol].point
+                slippage_price = slippage_points * point
+
+                # Slippage always works against the trader
+                if order_type == PositionType.BUY:
+                    execution_price += slippage_price  # Pay more for BUY
+                else:
+                    execution_price -= slippage_price  # Get less for SELL
+
+                self.logger.debug(
+                    f"[BACKTEST] Applied slippage: {slippage_points:.1f} points "
+                    f"({slippage_price:.5f} price) to {symbol} {order_type.name}"
                 )
 
             # Create position
@@ -740,8 +967,10 @@ class SimulatedBroker:
                     f"| SL: {sl:.5f} | TP: {tp:.5f} | Ticket: {ticket} - THIS POSITION WILL NEVER CLOSE!"
                 )
 
+            # Log order execution with slippage info
+            slippage_info = f" (slippage: {slippage_points:.1f}pts)" if slippage_points > 0 else ""
             self.logger.info(
-                f"[BACKTEST] Order executed: {symbol} {order_type.name} {volume} lots @ {execution_price:.5f} "
+                f"[BACKTEST] Order executed: {symbol} {order_type.name} {volume} lots @ {execution_price:.5f}{slippage_info} "
                 f"| SL: {sl:.5f} | TP: {tp:.5f} | Ticket: {ticket}"
             )
 
@@ -906,33 +1135,89 @@ class SimulatedBroker:
 
     def _check_sl_tp_hit(self, position: PositionInfo) -> bool:
         """
-        Check if position hit SL or TP.
+        Check if position hit SL or TP using intra-bar accuracy.
+
+        Uses the high/low prices of the current M1 bar to detect SL/TP hits
+        that may have occurred during the bar, not just at the close.
+
+        This is more realistic than only checking the close price, as it
+        accounts for price wicks that touch SL/TP levels.
 
         Returns:
             True if SL or TP was hit
         """
-        current_price = position.current_price
+        # Get the current M1 candle for intra-bar high/low
+        candle = self.get_latest_candle(position.symbol, "M1")
 
+        if candle is None:
+            # Fallback to close price if candle not available
+            current_price = position.current_price
+
+            if position.position_type == PositionType.BUY:
+                if position.sl > 0 and current_price <= position.sl:
+                    self.logger.info(f"[BACKTEST] Position {position.ticket} hit SL: {current_price:.5f} <= {position.sl:.5f}")
+                    return True
+                if position.tp > 0 and current_price >= position.tp:
+                    self.logger.info(f"[BACKTEST] Position {position.ticket} hit TP: {current_price:.5f} >= {position.tp:.5f}")
+                    return True
+            else:  # SELL
+                if position.sl > 0 and current_price >= position.sl:
+                    self.logger.info(f"[BACKTEST] Position {position.ticket} hit SL: {current_price:.5f} >= {position.sl:.5f}")
+                    return True
+                if position.tp > 0 and current_price <= position.tp:
+                    self.logger.info(f"[BACKTEST] Position {position.ticket} hit TP: {current_price:.5f} <= {position.tp:.5f}")
+                    return True
+            return False
+
+        # Use intra-bar high/low for more accurate SL/TP detection
         if position.position_type == PositionType.BUY:
-            # Check SL (below current price)
-            if position.sl > 0 and current_price <= position.sl:
-                self.logger.info(f"[BACKTEST] Position {position.ticket} hit SL: {current_price:.5f} <= {position.sl:.5f}")
+            # For BUY positions:
+            # - SL is below entry, check if low touched it
+            # - TP is above entry, check if high touched it
+
+            # Check SL hit (price went down to SL level)
+            if position.sl > 0 and candle.low <= position.sl:
+                # Update position price to SL for accurate profit calculation
+                position.current_price = position.sl
+                self.logger.info(
+                    f"[BACKTEST] Position {position.ticket} hit SL (intra-bar): "
+                    f"bar_low={candle.low:.5f} <= SL={position.sl:.5f}"
+                )
                 return True
 
-            # Check TP (above current price)
-            if position.tp > 0 and current_price >= position.tp:
-                self.logger.info(f"[BACKTEST] Position {position.ticket} hit TP: {current_price:.5f} >= {position.tp:.5f}")
+            # Check TP hit (price went up to TP level)
+            if position.tp > 0 and candle.high >= position.tp:
+                # Update position price to TP for accurate profit calculation
+                position.current_price = position.tp
+                self.logger.info(
+                    f"[BACKTEST] Position {position.ticket} hit TP (intra-bar): "
+                    f"bar_high={candle.high:.5f} >= TP={position.tp:.5f}"
+                )
                 return True
 
         else:  # SELL
-            # Check SL (above current price)
-            if position.sl > 0 and current_price >= position.sl:
-                self.logger.info(f"[BACKTEST] Position {position.ticket} hit SL: {current_price:.5f} >= {position.sl:.5f}")
+            # For SELL positions:
+            # - SL is above entry, check if high touched it
+            # - TP is below entry, check if low touched it
+
+            # Check SL hit (price went up to SL level)
+            if position.sl > 0 and candle.high >= position.sl:
+                # Update position price to SL for accurate profit calculation
+                position.current_price = position.sl
+                self.logger.info(
+                    f"[BACKTEST] Position {position.ticket} hit SL (intra-bar): "
+                    f"bar_high={candle.high:.5f} >= SL={position.sl:.5f}"
+                )
                 return True
 
-            # Check TP (below current price)
-            if position.tp > 0 and current_price <= position.tp:
-                self.logger.info(f"[BACKTEST] Position {position.ticket} hit TP: {current_price:.5f} <= {position.tp:.5f}")
+            # Check TP hit (price went down to TP level)
+            if position.tp > 0 and candle.low <= position.tp:
+                # Update position price to TP for accurate profit calculation
+                position.current_price = position.tp
+                self.logger.info(
+                    f"[BACKTEST] Position {position.ticket} hit TP (intra-bar): "
+                    f"bar_low={candle.low:.5f} <= TP={position.tp:.5f}"
+                )
                 return True
 
         return False

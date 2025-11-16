@@ -289,19 +289,64 @@ class OrderExecutor:
             if result is None:
                 # Get last error from MT5
                 last_error = mt5.last_error()
+
+                # Get additional diagnostic information
+                symbol_info = self.connector.get_symbol_info(symbol)
+                account_info = mt5.account_info()
+
+                # Calculate SL/TP distances for diagnostics
+                sl_distance = abs(price - sl) if sl > 0 else 0
+                tp_distance = abs(price - tp) if tp > 0 else 0
+
+                # Get stops level requirement
+                stops_level = symbol_info.get('stops_level', 0) if symbol_info else 0
+                point = symbol_info.get('point', 0.00001) if symbol_info else 0.00001
+                min_distance = stops_level * point
+
+                # Build detailed diagnostic context
+                diagnostic_context = {
+                    "order_type": signal.signal_type.value.upper(),
+                    "volume": volume,
+                    "price": price,
+                    "sl": sl,
+                    "tp": tp,
+                    "sl_distance": f"{sl_distance:.5f}",
+                    "tp_distance": f"{tp_distance:.5f}",
+                    "min_distance_required": f"{min_distance:.5f} ({stops_level} points)",
+                    "sl_valid": "YES" if sl_distance >= min_distance or sl == 0 else "NO - TOO CLOSE",
+                    "tp_valid": "YES" if tp_distance >= min_distance or tp == 0 else "NO - TOO CLOSE",
+                    "filling_mode": request.get('type_filling', 'unknown'),
+                    "request": str(request),
+                    "last_error": str(last_error),
+                }
+
+                # Add account info if available
+                if account_info:
+                    diagnostic_context["account_balance"] = f"${account_info.balance:.2f}"
+                    diagnostic_context["account_equity"] = f"${account_info.equity:.2f}"
+                    diagnostic_context["account_margin_free"] = f"${account_info.margin_free:.2f}"
+
                 self.logger.trade_error(
                     symbol=symbol,
                     error_type="Trade Execution",
-                    error_message=f"order_send failed, no result returned from MT5. Last error: {last_error}",
-                    context={
-                        "order_type": signal.signal_type.value.upper(),
-                        "volume": volume,
-                        "price": price,
-                        "sl": sl,
-                        "tp": tp,
-                        "request": str(request)
-                    }
+                    error_message=f"order_send returned None (MT5 rejected order silently). Last error: {last_error}",
+                    context=diagnostic_context
                 )
+
+                # Log possible causes
+                if sl_distance < min_distance and sl > 0:
+                    self.logger.error(
+                        f"⚠️ LIKELY CAUSE: SL too close to entry price! "
+                        f"Distance: {sl_distance:.5f}, Required: {min_distance:.5f}",
+                        symbol
+                    )
+                if tp_distance < min_distance and tp > 0:
+                    self.logger.error(
+                        f"⚠️ LIKELY CAUSE: TP too close to entry price! "
+                        f"Distance: {tp_distance:.5f}, Required: {min_distance:.5f}",
+                        symbol
+                    )
+
                 return None
 
             if result.retcode != mt5.TRADE_RETCODE_DONE:
