@@ -95,6 +95,14 @@ class MT5Connector:
         """Get account currency. Delegates to AccountInfoProvider."""
         return self.account_info_provider.get_account_currency()
 
+    def get_account_free_margin(self) -> Optional[float]:
+        """Get account free margin. Delegates to AccountInfoProvider."""
+        return self.account_info_provider.get_account_free_margin()
+
+    def calculate_margin(self, symbol: str, volume: float, price: float) -> Optional[float]:
+        """Calculate required margin. Delegates to AccountInfoProvider."""
+        return self.account_info_provider.calculate_margin(symbol, volume, price)
+
     def get_currency_conversion_rate(self, from_currency: str, to_currency: str) -> Optional[float]:
         """Get conversion rate. Delegates to AccountInfoProvider."""
         return self.account_info_provider.get_currency_conversion_rate(from_currency, to_currency)

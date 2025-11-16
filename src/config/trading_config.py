@@ -57,9 +57,12 @@ class TradingConfig:
         min_lot_str = os.getenv('MIN_LOT_SIZE', '0.01').strip().upper()
         min_lot_value = 0.0 if min_lot_str == 'MIN' else float(min_lot_str)
 
-        # Parse MAX_LOT_SIZE: if "MIN", use 0 to signal using symbol's minimum
+        # Parse MAX_LOT_SIZE: if "MAX", use 0 to signal using symbol's maximum; if "MIN", use symbol's minimum
         max_lot_str = os.getenv('MAX_LOT_SIZE', '0.01').strip().upper()
-        max_lot_value = 0.0 if max_lot_str == 'MIN' else float(max_lot_str)
+        if max_lot_str in ('MAX', 'MIN'):
+            max_lot_value = 0.0
+        else:
+            max_lot_value = float(max_lot_str)
 
         self.risk = RiskConfig(
             risk_percent_per_trade=float(os.getenv('RISK_PERCENT_PER_TRADE', '1.0')),
@@ -98,7 +101,8 @@ class TradingConfig:
             use_breakeven=os.getenv('USE_BREAKEVEN', 'true').lower() == 'true',
             breakeven_trigger_rr=float(os.getenv('BREAKEVEN_TRIGGER_RR', '1.0')),
             magic_number=int(os.getenv('MAGIC_NUMBER', '123456')),
-            trade_comment=os.getenv('TRADE_COMMENT', '5MinScalper')
+            trade_comment=os.getenv('TRADE_COMMENT', '5MinScalper'),
+            enable_order_prevalidation=os.getenv('ENABLE_ORDER_PREVALIDATION', 'true').lower() == 'true'
         )
 
         # Range configurations for multi-range mode

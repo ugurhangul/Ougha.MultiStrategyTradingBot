@@ -16,6 +16,7 @@ import pandas as pd
 from src.strategy.base_strategy import BaseStrategy, ValidationResult
 from src.strategy.strategy_factory import register_strategy
 from src.strategy.validation_decorator import validation_check, auto_register_validations
+from src.strategy.adaptive_filter import AdaptiveFilter
 from src.models.data_models import (
     TradeSignal, PositionType, SymbolCategory, SymbolParameters, CandleData, ReferenceCandle,
     UnifiedBreakoutState
@@ -28,6 +29,7 @@ from src.risk.position_sizing.pattern_based_position_sizer import PatternBasedPo
 from src.indicators.technical_indicators import TechnicalIndicators
 from src.config.strategies import TrueBreakoutConfig
 from src.config.symbols import SymbolParametersRepository
+from src.config.trading_config import TradingConfig
 from src.utils.strategy import (
     SymbolCategoryUtils, StopLossCalculator, ValidationThresholdsCalculator,
     SignalValidationHelpers, RangeDetector, BreakoutDetector, ContinuationValidator
@@ -121,6 +123,9 @@ class TrueBreakoutStrategy(BaseStrategy):
         # Provides O(1) rolling average instead of O(N) Pandas operations
         self.volume_cache = VolumeCache(lookback=20)  # 20-period volume average
 
+        # Adaptive filter (will be initialized after symbol_params is loaded)
+        self.adaptive_filter: Optional[AdaptiveFilter] = None
+
         # All validations must pass (AND logic)
         self._validation_mode = "all"
 
@@ -154,6 +159,26 @@ class TrueBreakoutStrategy(BaseStrategy):
             default_params = SymbolParameters()  # Use default if category unknown
             self.symbol_params = SymbolParametersRepository.get_parameters(
                 self.category, default_params
+            )
+
+            # Initialize adaptive filter
+            trading_config = TradingConfig()
+            self.adaptive_filter = AdaptiveFilter(
+                symbol=self.symbol,
+                config=trading_config.adaptive_filters,
+                symbol_params=self.symbol_params
+            )
+
+            # Initialize filter state based on configuration
+            if trading_config.adaptive_filters.start_with_filters_enabled:
+                self.adaptive_filter.state.volume_confirmation_active = True
+                self.adaptive_filter.state.divergence_confirmation_active = True
+                self.symbol_params.volume_confirmation_enabled = True
+                self.symbol_params.divergence_confirmation_enabled = True
+
+            self.logger.info(
+                f"Adaptive filters initialized: enabled={trading_config.adaptive_filters.use_adaptive_filters}",
+                self.symbol, strategy_key=self.key
             )
 
             # Load validation thresholds
@@ -1050,20 +1075,52 @@ class TrueBreakoutStrategy(BaseStrategy):
     def _generate_buy_signal(self, candle: CandleData) -> Optional[TradeSignal]:
         """Generate BUY signal with proper SL/TP calculation."""
         try:
+            # Check if we already have a BUY position for this symbol/strategy
+            # This prevents duplicate signal generation while a position is open
+            existing_positions = self.connector.get_positions(
+                symbol=self.symbol,
+                magic_number=self.magic_number
+            )
+
+            for pos in existing_positions:
+                if pos.position_type == PositionType.BUY:
+                    # Extract strategy type from comment (format: "TB|15M_1M|BV")
+                    parts = pos.comment.split('|') if '|' in pos.comment else []
+                    comment_strategy = parts[0] if len(parts) > 0 else ''
+                    comment_range = parts[1] if len(parts) > 1 else ''
+
+                    # Check if this is the same strategy and range
+                    if comment_strategy == "TB" and comment_range == self.config.range_config.range_id:
+                        self.logger.debug(
+                            f"Suppressing BUY signal - position already open (ticket: {pos.ticket})",
+                            self.symbol, strategy_key=self.key
+                        )
+                        return None
+
+            # Calculate entry price first (needed for validation)
+            entry_price = candle.close
+
             # Calculate stop loss using pattern-based position sizer if available
             if isinstance(self.position_sizer, PatternBasedPositionSizer):
-                # Use pattern-based SL calculation (considers reference candle + breakout pattern)
-                sl_result = self.position_sizer.calculate_stop_loss_for_buy(
-                    reference_candle=self.current_reference_candle,
-                    breakout_candles=None  # Can be extended to include breakout candles
-                )
-                stop_loss = sl_result.stop_loss
+                try:
+                    # Use pattern-based SL calculation (considers reference candle + breakout pattern)
+                    sl_result = self.position_sizer.calculate_stop_loss_for_buy(
+                        reference_candle=self.current_reference_candle,
+                        breakout_candles=None  # Can be extended to include breakout candles
+                    )
+                    stop_loss = sl_result.stop_loss
 
-                self.logger.debug(
-                    f"Pattern-based SL for BUY: {stop_loss:.5f} "
-                    f"(Pattern Low: {sl_result.pattern_low:.5f}, Spread: {sl_result.spread_applied:.5f})",
-                    self.symbol
-                )
+                    self.logger.debug(
+                        f"Pattern-based SL for BUY: {stop_loss:.5f} "
+                        f"(Pattern Low: {sl_result.pattern_low:.5f}, Spread: {sl_result.spread_applied:.5f})",
+                        self.symbol, strategy_key=self.key
+                    )
+                except ValueError as e:
+                    self.logger.error(
+                        f"Failed to calculate pattern-based stop loss for BUY: {e}",
+                        self.symbol, strategy_key=self.key
+                    )
+                    return None
             else:
                 # Fallback to original SL calculation
                 symbol_info = self.connector.get_symbol_info(self.symbol)
@@ -1086,9 +1143,32 @@ class TrueBreakoutStrategy(BaseStrategy):
                 stop_loss = self.current_reference_candle.low - buffer
                 stop_loss = round(stop_loss, digits)
 
-            # Calculate take profit
-            entry_price = candle.close
+            # Validate stop loss distance
             sl_distance = abs(entry_price - stop_loss)
+            if sl_distance <= 0:
+                self.logger.error(
+                    f"Invalid stop loss for BUY signal - SL distance is zero or negative",
+                    self.symbol, strategy_key=self.key
+                )
+                self.logger.error(
+                    f"Entry: {entry_price:.5f}, SL: {stop_loss:.5f}, Distance: {sl_distance:.5f}",
+                    self.symbol, strategy_key=self.key
+                )
+                return None
+
+            # Verify SL is on correct side for BUY
+            if stop_loss >= entry_price:
+                self.logger.error(
+                    f"Invalid stop loss for BUY signal - SL must be below entry price",
+                    self.symbol, strategy_key=self.key
+                )
+                self.logger.error(
+                    f"Entry: {entry_price:.5f}, SL: {stop_loss:.5f}",
+                    self.symbol, strategy_key=self.key
+                )
+                return None
+
+            # Calculate take profit
             take_profit = entry_price + (sl_distance * self.config.risk_reward_ratio)
 
             # Calculate lot size from position sizer
@@ -1143,20 +1223,52 @@ class TrueBreakoutStrategy(BaseStrategy):
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
         """Generate SELL signal with proper SL/TP calculation."""
         try:
+            # Check if we already have a SELL position for this symbol/strategy
+            # This prevents duplicate signal generation while a position is open
+            existing_positions = self.connector.get_positions(
+                symbol=self.symbol,
+                magic_number=self.magic_number
+            )
+
+            for pos in existing_positions:
+                if pos.position_type == PositionType.SELL:
+                    # Extract strategy type from comment (format: "TB|15M_1M|BV")
+                    parts = pos.comment.split('|') if '|' in pos.comment else []
+                    comment_strategy = parts[0] if len(parts) > 0 else ''
+                    comment_range = parts[1] if len(parts) > 1 else ''
+
+                    # Check if this is the same strategy and range
+                    if comment_strategy == "TB" and comment_range == self.config.range_config.range_id:
+                        self.logger.debug(
+                            f"Suppressing SELL signal - position already open (ticket: {pos.ticket})",
+                            self.symbol, strategy_key=self.key
+                        )
+                        return None
+
+            # Calculate entry price first (needed for validation)
+            entry_price = candle.close
+
             # Calculate stop loss using pattern-based position sizer if available
             if isinstance(self.position_sizer, PatternBasedPositionSizer):
-                # Use pattern-based SL calculation (considers reference candle + breakout pattern)
-                sl_result = self.position_sizer.calculate_stop_loss_for_sell(
-                    reference_candle=self.current_reference_candle,
-                    breakout_candles=None  # Can be extended to include breakout candles
-                )
-                stop_loss = sl_result.stop_loss
+                try:
+                    # Use pattern-based SL calculation (considers reference candle + breakout pattern)
+                    sl_result = self.position_sizer.calculate_stop_loss_for_sell(
+                        reference_candle=self.current_reference_candle,
+                        breakout_candles=None  # Can be extended to include breakout candles
+                    )
+                    stop_loss = sl_result.stop_loss
 
-                self.logger.debug(
-                    f"Pattern-based SL for SELL: {stop_loss:.5f} "
-                    f"(Pattern High: {sl_result.pattern_high:.5f}, Spread: {sl_result.spread_applied:.5f})",
-                    self.symbol
-                )
+                    self.logger.debug(
+                        f"Pattern-based SL for SELL: {stop_loss:.5f} "
+                        f"(Pattern High: {sl_result.pattern_high:.5f}, Spread: {sl_result.spread_applied:.5f})",
+                        self.symbol, strategy_key=self.key
+                    )
+                except ValueError as e:
+                    self.logger.error(
+                        f"Failed to calculate pattern-based stop loss for SELL: {e}",
+                        self.symbol, strategy_key=self.key
+                    )
+                    return None
             else:
                 # Fallback to original SL calculation
                 symbol_info = self.connector.get_symbol_info(self.symbol)
@@ -1179,9 +1291,32 @@ class TrueBreakoutStrategy(BaseStrategy):
                 stop_loss = self.current_reference_candle.high + buffer
                 stop_loss = round(stop_loss, digits)
 
-            # Calculate take profit
-            entry_price = candle.close
+            # Validate stop loss distance
             sl_distance = abs(entry_price - stop_loss)
+            if sl_distance <= 0:
+                self.logger.error(
+                    f"Invalid stop loss for SELL signal - SL distance is zero or negative",
+                    self.symbol, strategy_key=self.key
+                )
+                self.logger.error(
+                    f"Entry: {entry_price:.5f}, SL: {stop_loss:.5f}, Distance: {sl_distance:.5f}",
+                    self.symbol, strategy_key=self.key
+                )
+                return None
+
+            # Verify SL is on correct side for SELL
+            if stop_loss <= entry_price:
+                self.logger.error(
+                    f"Invalid stop loss for SELL signal - SL must be above entry price",
+                    self.symbol, strategy_key=self.key
+                )
+                self.logger.error(
+                    f"Entry: {entry_price:.5f}, SL: {stop_loss:.5f}",
+                    self.symbol, strategy_key=self.key
+                )
+                return None
+
+            # Calculate take profit
             take_profit = entry_price - (sl_distance * self.config.risk_reward_ratio)
 
             # Calculate lot size from position sizer
@@ -1255,6 +1390,10 @@ class TrueBreakoutStrategy(BaseStrategy):
             f"Position closed: {'WIN' if is_win else 'LOSS'} ${profit:.2f}",
             self.symbol, strategy_key=self.key
         )
+
+        # Update adaptive filter state
+        if self.adaptive_filter is not None:
+            self.adaptive_filter.on_trade_result(is_win)
 
         # Delegate to position sizer
         if self.position_sizer is not None:

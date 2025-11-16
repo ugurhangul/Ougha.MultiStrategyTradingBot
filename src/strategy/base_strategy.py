@@ -72,6 +72,10 @@ class BaseStrategy(ABC):
         self.position_sizer = position_sizer
         self.logger = get_logger()
         self.key = "base_strategy"
+
+        # Get magic number from order manager
+        self.magic_number = order_manager.magic_number if order_manager else None
+
         # Common state
         self.is_initialized = False
         self.category: Optional[SymbolCategory] = None

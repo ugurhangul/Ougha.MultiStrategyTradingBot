@@ -20,6 +20,12 @@ class TimeMode(Enum):
     MAX_SPEED = "max"  # As fast as possible
 
 
+class TimeGranularity(Enum):
+    """Time granularity for backtesting."""
+    TICK = "tick"      # Advance tick-by-tick (highest fidelity)
+    MINUTE = "minute"  # Advance minute-by-minute (candle-based)
+
+
 class TimeController:
     """
     Controls synchronized time advancement across multiple symbol threads.
@@ -34,19 +40,22 @@ class TimeController:
     """
 
     def __init__(self, symbols: List[str], mode: TimeMode = TimeMode.MAX_SPEED,
+                 granularity: TimeGranularity = TimeGranularity.MINUTE,
                  include_position_monitor: bool = True, broker=None):
         """
         Initialize time controller.
 
         Args:
             symbols: List of symbols to synchronize
-            mode: Time advancement mode
+            mode: Time advancement mode (REALTIME, FAST, MAX_SPEED)
+            granularity: Time granularity (TICK or MINUTE)
             include_position_monitor: Whether to include position monitor in barrier (default: True)
             broker: SimulatedBroker instance for global time advancement (backtest only)
         """
         self.logger = get_logger()
         self.symbols = symbols
         self.mode = mode
+        self.granularity = granularity
         self.include_position_monitor = include_position_monitor
         self.broker = broker  # For global time advancement
 
@@ -83,6 +92,22 @@ class TimeController:
 
     def start(self):
         """Start time controller."""
+        # Validate tick timeline if in tick mode
+        if self.granularity == TimeGranularity.TICK:
+            if self.broker is None:
+                self.logger.error("TICK mode requires broker to be set!")
+                return
+            if not hasattr(self.broker, 'global_tick_timeline'):
+                self.logger.error("TICK mode enabled but broker has no global_tick_timeline!")
+                self.logger.error("Make sure tick data is loaded before starting TimeController")
+                return
+            if len(self.broker.global_tick_timeline) == 0:
+                self.logger.error("TICK mode enabled but global_tick_timeline is EMPTY!")
+                self.logger.error("Check that tick data was loaded in STEP 2 and STEP 4.5")
+                return
+
+            self.logger.info(f"TICK mode validated: {len(self.broker.global_tick_timeline):,} ticks in timeline")
+
         self.running = True
         self.paused = False
         self.start_time = datetime.now(timezone.utc)
@@ -130,6 +155,10 @@ class TimeController:
         if not self.running:
             return False
 
+        # Determine if this thread should advance time (last to arrive)
+        should_advance_time = False
+        arrival_generation = 0
+
         with self.barrier_condition:
             # Mark this participant as ready
             self.symbols_ready.add(participant)
@@ -137,44 +166,94 @@ class TimeController:
             # Remember the current generation when we arrived
             arrival_generation = self.barrier_generation
 
+            # Debug logging for first few steps
+            if self.total_steps < 3:
+                self.logger.info(f"[BARRIER] {participant} arrived at barrier (gen={arrival_generation}, ready={len(self.symbols_ready)}/{self.total_participants})")
+
             # Check if all participants are ready
             if len(self.symbols_ready) == self.total_participants:
+                # Debug logging for first few steps
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] All {self.total_participants} participants ready! Advancing time...")
+
                 # All participants ready - advance time
                 self.total_steps += 1
+
+                # CRITICAL: Increment generation FIRST, before clearing ready set
+                # This prevents race condition where threads wake up and re-add themselves
+                # to the ready set before seeing the new generation
+                self.barrier_generation += 1
+
+                # Debug logging
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] Generation incremented to {self.barrier_generation}")
 
                 # Clear ready set for next step
                 self.symbols_ready.clear()
 
-                # Apply time delay based on mode
-                self._apply_time_delay()
+                # Mark that this thread should advance time (after releasing lock)
+                should_advance_time = True
 
-                # Advance global time by one minute (if broker is available)
-                if self.broker is not None:
+        # CRITICAL: Advance time OUTSIDE the barrier_condition lock to avoid deadlock
+        # The time advancement acquires time_lock, which might be held by other threads
+        # If we hold barrier_condition while trying to acquire time_lock, we can deadlock
+        if should_advance_time:
+            # Apply time delay based on mode
+            self._apply_time_delay()
+
+            # Advance global time (if broker is available)
+            # Call appropriate method based on granularity
+            if self.broker is not None:
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] About to advance time (granularity={self.granularity.value})")
+
+                if self.granularity == TimeGranularity.TICK:
+                    # Tick-by-tick mode: advance to next tick in global timeline
+                    # Check if tick timeline is loaded
+                    if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
+                        self.logger.error("TICK mode enabled but no tick timeline loaded!")
+                        self.logger.error("Check that tick data was loaded in STEP 2")
+                        self.running = False
+                    else:
+                        if self.total_steps < 3:
+                            self.logger.info(f"[BARRIER] Calling advance_global_time_tick_by_tick()")
+                        if not self.broker.advance_global_time_tick_by_tick():
+                            # All ticks processed, stop backtest
+                            self.running = False
+                else:  # MINUTE
+                    # Minute-by-minute mode: advance by 1 minute
                     if not self.broker.advance_global_time():
                         # All symbols exhausted, stop backtest
                         self.running = False
 
-                # Increment generation to signal barrier release
-                # This is the key fix: all threads (including this one) must see the new generation
-                self.barrier_generation += 1
-
+            # Re-acquire barrier_condition to notify waiting threads
+            with self.barrier_condition:
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] Notifying all threads (generation={self.barrier_generation})")
                 # Notify all waiting threads
                 self.barrier_condition.notify_all()
 
-                # IMPORTANT: The last thread to arrive must also wait for the barrier to be released
-                # This prevents it from racing ahead and processing the next tick before others wake up
-                # We wait until we see the new generation (which we just incremented)
-                # Since we just incremented it, we'll see it immediately and exit the loop
-                # But this ensures consistent behavior for all threads
+        # Wait for barrier to be released (generation to change)
+        # All threads (including the last one to arrive) wait here
+        with self.barrier_condition:
+            wait_count = 0
+            if self.total_steps < 3:
+                self.logger.info(f"[BARRIER] {participant} entering wait loop (arrival={arrival_generation}, current={self.barrier_generation}, should_wait={self.barrier_generation == arrival_generation})")
 
-            # Wait for barrier to be released (generation to change)
-            # All threads (including the last one to arrive) wait here
             while (self.running and
                    self.barrier_generation == arrival_generation and
                    not self.paused):
+                if self.total_steps < 3 and wait_count == 0:
+                    self.logger.info(f"[BARRIER] {participant} waiting for generation change (arrival={arrival_generation}, current={self.barrier_generation})")
                 self.barrier_condition.wait(timeout=1.0)
+                wait_count += 1
+                if self.total_steps < 3 and wait_count == 1:
+                    self.logger.info(f"[BARRIER] {participant} woke up (arrival={arrival_generation}, current={self.barrier_generation}, running={self.running})")
 
-            return self.running
+            if self.total_steps < 3:
+                self.logger.info(f"[BARRIER] {participant} exiting wait loop (arrival={arrival_generation}, current={self.barrier_generation})")
+
+        return self.running
 
     def remove_participant(self, participant: str):
         """

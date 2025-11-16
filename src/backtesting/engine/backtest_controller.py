@@ -31,16 +31,17 @@ class BacktestController:
     - Reuses existing strategies without modification
     """
     
-    def __init__(self, 
+    def __init__(self,
                  simulated_broker: SimulatedBroker,
                  time_controller: TimeController,
                  order_manager: OrderManager,
                  risk_manager: RiskManager,
                  trade_manager: TradeManager,
-                 indicators: TechnicalIndicators):
+                 indicators: TechnicalIndicators,
+                 stop_loss_threshold: float = 0.0):
         """
         Initialize backtest controller.
-        
+
         Args:
             simulated_broker: Simulated broker instance
             time_controller: Time controller instance
@@ -48,11 +49,12 @@ class BacktestController:
             risk_manager: Risk manager instance
             trade_manager: Trade manager instance
             indicators: Technical indicators instance
+            stop_loss_threshold: Stop backtest if balance falls below this % of initial (0 = disabled)
         """
         self.logger = get_logger()
         self.broker = simulated_broker
         self.time_controller = time_controller
-        
+
         # Create TradingController with simulated broker and time controller
         self.trading_controller = TradingController(
             connector=simulated_broker,  # Pass SimulatedBroker as connector
@@ -62,7 +64,7 @@ class BacktestController:
             indicators=indicators,
             time_controller=time_controller  # Pass TimeController for backtest synchronization
         )
-        
+
         # Backtest state
         self.running = False
         self.symbols: List[str] = []
@@ -73,6 +75,11 @@ class BacktestController:
 
         # Results tracking
         self.equity_curve: List[Dict] = []
+
+        # Early termination settings
+        self.stop_loss_threshold = stop_loss_threshold
+        self.stop_loss_triggered = False
+        self.stop_loss_balance_threshold = 0.0  # Will be set when backtest starts
         self.trade_log: List[Dict] = []
 
         self.logger.info("BacktestController initialized")
@@ -137,6 +144,13 @@ class BacktestController:
         self.logger.info("Logging time provider updated to use simulated time from broker")
         self.logger.info(f"Backtest time range: {self.start_time} to {self.end_time}")
 
+        # Set stop loss threshold
+        if self.stop_loss_threshold > 0:
+            self.stop_loss_balance_threshold = self.broker.initial_balance * (self.stop_loss_threshold / 100.0)
+            self.logger.info(f"Stop loss threshold: ${self.stop_loss_balance_threshold:,.2f} ({self.stop_loss_threshold}% of initial balance)")
+        else:
+            self.logger.info("Stop loss threshold: DISABLED (will run full backtest period)")
+
         try:
             self.running = True
 
@@ -193,6 +207,32 @@ class BacktestController:
                 print()  # Move to next line after progress updates
                 self.logger.info("All worker threads completed")
                 break
+
+            # Check for early termination due to stop loss threshold
+            # Use EQUITY (balance + floating P/L) instead of just balance
+            if self.stop_loss_threshold > 0 and not self.stop_loss_triggered:
+                current_equity = self.broker.get_account_equity()
+                if current_equity <= self.stop_loss_balance_threshold:
+                    self.stop_loss_triggered = True
+                    print()  # Move to next line after progress updates
+                    self.logger.warning("")
+                    current_balance = self.broker.get_account_balance()
+                    self.logger.warning("=" * 80)
+                    self.logger.warning("⚠️  STOP LOSS THRESHOLD REACHED - TERMINATING BACKTEST")
+                    self.logger.warning("=" * 80)
+                    self.logger.warning(f"  Initial Balance:    ${self.broker.initial_balance:,.2f}")
+                    self.logger.warning(f"  Current Balance:    ${current_balance:,.2f}")
+                    self.logger.warning(f"  Current Equity:     ${current_equity:,.2f}")
+                    self.logger.warning(f"  Threshold:          ${self.stop_loss_balance_threshold:,.2f} ({self.stop_loss_threshold}%)")
+                    self.logger.warning(f"  Loss:               ${current_equity - self.broker.initial_balance:,.2f} ({((current_equity - self.broker.initial_balance) / self.broker.initial_balance * 100):.2f}%)")
+                    self.logger.warning("=" * 80)
+                    self.logger.warning("")
+
+                    # Stop the backtest
+                    self.running = False
+                    self.time_controller.stop()
+                    self.trading_controller.stop()
+                    break
 
             # Record equity curve periodically
             if step % 10 == 0:  # Record every 10 checks (10 seconds)
@@ -307,17 +347,30 @@ class BacktestController:
             closed_trades = self.broker.closed_trades
             total_trades = len(closed_trades)
 
-            # Get progress percentage based on time (not bar indices)
+            # Get progress percentage
+            # For tick mode: use tick index, for candle mode: use time
             progress_pct = 0
-            if self.start_time and self.end_time and current_time:
-                # Calculate progress as percentage of time elapsed
-                total_duration = (self.end_time - self.start_time).total_seconds()
-                elapsed_duration = (current_time - self.start_time).total_seconds()
+            tick_info = ""
 
-                if total_duration > 0:
-                    progress_pct = (elapsed_duration / total_duration * 100)
-                    # Clamp to 0-100 range
-                    progress_pct = max(0, min(100, progress_pct))
+            if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
+                # Tick mode: show tick progress
+                if hasattr(self.broker, 'global_tick_index') and hasattr(self.broker, 'global_tick_timeline'):
+                    total_ticks = len(self.broker.global_tick_timeline)
+                    current_tick = self.broker.global_tick_index
+                    if total_ticks > 0:
+                        progress_pct = (current_tick / total_ticks * 100)
+                        tick_info = f" | Tick: {current_tick:,}/{total_ticks:,}"
+            else:
+                # Candle mode: use time-based progress
+                if self.start_time and self.end_time and current_time:
+                    # Calculate progress as percentage of time elapsed
+                    total_duration = (self.end_time - self.start_time).total_seconds()
+                    elapsed_duration = (current_time - self.start_time).total_seconds()
+
+                    if total_duration > 0:
+                        progress_pct = (elapsed_duration / total_duration * 100)
+                        # Clamp to 0-100 range
+                        progress_pct = max(0, min(100, progress_pct))
 
             # Calculate live metrics
             metrics = self._calculate_live_metrics(stats, closed_trades)
@@ -347,7 +400,7 @@ class BacktestController:
             barrier_status = f"Waiting: {symbols_waiting}/{total_participants}" if symbols_waiting > 0 else ""
 
             print(
-                f"\r[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')} | "
+                f"\r[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')}{tick_info} | "
                 f"Equity: ${stats['equity']:>10,.2f} | "
                 f"P&L: ${stats['profit']:>8,.2f} ({stats['profit_percent']:>+6.2f}%) | "
                 f"Floating: ${stats['floating_pnl']:>8,.2f} | "

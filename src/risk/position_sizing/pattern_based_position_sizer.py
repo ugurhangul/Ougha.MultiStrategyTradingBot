@@ -293,6 +293,13 @@ class PatternBasedPositionSizer(BasePositionSizer):
         stop_loss = pattern_low - spread_price
         stop_loss = round(stop_loss, digits)
 
+        # Validate that we have a reasonable stop loss
+        if pattern_low <= 0:
+            raise ValueError(
+                f"Invalid pattern_low ({pattern_low:.5f}) - cannot calculate stop loss. "
+                f"This may indicate insufficient historical data."
+            )
+
         self.logger.debug(
             f"BUY SL calculated from 10x{self.execution_timeframe} candles: SL={stop_loss:.5f}, "
             f"Pattern Low={pattern_low:.5f}, Spread={spread_price:.5f}",
@@ -352,6 +359,13 @@ class PatternBasedPositionSizer(BasePositionSizer):
         # For SELL: SL = pattern_high + spread (to account for BID/ASK difference)
         stop_loss = pattern_high + spread_price
         stop_loss = round(stop_loss, digits)
+
+        # Validate that we have a reasonable stop loss
+        if pattern_high <= 0:
+            raise ValueError(
+                f"Invalid pattern_high ({pattern_high:.5f}) - cannot calculate stop loss. "
+                f"This may indicate insufficient historical data."
+            )
 
         self.logger.debug(
             f"SELL SL calculated from 10x{self.execution_timeframe} candles: SL={stop_loss:.5f}, "

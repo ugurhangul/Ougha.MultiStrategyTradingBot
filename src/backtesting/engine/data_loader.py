@@ -275,6 +275,157 @@ class BacktestDataLoader:
             self.logger.error(f"Error getting date range for {symbol}: {e}")
             return None
 
+    def load_ticks_from_mt5(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        tick_type: int = mt5.COPY_TICKS_INFO,
+        cache_dir: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load tick data from MT5 using copy_ticks_range().
+
+        Supports caching: If cache_dir is provided, saves ticks to parquet files
+        and loads from cache on subsequent runs.
+
+        Args:
+            symbol: Symbol name
+            start_date: Start date (UTC)
+            end_date: End date (UTC)
+            tick_type: Type of ticks to load (default: COPY_TICKS_INFO for bid/ask changes)
+                - mt5.COPY_TICKS_ALL: All ticks
+                - mt5.COPY_TICKS_INFO: Bid/ask changes (recommended)
+                - mt5.COPY_TICKS_TRADE: Trade ticks only
+            cache_dir: Directory to cache tick data (optional). If provided, ticks are
+                saved to/loaded from parquet files for faster subsequent runs.
+
+        Returns:
+            DataFrame with columns: time, bid, ask, last, volume, time_msc, flags
+            or None if failed
+        """
+        from pathlib import Path
+
+        # Check cache first if cache_dir provided
+        if cache_dir:
+            cache_path = Path(cache_dir)
+            cache_path.mkdir(parents=True, exist_ok=True)
+
+            # Create cache filename based on symbol, dates, and tick type
+            tick_type_name = {
+                mt5.COPY_TICKS_INFO: "INFO",
+                mt5.COPY_TICKS_ALL: "ALL",
+                mt5.COPY_TICKS_TRADE: "TRADE"
+            }.get(tick_type, "UNKNOWN")
+
+            start_str = start_date.strftime("%Y%m%d")
+            end_str = end_date.strftime("%Y%m%d")
+            cache_file = cache_path / f"{symbol}_{start_str}_{end_str}_{tick_type_name}.parquet"
+
+            # Try to load from cache
+            if cache_file.exists():
+                try:
+                    self.logger.info(f"Loading {symbol} ticks from cache: {cache_file.name}")
+                    df = pd.read_parquet(cache_file)
+
+                    # Ensure time column is datetime with UTC timezone
+                    if 'time' in df.columns:
+                        df['time'] = pd.to_datetime(df['time'], utc=True)
+
+                    self.logger.info(f"  ✓ Loaded {len(df):,} ticks from cache")
+                    return df
+                except Exception as e:
+                    self.logger.warning(f"Failed to load from cache: {e}, will reload from MT5")
+
+        try:
+            # Connect if needed
+            if self._owns_connector and not self.connector.is_connected:
+                if not self.connector.connect():
+                    self.logger.error("Failed to connect to MT5")
+                    return None
+
+            # Ensure symbol is selected in Market Watch
+            if not mt5.symbol_select(symbol, True):
+                self.logger.warning(f"Could not select {symbol} in Market Watch")
+
+            # Check if symbol is available
+            symbol_info_check = mt5.symbol_info(symbol)
+            if symbol_info_check is None:
+                self.logger.error(f"Symbol {symbol} not found in MT5")
+                return None
+
+            if not symbol_info_check.visible:
+                self.logger.warning(f"Symbol {symbol} not visible, attempting to enable...")
+                if not mt5.symbol_select(symbol, True):
+                    self.logger.error(f"Failed to enable {symbol} in Market Watch")
+                    return None
+
+            # Load ticks from MT5
+            self.logger.info(f"Loading tick data for {symbol} from {start_date} to {end_date}")
+            self.logger.info(f"  Tick type: {tick_type} (INFO=bid/ask, ALL=all ticks, TRADE=trades only)")
+
+            ticks = mt5.copy_ticks_range(symbol, start_date, end_date, tick_type)
+
+            if ticks is None or len(ticks) == 0:
+                error_code, error_msg = mt5.last_error()
+                self.logger.error(
+                    f"No tick data retrieved for {symbol} - "
+                    f"MT5 Error: ({error_code}) {error_msg}"
+                )
+                self.logger.error(
+                    f"Date range: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to "
+                    f"{end_date.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                return None
+
+            # Convert to DataFrame
+            df = pd.DataFrame(ticks)
+
+            # Convert time from Unix timestamp to datetime
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+
+            # Ensure all required columns exist
+            required_cols = ['time', 'bid', 'ask', 'last', 'volume']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                self.logger.error(f"Tick data missing required columns: {missing_cols}")
+                return None
+
+            # Filter out ticks with zero bid/ask (invalid ticks)
+            initial_count = len(df)
+            df = df[(df['bid'] > 0) & (df['ask'] > 0)].copy()
+            filtered_count = initial_count - len(df)
+
+            if filtered_count > 0:
+                self.logger.warning(f"  Filtered out {filtered_count} invalid ticks (zero bid/ask)")
+
+            self.logger.info(f"  Loaded {len(df):,} ticks for {symbol}")
+
+            # Log tick data statistics
+            if len(df) > 0:
+                time_span = (df['time'].iloc[-1] - df['time'].iloc[0]).total_seconds()
+                ticks_per_second = len(df) / time_span if time_span > 0 else 0
+                self.logger.info(f"  Time span: {time_span/3600:.1f} hours")
+                self.logger.info(f"  Average: {ticks_per_second:.1f} ticks/second")
+
+            # Save to cache if cache_dir provided
+            if cache_dir and len(df) > 0:
+                try:
+                    self.logger.info(f"  Saving ticks to cache: {cache_file.name}")
+                    df.to_parquet(cache_file, compression='snappy', index=False)
+                    file_size_mb = cache_file.stat().st_size / 1024 / 1024
+                    self.logger.info(f"  ✓ Cached {len(df):,} ticks ({file_size_mb:.1f} MB)")
+                except Exception as e:
+                    self.logger.warning(f"  Failed to save cache: {e}")
+
+            return df
+
+        except Exception as e:
+            self.logger.error(f"Error loading tick data for {symbol}: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None
+
     def _convert_timeframe(self, timeframe: str) -> Optional[int]:
         """Convert timeframe string to MT5 constant."""
         timeframe_map = {

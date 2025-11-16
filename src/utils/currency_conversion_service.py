@@ -21,16 +21,22 @@ class CurrencyConversionService:
     - Try multiple pair formats (direct, inverse, with separators)
     - Convert tick values to account currency
     - Handle conversion failures gracefully
+
+    Works in both live and backtest modes:
+    - Live: Uses mt5.symbol_info_tick() for current rates
+    - Backtest: Uses connector.get_current_price() for historical rates
     """
 
-    def __init__(self, logger: 'TradingLogger'):
+    def __init__(self, logger: 'TradingLogger', connector=None):
         """
         Initialize currency conversion service.
-        
+
         Args:
             logger: Logger instance for logging conversion operations
+            connector: MT5Connector or SimulatedBroker instance (optional, for backtest mode)
         """
         self.logger = logger
+        self.connector = connector  # For backtest mode
     
     def get_conversion_rate(
         self,
@@ -39,19 +45,20 @@ class CurrencyConversionService:
     ) -> Optional[float]:
         """
         Get conversion rate from one currency to another.
-        
+
         Tries multiple formats:
         1. Direct pair: FROMTO (e.g., THBUSD)
         2. Inverse pair: TOFROM (e.g., USDTHB)
         3. Pairs with separators: FROM/TO, FROM.TO, FROM_TO
-        
+        4. Cross-rate via common currency (e.g., CHF->USD via EUR)
+
         Args:
             from_currency: Source currency (e.g., 'THB')
             to_currency: Target currency (e.g., 'USD')
-            
+
         Returns:
             Conversion rate or None if not available
-            
+
         Examples:
             >>> service.get_conversion_rate('USD', 'EUR')
             0.92  # 1 USD = 0.92 EUR
@@ -61,26 +68,31 @@ class CurrencyConversionService:
         # Same currency - no conversion needed
         if from_currency == to_currency:
             return 1.0
-        
+
         # Try direct pair: FROMTO (e.g., THBUSD)
         rate = self._try_direct_pair(from_currency, to_currency)
         if rate is not None:
             return rate
-        
+
         # Try inverse pair: TOFROM (e.g., USDTHB)
         rate = self._try_inverse_pair(from_currency, to_currency)
         if rate is not None:
             return rate
-        
+
         # Try with common separators
         rate = self._try_with_separators(from_currency, to_currency)
         if rate is not None:
             return rate
-        
+
+        # Try cross-rate via common currencies (EUR, GBP, JPY)
+        rate = self._try_cross_rate(from_currency, to_currency)
+        if rate is not None:
+            return rate
+
         # All attempts failed
         self.logger.warning(
             f"Could not find conversion rate for {from_currency} to {to_currency}. "
-            f"Tried: {from_currency}{to_currency}, {to_currency}{from_currency}, and variants with separators"
+            f"Tried: {from_currency}{to_currency}, {to_currency}{from_currency}, variants with separators, and cross-rates"
         )
         return None
     
@@ -110,10 +122,15 @@ class CurrencyConversionService:
         """
         # No conversion needed
         if currency_profit == account_currency:
+            self.logger.debug(
+                f"No conversion needed: {currency_profit} == {account_currency}, "
+                f"tick_value={tick_value:.8f}"
+            )
             return tick_value, None
-        
+
         # Missing currency information
         if not account_currency or currency_profit == 'UNKNOWN':
+            self.logger.debug(f"Missing currency info, using raw tick_value={tick_value:.8f}")
             return tick_value, None
         
         # Get conversion rate
@@ -140,42 +157,72 @@ class CurrencyConversionService:
     def _try_direct_pair(self, from_currency: str, to_currency: str) -> Optional[float]:
         """
         Try direct currency pair (e.g., EURUSD for EUR->USD).
-        
+
         Args:
             from_currency: Source currency
             to_currency: Target currency
-            
+
         Returns:
             Conversion rate or None
         """
         direct_pair = f"{from_currency}{to_currency}"
+
+        # Try to get rate from connector first (works in both live and backtest)
+        if self.connector is not None:
+            rate = self.connector.get_current_price(direct_pair)
+            if rate is not None and rate > 0:
+                self.logger.debug(f"Found direct pair {direct_pair} via connector, rate={rate:.5f}")
+                return rate
+
+        # Fallback to MT5 direct call (live mode only)
         tick = mt5.symbol_info_tick(direct_pair)
-        
         if tick is not None:
             # Use bid price for conversion
+            self.logger.debug(f"Found direct pair {direct_pair} via MT5, rate={tick.bid:.5f}")
             return tick.bid
-        
+
+        self.logger.debug(f"Direct pair {direct_pair} not found")
         return None
     
     def _try_inverse_pair(self, from_currency: str, to_currency: str) -> Optional[float]:
         """
-        Try inverse currency pair (e.g., USDEUR for EUR->USD).
-        
+        Try inverse currency pair (e.g., USDCHF for CHF->USD).
+
+        For CHF->USD: We look for USDCHF and take 1/price
+
         Args:
-            from_currency: Source currency
-            to_currency: Target currency
-            
+            from_currency: Source currency (e.g., CHF)
+            to_currency: Target currency (e.g., USD)
+
         Returns:
             Conversion rate or None
         """
         inverse_pair = f"{to_currency}{from_currency}"
+
+        # Try to get rate from connector first (works in both live and backtest)
+        if self.connector is not None:
+            price = self.connector.get_current_price(inverse_pair)
+            if price is not None and price > 0:
+                rate = 1.0 / price
+                self.logger.debug(
+                    f"Found inverse pair {inverse_pair} via connector, price={price:.5f}, "
+                    f"inverse rate={rate:.5f}"
+                )
+                return rate
+
+        # Fallback to MT5 direct call (live mode only)
         tick = mt5.symbol_info_tick(inverse_pair)
-        
         if tick is not None:
             # Use inverse of ask price for conversion
             if tick.ask > 0:
-                return 1.0 / tick.ask
-        
+                rate = 1.0 / tick.ask
+                self.logger.debug(
+                    f"Found inverse pair {inverse_pair} via MT5, ask={tick.ask:.5f}, "
+                    f"inverse rate={rate:.5f}"
+                )
+                return rate
+
+        self.logger.debug(f"Inverse pair {inverse_pair} not found")
         return None
     
     def _try_with_separators(self, from_currency: str, to_currency: str) -> Optional[float]:

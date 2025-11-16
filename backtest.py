@@ -43,6 +43,8 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 import sys
 from pathlib import Path
+import psutil
+import os
 
 # Ensure project root is in path
 project_root = Path(__file__).parent
@@ -53,6 +55,7 @@ from src.backtesting.engine import (
     SimulatedBroker,
     TimeController,
     TimeMode,
+    TimeGranularity,
     BacktestController,
     BacktestDataLoader,
     ResultsAnalyzer
@@ -72,18 +75,26 @@ from src.core.mt5_connector import MT5Connector
 # Date Range
 # Use recent dates for quick testing, or longer periods for comprehensive analysis
 # IMPORTANT: Use recent dates (2025)! Some symbols are new and don't have 2024 data
-# Recommended: Last 7-14 days for testing, last 1-3 months for full backtest
-START_DATE = datetime(2025, 10, 1, tzinfo=timezone.utc)
+# Recommended for TICK MODE: 1-3 days (to manage memory), 7 days max
+# Recommended for CANDLE MODE: Last 7-14 days for testing, last 1-3 months for full backtest
+START_DATE = datetime(2025, 11, 14, tzinfo=timezone.utc)  # Reduced to 1 day for tick mode
 END_DATE = datetime(2025, 11, 15, tzinfo=timezone.utc)
 
 # Initial Balance
-INITIAL_BALANCE = 10000.0  # Starting capital in USD
+INITIAL_BALANCE = 1000.0  # Starting capital in USD
+
+# Stop Loss Threshold (early termination)
+# Stop the backtest if EQUITY falls below this percentage of initial balance
+# This prevents wasting time on a blown account and simulates realistic margin call
+STOP_LOSS_THRESHOLD = 1.0  # Stop if equity < 50% of initial (realistic margin call level)
+# Set to 0.0 to disable early termination and run the full backtest period
 
 # Symbols
-# Option 1: Specify symbols directly (recommended for testing)
-# SYMBOLS: Optional[List[str]] = []  # Major pairs with good data
-# Option 2: Set to None to load from active.set file (recommended for full backtest)
-SYMBOLS = None  # Load from active.set - will auto-skip symbols with insufficient data
+# Option 1: Specify symbols directly (recommended for testing and TICK MODE)
+# SYMBOLS: Optional[List[str]] = ['EURUSD', 'GBPUSD']  # Major pairs with good data
+# Option 2: Set to None to load from active.set file (recommended for CANDLE MODE full backtest)
+# IMPORTANT: For TICK MODE, use only 2-5 symbols to manage memory and loading time!
+SYMBOLS: Optional[List[str]] = ['EURUSD', 'GBPUSD']  # Limited symbols for tick mode
 
 # Timeframes
 # Load all timeframes needed by strategies from MT5 (more accurate than resampling)
@@ -98,6 +109,17 @@ TIMEFRAMES = ["M1", "M5", "M15", "H1", "H4"]
 # - TimeMode.FAST: 10x speed (100ms per bar) - for faster testing
 # - TimeMode.REALTIME: 1x speed (1 second per bar) - for visual debugging
 TIME_MODE = TimeMode.MAX_SPEED
+
+# Tick-Level Backtesting
+# Enable tick-level backtesting for highest fidelity simulation
+# TICK MODE: Uses real tick data from MT5 (copy_ticks_range), advances tick-by-tick
+#   - Pros: Accurate SL/TP execution, realistic spread, proper HFT simulation
+#   - Cons: ~60x slower than candle mode (~700k time steps per week vs 10k)
+# CANDLE MODE: Uses OHLCV candles, advances minute-by-minute
+#   - Pros: Fast execution
+#   - Cons: Misses intra-candle SL/TP hits, static spread, HFT strategy broken
+USE_TICK_DATA = True  # Set to True to enable tick-level backtesting
+TICK_TYPE = "ALL"  # "INFO" (bid/ask changes, recommended), "ALL" (all ticks), "TRADE" (trade ticks only)
 
 # Historical Data Buffer
 # Load extra days before START_DATE for reference candle lookback
@@ -129,6 +151,22 @@ LEVERAGE = 2000  # 100:1 leverage (typical for forex)
 #   - 200:1 (aggressive)
 #   - 500:1 (very aggressive, common for offshore brokers)
 # Example: With 100:1 leverage, controlling $10,000 worth of currency requires $100 margin
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_memory_usage() -> float:
+    """Get current memory usage in MB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+
+def log_memory(logger, label: str):
+    """Log current memory usage."""
+    mem_mb = get_memory_usage()
+    logger.info(f"  💾 Memory usage ({label}): {mem_mb:.1f} MB")
 
 
 # ============================================================================
@@ -242,9 +280,19 @@ def main():
     # Display configuration
     progress_print("BACKTEST CONFIGURATION:", logger)
     progress_print(f"  Date Range:       {START_DATE.date()} to {END_DATE.date()}", logger)
+    days = (END_DATE - START_DATE).days
+    progress_print(f"  Duration:         {days} day(s)", logger)
     progress_print(f"  Initial Balance:  ${INITIAL_BALANCE:,.2f}", logger)
+    stop_threshold_amount = INITIAL_BALANCE * (STOP_LOSS_THRESHOLD / 100.0)
+    stop_threshold_status = f"${stop_threshold_amount:,.2f} ({STOP_LOSS_THRESHOLD}%)" if STOP_LOSS_THRESHOLD > 0 else "DISABLED"
+    progress_print(f"  Stop Threshold:   {stop_threshold_status}", logger)
     progress_print(f"  Timeframes:       {', '.join(TIMEFRAMES)}", logger)
     progress_print(f"  Time Mode:        {TIME_MODE.value}", logger)
+    tick_mode_status = f"ENABLED ({TICK_TYPE})" if USE_TICK_DATA else "DISABLED (candle mode)"
+    progress_print(f"  Tick Data:        {tick_mode_status}", logger)
+    if USE_TICK_DATA and days > 3:
+        progress_print(f"  ⚠ WARNING:        {days} days with tick data may use significant memory!", logger)
+        progress_print(f"                    Consider reducing to 1-3 days for tick mode", logger)
     progress_print(f"  Spreads:          Read from MT5 (per-symbol actual spreads)", logger)
     slippage_status = f"ENABLED ({SLIPPAGE_POINTS} points base)" if ENABLE_SLIPPAGE else "DISABLED"
     progress_print(f"  Slippage:         {slippage_status}", logger)
@@ -302,6 +350,28 @@ def main():
         logger.info(f"  Force refresh: {'YES' if FORCE_REFRESH else 'NO'}")
     logger.info("")
 
+    # Tick data configuration
+    if USE_TICK_DATA:
+        import MetaTrader5 as mt5
+        tick_cache_dir = Path("data/ticks")
+        tick_cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Tick data mode: ENABLED ({TICK_TYPE})")
+        logger.info(f"  Tick cache directory: {tick_cache_dir.absolute()}")
+        logger.info(f"  (Ticks will be saved/loaded from cache for faster subsequent runs)")
+        logger.info("")
+
+        # Map tick type string to MT5 constant
+        tick_type_map = {
+            "INFO": mt5.COPY_TICKS_INFO,    # Bid/ask changes (recommended)
+            "ALL": mt5.COPY_TICKS_ALL,      # All ticks
+            "TRADE": mt5.COPY_TICKS_TRADE   # Trade ticks only
+        }
+        tick_type_flag = tick_type_map.get(TICK_TYPE.upper(), mt5.COPY_TICKS_INFO)
+        tick_cache_files = {}  # Will store {symbol: cache_file_path}
+    else:
+        logger.info("Tick data mode: DISABLED (candle-based backtesting)")
+        logger.info("")
+
     data_loader = BacktestDataLoader(use_cache=USE_CACHE, cache_dir=CACHE_DIR)
     symbol_data = {}  # Key: (symbol, timeframe), Value: DataFrame
     symbol_info = {}  # Key: symbol, Value: symbol_info dict
@@ -356,6 +426,38 @@ def main():
 
             logger.info(f"  ✓ {symbol} {timeframe}: {len(df):,} bars loaded")
 
+        # Load tick data for this symbol (if tick mode enabled)
+        if USE_TICK_DATA and not has_insufficient_data and len(loaded_timeframes) == len(TIMEFRAMES):
+            logger.info(f"  Loading tick data for {symbol}...")
+            ticks_df = data_loader.load_ticks_from_mt5(
+                symbol=symbol,
+                start_date=START_DATE,
+                end_date=END_DATE,
+                tick_type=tick_type_flag,
+                cache_dir=str(tick_cache_dir)
+            )
+
+            if ticks_df is not None and len(ticks_df) > 0:
+                logger.info(f"  ✓ {symbol}: {len(ticks_df):,} ticks loaded")
+
+                # Build cache file path
+                tick_type_name = {
+                    mt5.COPY_TICKS_INFO: "INFO",
+                    mt5.COPY_TICKS_ALL: "ALL",
+                    mt5.COPY_TICKS_TRADE: "TRADE"
+                }.get(tick_type_flag, "UNKNOWN")
+
+                start_str = START_DATE.strftime("%Y%m%d")
+                end_str = END_DATE.strftime("%Y%m%d")
+                cache_file = tick_cache_dir / f"{symbol}_{start_str}_{end_str}_{tick_type_name}.parquet"
+                tick_cache_files[symbol] = str(cache_file)
+
+                # Free memory immediately - don't keep DataFrame
+                del ticks_df
+            else:
+                logger.warning(f"  ⚠ {symbol}: No tick data available")
+                has_insufficient_data = True  # Mark as insufficient if ticks required but not available
+
         # Check if all required timeframes were loaded and data is sufficient
         if has_insufficient_data or len(loaded_timeframes) != len(TIMEFRAMES):
             if has_insufficient_data:
@@ -385,6 +487,13 @@ def main():
     logger.info(f"Successfully loaded {len(symbols)} symbols with all {len(TIMEFRAMES)} timeframes")
     if symbols:
         logger.info(f"Symbols to backtest: {', '.join(symbols)}")
+
+    # Show tick data summary if enabled
+    if USE_TICK_DATA:
+        logger.info("")
+        logger.info(f"Tick data loaded for {len(tick_cache_files)}/{len(symbols)} symbols")
+        log_memory(logger, "after tick data loading")
+
     logger.info("")
 
     # Step 2.5: Load currency conversion pairs for risk calculation
@@ -499,17 +608,73 @@ def main():
         leverage=LEVERAGE
     )
 
+    # Convert tick_value to USD for all symbols before loading into broker
+    # This is CRITICAL for accurate profit calculations in backtest!
+    logger.info("Converting tick_value to USD for all symbols...")
+
+    def get_conversion_rate_from_data(from_currency: str, to_currency: str) -> Optional[float]:
+        """Get conversion rate from loaded symbol_data."""
+        if from_currency == to_currency:
+            return 1.0
+
+        # Try direct pair (e.g., JPYUSD)
+        direct_pair = f"{from_currency}{to_currency}"
+        if (direct_pair, 'M1') in symbol_data:
+            df = symbol_data[(direct_pair, 'M1')]
+            if len(df) > 0:
+                return float(df.iloc[0]['close'])  # Use first available price
+
+        # Try inverse pair (e.g., USDJPY)
+        inverse_pair = f"{to_currency}{from_currency}"
+        if (inverse_pair, 'M1') in symbol_data:
+            df = symbol_data[(inverse_pair, 'M1')]
+            if len(df) > 0:
+                price = float(df.iloc[0]['close'])
+                if price > 0:
+                    return 1.0 / price
+
+        return None
+
+    converted_symbol_info = {}
+    for symbol, info in symbol_info.items():
+        # Make a copy to avoid modifying original
+        converted_info = info.copy()
+
+        # Convert tick_value from currency_profit to USD
+        currency_profit = info.get('currency_profit', 'USD')
+        tick_value_raw = info.get('tick_value', 1.0)
+
+        if currency_profit != 'USD' and currency_profit != 'UNKNOWN':
+            # Get conversion rate from loaded data
+            conversion_rate = get_conversion_rate_from_data(currency_profit, 'USD')
+            if conversion_rate is not None:
+                tick_value_usd = tick_value_raw * conversion_rate
+                converted_info['tick_value'] = tick_value_usd
+                # IMPORTANT: Update currency_profit to USD to prevent double conversion
+                converted_info['currency_profit'] = 'USD'
+                logger.info(
+                    f"  ✓ {symbol}: tick_value converted {currency_profit}→USD: "
+                    f"{tick_value_raw:.5f} × {conversion_rate:.5f} = {tick_value_usd:.5f}"
+                )
+            else:
+                logger.warning(
+                    f"  ⚠ {symbol}: Failed to convert tick_value from {currency_profit} to USD, "
+                    f"using raw value {tick_value_raw:.5f}"
+                )
+
+        converted_symbol_info[symbol] = converted_info
+
     # Load data for trading symbols (all timeframes) and conversion pairs (M1 only)
     loaded_count = 0
     conversion_count = 0
     for (symbol, timeframe), df in symbol_data.items():
         if symbol in symbols:
-            # Trading symbol - load all timeframes
-            broker.load_symbol_data(symbol, df, symbol_info[symbol], timeframe)
+            # Trading symbol - load all timeframes with CONVERTED tick_value
+            broker.load_symbol_data(symbol, df, converted_symbol_info[symbol], timeframe)
             loaded_count += 1
-        elif symbol in symbol_info and timeframe == 'M1':
+        elif symbol in converted_symbol_info and timeframe == 'M1':
             # Conversion pair - only load M1 for price data
-            broker.load_symbol_data(symbol, df, symbol_info[symbol], timeframe)
+            broker.load_symbol_data(symbol, df, converted_symbol_info[symbol], timeframe)
             conversion_count += 1
 
     logger.info(f"  ✓ SimulatedBroker initialized (with position persistence)")
@@ -528,18 +693,50 @@ def main():
     broker.set_start_time(START_DATE)
     logger.info("")
 
+    # Step 4.5: Load Tick Timeline (if tick-level backtesting enabled)
+    if USE_TICK_DATA:
+        logger.info("=" * 80)
+        logger.info("STEP 4.5: Loading Tick Timeline")
+        logger.info("=" * 80)
+        logger.info(f"Loading ticks from cache files into global timeline...")
+        logger.info(f"  Symbols with tick data: {len(tick_cache_files)}/{len(symbols)}")
+        log_memory(logger, "before timeline loading")
+        logger.info("")
+
+        # Load ticks from cache files directly into global timeline (memory-efficient)
+        broker.load_ticks_from_cache_files(tick_cache_files)
+        logger.info("  ✓ Global tick timeline loaded and sorted")
+        log_memory(logger, "after timeline loading")
+        logger.info("")
+
     # Step 5: Initialize TimeController
     logger.info("=" * 80)
     logger.info("STEP 5: Initializing Time Controller")
     logger.info("=" * 80)
 
+    # Determine time granularity based on tick data mode
+    time_granularity = TimeGranularity.TICK if USE_TICK_DATA else TimeGranularity.MINUTE
+
     # Include position monitor in barrier synchronization
     # Pass broker for global time advancement
-    time_controller = TimeController(symbols, mode=TIME_MODE, include_position_monitor=True, broker=broker)
+    time_controller = TimeController(
+        symbols,
+        mode=TIME_MODE,
+        granularity=time_granularity,
+        include_position_monitor=True,
+        broker=broker
+    )
     logger.info(f"  ✓ TimeController initialized")
     logger.info(f"  ✓ Time mode: {TIME_MODE.value}")
+    logger.info(f"  ✓ Time granularity: {time_granularity.value}")
     logger.info(f"  ✓ Barrier participants: {len(symbols)} symbols + 1 position monitor")
-    logger.info(f"  ✓ Global time advancement: minute-by-minute")
+
+    if USE_TICK_DATA:
+        total_ticks = len(broker.global_tick_timeline)
+        logger.info(f"  ✓ Global time advancement: tick-by-tick ({total_ticks:,} ticks)")
+        logger.info(f"  ⚠ Performance: ~{total_ticks:,} time steps (slower but highest fidelity)")
+    else:
+        logger.info(f"  ✓ Global time advancement: minute-by-minute")
     logger.info("")
 
     # Step 6: Initialize trading components
@@ -593,7 +790,8 @@ def main():
         order_manager=order_manager,
         risk_manager=risk_manager,
         trade_manager=trade_manager,
-        indicators=indicators
+        indicators=indicators,
+        stop_loss_threshold=STOP_LOSS_THRESHOLD
     )
 
     # Initialize with symbols (this creates strategies based on .env configuration)
