@@ -896,7 +896,7 @@ class FakeoutStrategy(BaseStrategy):
 
         return reversal_volume >= (avg_volume * self.config.min_reversal_volume_multiplier)
 
-    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is low (weak breakout)", required=False)
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is low (weak breakout)")
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had LOW volume (required for fakeout).
@@ -984,7 +984,7 @@ class FakeoutStrategy(BaseStrategy):
             reason=f"Reversal {'confirmed' if reversal_ok else 'failed'} for {direction_str} signal"
         )
 
-    @validation_check(abbreviation="RVol", order=3, description="Check reversal volume meets threshold", required=False)
+    @validation_check(abbreviation="RVol", order=3, description="Check reversal volume meets threshold")
     def _check_reversal_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if reversal/confirmation volume meets configured requirements.

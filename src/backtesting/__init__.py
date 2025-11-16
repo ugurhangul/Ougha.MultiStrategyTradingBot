@@ -1,24 +1,42 @@
 ﻿"""
 Backtesting package for multi-strategy trading bot.
 
-This package provides backtesting capabilities using backtesting.py library:
-- Data loading from MT5 or CSV
-- Strategy adapters for backtesting.py
-- Interactive Jupyter notebook backtesting
-- Performance metrics and visualization
-- Parameter optimization
+This package provides a custom backtesting engine that:
+- Simulates the exact live trading architecture
+- Uses SimulatedBroker to replay historical data
+- Runs the same strategies as live trading without modification
+- Supports concurrent multi-symbol, multi-strategy backtesting
+- Provides realistic position limit and risk management simulation
 
 Structure:
-- data/: Data loading utilities
-- adapters/: Strategy adapters for backtesting.py
+- engine/: Custom backtesting engine (SimulatedBroker, BacktestController, etc.)
 - metrics/: Performance metrics and analysis
 - visualization/: Results visualization tools
+
+Usage:
+    See examples/test_custom_backtest_engine.py for complete example
+    See docs/CUSTOM_BACKTEST_ENGINE.md for detailed documentation
 """
 
-from .data import BacktestingPyDataLoader
-from .adapters import BacktestingPyStrategyAdapter, FakeoutStrategyAdapter
+from .engine import (
+    SimulatedBroker,
+    SimulatedSymbolInfo,
+    TimeController,
+    TimeMode,
+    BacktestController,
+    BacktestDataLoader,
+    ResultsAnalyzer
+)
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 
-__all__ = ['BacktestingPyDataLoader', 'BacktestingPyStrategyAdapter', 'FakeoutStrategyAdapter']
+__all__ = [
+    'SimulatedBroker',
+    'SimulatedSymbolInfo',
+    'TimeController',
+    'TimeMode',
+    'BacktestController',
+    'BacktestDataLoader',
+    'ResultsAnalyzer'
+]
 

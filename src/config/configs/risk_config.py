@@ -11,6 +11,7 @@ class RiskConfig:
     max_lot_size: float = 10.0
     min_lot_size: float = 0.01
     max_positions: int = 10
+    max_portfolio_risk_percent: float = 20.0  # Maximum total portfolio risk across all positions
 
 
 @dataclass

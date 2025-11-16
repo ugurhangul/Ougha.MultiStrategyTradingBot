@@ -81,24 +81,60 @@ class SymbolPerformancePersistence:
     def _save_stats(self):
         """
         Save symbol stats to JSON file with atomic write.
-        
+
         NOTE: This method does NOT acquire the lock - it must be called
         from a method that already holds the lock.
         """
+        import time
+        import sys
+
         try:
             # Write to temporary file first (atomic write)
             temp_file = self.stats_file.with_suffix('.json.tmp')
-            
+
             with open(temp_file, 'w') as f:
                 json.dump(self.stats_cache, f, indent=2, default=str)
-            
-            # Atomic rename (replaces old file)
-            temp_file.replace(self.stats_file)
-            
-            self.logger.debug(f"Saved stats for {len(self.stats_cache)} symbols to persistence file")
-            
+            # File handle is now closed
+
+            # Windows-compatible atomic rename with retry logic
+            max_retries = 3
+            retry_delay = 0.1  # 100ms
+
+            for attempt in range(max_retries):
+                try:
+                    if sys.platform == 'win32':
+                        # On Windows, we need to delete the target file first
+                        # because replace() can fail with "Access is denied"
+                        if self.stats_file.exists():
+                            self.stats_file.unlink()
+                        # Now rename temp file to target
+                        temp_file.rename(self.stats_file)
+                    else:
+                        # On Unix-like systems, replace() is truly atomic
+                        temp_file.replace(self.stats_file)
+
+                    # Success
+                    self.logger.debug(f"Saved stats for {len(self.stats_cache)} symbols to persistence file")
+                    break
+
+                except (PermissionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        # Retry after a short delay
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        # Final attempt failed
+                        raise
+
         except Exception as e:
             self.logger.error(f"Error saving symbol stats: {e}")
+            # Clean up temp file if it still exists
+            try:
+                temp_file = self.stats_file.with_suffix('.json.tmp')
+                if temp_file.exists():
+                    temp_file.unlink()
+            except:
+                pass
     
     def save_symbol_stats(self, symbol: str, stats: SymbolStats):
         """

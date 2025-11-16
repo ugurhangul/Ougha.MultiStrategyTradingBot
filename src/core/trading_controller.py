@@ -27,17 +27,19 @@ class TradingController:
     def __init__(self, connector: MT5Connector, order_manager: OrderManager,
                  risk_manager: RiskManager, trade_manager: TradeManager,
                  indicators: TechnicalIndicators,
-                 symbol_persistence: Optional[SymbolPerformancePersistence] = None):
+                 symbol_persistence: Optional[SymbolPerformancePersistence] = None,
+                 time_controller: Optional['TimeController'] = None):
         """
         Initialize trading controller.
 
         Args:
-            connector: MT5 connector instance
+            connector: MT5 connector instance (or SimulatedBroker for backtesting)
             order_manager: Order manager instance
             risk_manager: Risk manager instance
             trade_manager: Trade manager instance
             indicators: Technical indicators instance
             symbol_persistence: Symbol performance persistence instance (optional)
+            time_controller: Time controller for backtest synchronization (optional, backtest only)
         """
         self.connector = connector
         self.order_manager = order_manager
@@ -45,6 +47,10 @@ class TradingController:
         self.trade_manager = trade_manager
         self.indicators = indicators
         self.logger = get_logger()
+
+        # Backtest mode detection and time controller
+        self.time_controller = time_controller
+        self.is_backtest_mode = time_controller is not None
 
         # Symbol performance persistence (shared across all symbols)
         self.symbol_persistence = symbol_persistence if symbol_persistence is not None else SymbolPerformancePersistence()
@@ -67,6 +73,9 @@ class TradingController:
 
         # Monitoring
         self.last_position_check = datetime.now(timezone.utc)
+
+        if self.is_backtest_mode:
+            self.logger.info("TradingController initialized in BACKTEST mode with TimeController")
 
     def initialize(self, symbols: List[str]) -> bool:
         """
@@ -122,8 +131,14 @@ class TradingController:
 
         self.logger.info("=" * 60)
 
-        # Check if session checking is enabled
-        if config.trading_hours.check_symbol_session:
+        # In backtest mode, always initialize all symbols regardless of session status
+        # because we're simulating historical time, not real-time
+        if self.is_backtest_mode:
+            self.logger.info("BACKTEST MODE: Initializing all symbols (session checking skipped)")
+            for symbol in symbols:
+                success_count += self._initialize_symbol(symbol)
+        # Check if session checking is enabled (live trading only)
+        elif config.trading_hours.check_symbol_session:
             # Check trading session status for all symbols
             active_symbols, inactive_symbols = self.session_monitor.filter_active_symbols(symbols)
 
@@ -420,6 +435,9 @@ class TradingController:
         """
         Worker thread for a single symbol.
 
+        In LIVE mode: Runs continuously with time.sleep(1) between ticks
+        In BACKTEST mode: Uses TimeController barrier synchronization
+
         Args:
             symbol: Symbol name
             strategy: MultiStrategyOrchestrator instance for this symbol
@@ -428,31 +446,63 @@ class TradingController:
 
         while self.running:
             try:
-                # Check if AutoTrading is still enabled
-                if not self.connector.is_autotrading_enabled():
-                    self.logger.error(f"AutoTrading DISABLED - Stopping worker thread", symbol)
-                    self.running = False
-                    break
-
-                # Check if symbol trading is still enabled
-                if not self.connector.is_trading_enabled(symbol):
-                    self.logger.warning(f"Trading DISABLED for symbol - Stopping worker thread", symbol)
-                    break
-
-                # Check if symbol is in an active trading session
-                in_session = self._is_symbol_in_active_session(symbol)
-                if not in_session:
-                    self.logger.info(f"{symbol}: Not in active trading session - entering sleep mode", symbol)
-                    # Put the worker thread to sleep until the next active session
-                    if not self._sleep_until_next_session(symbol):
-                        # Sleep was aborted because controller is stopping
+                # BACKTEST MODE: Check if we should continue
+                if self.is_backtest_mode:
+                    # Check if data is still available for this symbol
+                    if not self.connector.is_data_available(symbol):
+                        self.logger.info(f"{symbol}: No more data available - stopping worker", symbol)
                         break
-                    # After waking up, re-validate all conditions
-                    continue
 
-                # Process tick
-                strategy.on_tick()
-                time.sleep(1)  # Sleep for 1 second (adjust as needed)
+                # LIVE MODE: Check AutoTrading and symbol trading status
+                if not self.is_backtest_mode:
+                    # Check if AutoTrading is still enabled
+                    if not self.connector.is_autotrading_enabled():
+                        self.logger.error(f"AutoTrading DISABLED - Stopping worker thread", symbol)
+                        self.running = False
+                        break
+
+                    # Check if symbol trading is still enabled
+                    if not self.connector.is_trading_enabled(symbol):
+                        self.logger.warning(f"Trading DISABLED for symbol - Stopping worker thread", symbol)
+                        break
+
+                    # Check if symbol is in an active trading session
+                    in_session = self._is_symbol_in_active_session(symbol)
+                    if not in_session:
+                        self.logger.info(f"{symbol}: Not in active trading session - entering sleep mode", symbol)
+                        # Put the worker thread to sleep until the next active session
+                        if not self._sleep_until_next_session(symbol):
+                            # Sleep was aborted because controller is stopping
+                            break
+                        # After waking up, re-validate all conditions
+                        continue
+
+                # BACKTEST MODE: Check if symbol has data at current global time
+                if self.is_backtest_mode:
+                    # Check if this symbol has data at the current global time
+                    has_data = self.connector.has_data_at_current_time(symbol)
+
+                    if has_data:
+                        # Process tick only if symbol has data at current time
+                        strategy.on_tick()
+                    # else: Symbol has no data at this minute, skip processing
+
+                    # All symbols wait at barrier (whether they processed or not)
+                    if not self.time_controller.wait_for_next_step(symbol):
+                        # TimeController stopped
+                        break
+
+                    # Check if symbol has reached end of all data
+                    if not self.connector.has_more_data(symbol):
+                        # No more data for this symbol
+                        self.logger.info(f"{symbol}: Reached end of data", symbol)
+                        break
+
+                # LIVE MODE: Process tick and sleep
+                else:
+                    strategy.on_tick()
+                    time.sleep(1)  # Sleep for 1 second (adjust as needed)
+
             except Exception as e:
                 self.logger.trade_error(
                     symbol=symbol,
@@ -464,20 +514,30 @@ class TradingController:
                     }
                 )
 
-                # Before retrying, check if the exception was due to session being closed
-                # This prevents rapid retry loops when market is closed
-                if not self._is_symbol_in_active_session(symbol):
-                    self.logger.info(
-                        f"{symbol}: Exception occurred and session is now closed - entering sleep mode",
-                        symbol
-                    )
-                    # Don't retry immediately - go to sleep mode instead
-                    continue
+                # LIVE MODE: Check session status before retrying
+                if not self.is_backtest_mode:
+                    # Before retrying, check if the exception was due to session being closed
+                    # This prevents rapid retry loops when market is closed
+                    if not self._is_symbol_in_active_session(symbol):
+                        self.logger.info(
+                            f"{symbol}: Exception occurred and session is now closed - entering sleep mode",
+                            symbol
+                        )
+                        # Don't retry immediately - go to sleep mode instead
+                        continue
 
-                # Session is still active, wait before retrying
-                time.sleep(5)
+                    # Session is still active, wait before retrying
+                    time.sleep(5)
+                else:
+                    # BACKTEST MODE: Log error and continue
+                    self.logger.warning(f"{symbol}: Error in backtest, continuing...", symbol)
+                    time.sleep(0.1)
 
         self.logger.info(f"Worker thread stopped for {symbol}", symbol)
+
+        # BACKTEST MODE: Remove this participant from the barrier
+        if self.is_backtest_mode:
+            self.time_controller.remove_participant(symbol)
 
     def _is_symbol_in_active_session(self, symbol: str, suppress_logs: bool = False) -> bool:
         """Determine if a symbol is currently in an active trading session.
@@ -661,22 +721,33 @@ class TradingController:
 
 
     def _position_monitor(self):
-        """Monitor all positions and check for closed trades"""
+        """
+        Monitor all positions and check for closed trades.
+
+        In LIVE mode: Runs every 5 seconds with time.sleep(5)
+        In BACKTEST mode: Runs on every time step synchronized with symbol threads
+        """
         self.logger.info("Position monitor thread started")
 
         # Track known positions
         known_positions = set()
 
-        # Track last statistics log time
-        last_stats_log = datetime.now(timezone.utc)
+        # Track last statistics log time (only needed in live mode)
+        if not self.is_backtest_mode:
+            last_stats_log = datetime.now(timezone.utc)
+
+        # Backtest: Track steps to run position monitor less frequently
+        step_counter = 0
 
         while self.running:
             try:
-                # Check if AutoTrading is still enabled
-                if not self.connector.is_autotrading_enabled():
-                    self.logger.error("AutoTrading DISABLED - Stopping position monitor")
-                    self.running = False
-                    break
+                # LIVE MODE: Check AutoTrading
+                if not self.is_backtest_mode:
+                    # Check if AutoTrading is still enabled
+                    if not self.connector.is_autotrading_enabled():
+                        self.logger.error("AutoTrading DISABLED - Stopping position monitor")
+                        self.running = False
+                        break
 
                 # Get all positions
                 positions = self.connector.get_positions(
@@ -697,26 +768,61 @@ class TradingController:
                 # Update known positions
                 known_positions = current_tickets
 
+                # BACKTEST MODE: Update positions with current prices and check SL/TP
+                if self.is_backtest_mode:
+                    # Call SimulatedBroker's update_positions to:
+                    # 1. Update all position profits with current prices
+                    # 2. Check for SL/TP hits and close positions automatically
+                    self.connector.update_positions()
+
+                    # Get fresh position list after update_positions() may have closed some
+                    positions = self.connector.get_positions(
+                        magic_number=config.advanced.magic_number
+                    )
+
+                # Manage positions (breakeven and trailing stops) - works in both live and backtest
                 if positions:
+                    self.trade_manager.manage_positions(positions)
+
+                # LIVE MODE ONLY: Close positions before session end
+                if positions and not self.is_backtest_mode:
                     # Close positions if the session is about to end
                     self._close_positions_before_session_end(positions)
 
-                    # Manage positions (breakeven and trailing stops)
-                    self.trade_manager.manage_positions(positions)
+                # Log statistics periodically (only in live mode)
+                if not self.is_backtest_mode:
+                    current_time = datetime.now(timezone.utc)
+                    if current_time and last_stats_log and (current_time - last_stats_log).total_seconds() >= 10:
+                        self._log_position_statistics(positions)
+                        last_stats_log = current_time
 
-                # Log statistics every 10 seconds
-                if (datetime.now(timezone.utc) - last_stats_log).total_seconds() >= 10:
-                    self._log_position_statistics(positions)
-                    last_stats_log = datetime.now(timezone.utc)
+                # BACKTEST MODE: Wait at barrier
+                if self.is_backtest_mode:
+                    # Position monitor participates in barrier synchronization
+                    # Use a special "position_monitor" identifier
+                    if not self.time_controller.wait_for_next_step("position_monitor"):
+                        # TimeController stopped
+                        break
 
-                # Sleep for 5 seconds
-                time.sleep(5)
+                    step_counter += 1
+
+                # LIVE MODE: Sleep for 5 seconds
+                else:
+                    time.sleep(5)
 
             except Exception as e:
                 self.logger.error(f"Error in position monitor: {e}")
-                time.sleep(10)
+                if not self.is_backtest_mode:
+                    time.sleep(10)
+                else:
+                    # In backtest, just log and continue
+                    pass
 
         self.logger.info("Position monitor thread stopped")
+
+        # BACKTEST MODE: Remove position monitor from the barrier
+        if self.is_backtest_mode:
+            self.time_controller.remove_participant("position_monitor")
 
     def _log_position_statistics(self, positions: List[PositionInfo]):
         """

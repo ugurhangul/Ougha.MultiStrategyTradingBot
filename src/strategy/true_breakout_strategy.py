@@ -226,7 +226,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error in on_tick: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_reference_candle(self) -> Optional[ReferenceCandle]:
@@ -490,7 +490,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return False
 
         except Exception as e:
-            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error checking confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return False
 
     def _process_confirmation_candle(self) -> Optional[TradeSignal]:
@@ -554,7 +554,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return None
 
         except Exception as e:
-            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error processing confirmation candle: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _check_breakout_timeout(self, current_time: datetime):
@@ -889,7 +889,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             self.symbol
         )
 
-    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high", required=False)
+    @validation_check(abbreviation="BV", order=1, description="Check breakout volume is high")
     def _check_breakout_volume(self, signal_data: Dict[str, Any]) -> ValidationResult:
         """
         Check if initial breakout had high volume (required for true breakout).
@@ -1111,7 +1111,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error generating BUY signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
     def _generate_sell_signal(self, candle: CandleData) -> Optional[TradeSignal]:
@@ -1204,7 +1204,7 @@ class TrueBreakoutStrategy(BaseStrategy):
             return signal
 
         except Exception as e:
-            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key, exc_info=True)
+            self.logger.error(f"Error generating SELL signal: {e}", self.symbol, strategy_key=self.key)
             return None
 
 

@@ -36,7 +36,7 @@ class RangeConfigSettings:
             range_id="15M_1M",
             reference_timeframe="M15",
             reference_time=dt_time(14, 30),  # 14:30 UTC (primary)
-            fallback_reference_time=dt_time(14, 0),  # 14:00 UTC
+            fallback_reference_time=dt_time(15, 0),  # 14:00 UTC
             breakout_timeframe="M1",
             use_specific_time=True,
             atr_timeframe="M1"  # M1 ATR for M1 scalping

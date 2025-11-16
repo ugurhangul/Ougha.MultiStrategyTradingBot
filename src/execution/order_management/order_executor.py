@@ -165,6 +165,20 @@ class OrderExecutor:
             )
             return None
 
+        # PRE-TRADE RISK VALIDATION (TIER 1): Reject trade if individual risk exceeds configured limit
+        if self.risk_manager is not None and volume > 0:
+            # Validate actual risk before executing trade
+            risk_valid = self._validate_pre_trade_risk(symbol, volume, price, sl)
+            if not risk_valid:
+                return None
+
+        # PORTFOLIO RISK VALIDATION (TIER 2): Reject trade if total portfolio risk exceeds limit
+        if self.risk_manager is not None and volume > 0:
+            # Validate total portfolio risk including this new trade
+            portfolio_risk_valid = self._validate_portfolio_risk(symbol, volume, price, sl)
+            if not portfolio_risk_valid:
+                return None
+
         # Recalculate TP based on actual execution price (market price)
         # This ensures the R:R ratio is maintained with the actual entry
         # Use the configured R:R ratio from constants
@@ -399,4 +413,336 @@ class OrderExecutor:
             self.logger.error(f"Position {result.order} opened in MT5 but not tracked in bot!", symbol)
 
         return result.order
+
+    def _validate_pre_trade_risk(self, symbol: str, lot_size: float,
+                                  entry_price: float, stop_loss: float) -> bool:
+        """
+        Validate that the trade's risk does not exceed the configured risk limit.
+
+        This is a STRICT validation that rejects trades if risk exceeds the limit,
+        unlike validate_trade_risk() which automatically adjusts lot size.
+
+        Args:
+            symbol: Symbol name
+            lot_size: Proposed lot size
+            entry_price: Entry price
+            stop_loss: Stop loss price
+
+        Returns:
+            True if risk is within limits, False if trade should be rejected
+        """
+        # Get account balance
+        balance = self.connector.get_account_balance()
+        if balance <= 0:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Pre-Trade Risk Validation",
+                error_message="Invalid account balance",
+                context={"balance": balance, "action": "Trade rejected"}
+            )
+            return False
+
+        # Get symbol info
+        symbol_info = self.connector.get_symbol_info(symbol)
+        if symbol_info is None:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Pre-Trade Risk Validation",
+                error_message="Failed to get symbol information",
+                context={"action": "Trade rejected"}
+            )
+            return False
+
+        # Calculate stop loss distance
+        sl_distance = abs(entry_price - stop_loss)
+        if sl_distance <= 0:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Pre-Trade Risk Validation",
+                error_message="Invalid stop loss distance",
+                context={
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "sl_distance": sl_distance,
+                    "action": "Trade rejected"
+                }
+            )
+            return False
+
+        # Get symbol specifications
+        point = symbol_info['point']
+        tick_value = symbol_info['tick_value']
+        currency_profit = symbol_info.get('currency_profit', 'UNKNOWN')
+        account_currency = self.connector.get_account_currency()
+
+        # Convert tick value to account currency if needed
+        from src.utils.currency_conversion_service import CurrencyConversionService
+        currency_service = CurrencyConversionService(self.logger)
+        tick_value, conversion_rate = currency_service.convert_tick_value(
+            tick_value=tick_value,
+            currency_profit=currency_profit,
+            account_currency=account_currency,
+            symbol=symbol
+        )
+
+        # Calculate SL distance in points
+        sl_distance_in_points = sl_distance / point if point > 0 else sl_distance
+
+        # Calculate actual risk amount and percentage
+        risk_amount = sl_distance_in_points * tick_value * lot_size
+        risk_percent = (risk_amount / balance) * 100.0 if balance > 0 else 0
+
+        # Get configured risk limit
+        configured_risk_percent = self.risk_manager.risk_config.risk_percent_per_trade
+
+        # Check if risk exceeds configured limit
+        if risk_percent > configured_risk_percent:
+            # REJECT THE TRADE - Risk exceeds limit
+            self.logger.warning(
+                f"⚠️  PRE-TRADE RISK VALIDATION FAILED - Trade REJECTED",
+                symbol
+            )
+            self.logger.warning(
+                f"Calculated Risk: ${risk_amount:.2f} ({risk_percent:.2f}%)",
+                symbol
+            )
+            self.logger.warning(
+                f"Configured Limit: {configured_risk_percent:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Risk Exceeds Limit By: {risk_percent - configured_risk_percent:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Trade Details: Lot Size={lot_size:.2f}, Entry={entry_price:.5f}, "
+                f"SL={stop_loss:.5f}, SL Distance={sl_distance_in_points:.1f} points",
+                symbol
+            )
+            self.logger.warning(
+                f"Reason: Position size ({lot_size:.2f} lots) with SL distance "
+                f"({sl_distance_in_points:.1f} points) creates {risk_percent:.2f}% risk, "
+                f"which exceeds the configured {configured_risk_percent:.2f}% limit.",
+                symbol
+            )
+            self.logger.warning(
+                f"Action: Trade NOT executed. Consider reducing position size, "
+                f"tightening stop loss, or increasing account balance.",
+                symbol
+            )
+            return False
+
+        # Risk is within acceptable limits
+        self.logger.debug(
+            f"✓ Pre-trade risk validation passed: ${risk_amount:.2f} ({risk_percent:.2f}%) "
+            f"<= {configured_risk_percent:.2f}% limit",
+            symbol
+        )
+
+        return True
+
+    def _validate_portfolio_risk(self, symbol: str, lot_size: float,
+                                  entry_price: float, stop_loss: float) -> bool:
+        """
+        Validate that adding this trade won't exceed the maximum portfolio risk limit.
+
+        This is a TIER 2 validation that checks total portfolio risk across all open positions
+        plus the proposed new trade. Individual trade risk is validated separately in TIER 1.
+
+        Args:
+            symbol: Symbol name
+            lot_size: Proposed lot size for new trade
+            entry_price: Entry price for new trade
+            stop_loss: Stop loss price for new trade
+
+        Returns:
+            True if portfolio risk is within limits, False if trade should be rejected
+        """
+        # Get account balance
+        balance = self.connector.get_account_balance()
+        if balance <= 0:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Portfolio Risk Validation",
+                error_message="Invalid account balance",
+                context={"balance": balance, "action": "Trade rejected"}
+            )
+            return False
+
+        # Get all open positions for this magic number
+        open_positions = self.connector.get_positions(magic_number=self.magic_number)
+
+        # Calculate total risk from existing positions
+        total_existing_risk = 0.0
+        position_risks = []
+
+        for position in open_positions:
+            # Get symbol info for this position
+            pos_symbol_info = self.connector.get_symbol_info(position.symbol)
+            if pos_symbol_info is None:
+                self.logger.warning(
+                    f"Could not get symbol info for position {position.ticket} ({position.symbol}), "
+                    f"skipping in portfolio risk calculation",
+                    symbol
+                )
+                continue
+
+            # Calculate SL distance for this position
+            pos_sl_distance = abs(position.current_price - position.sl)
+            if pos_sl_distance <= 0:
+                # Position has no SL or invalid SL, skip it
+                continue
+
+            # Get symbol specifications
+            pos_point = pos_symbol_info['point']
+            pos_tick_value = pos_symbol_info['tick_value']
+            pos_currency_profit = pos_symbol_info.get('currency_profit', 'UNKNOWN')
+            account_currency = self.connector.get_account_currency()
+
+            # Convert tick value to account currency if needed
+            from src.utils.currency_conversion_service import CurrencyConversionService
+            currency_service = CurrencyConversionService(self.logger)
+            pos_tick_value, _ = currency_service.convert_tick_value(
+                tick_value=pos_tick_value,
+                currency_profit=pos_currency_profit,
+                account_currency=account_currency,
+                symbol=position.symbol
+            )
+
+            # Calculate risk for this position
+            pos_sl_distance_points = pos_sl_distance / pos_point if pos_point > 0 else pos_sl_distance
+            pos_risk_amount = pos_sl_distance_points * pos_tick_value * position.volume
+
+            total_existing_risk += pos_risk_amount
+            position_risks.append({
+                'ticket': position.ticket,
+                'symbol': position.symbol,
+                'volume': position.volume,
+                'risk_amount': pos_risk_amount
+            })
+
+        # Calculate risk for the proposed new trade
+        # Get symbol info
+        symbol_info = self.connector.get_symbol_info(symbol)
+        if symbol_info is None:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Portfolio Risk Validation",
+                error_message="Failed to get symbol information",
+                context={"action": "Trade rejected"}
+            )
+            return False
+
+        # Calculate SL distance
+        sl_distance = abs(entry_price - stop_loss)
+        if sl_distance <= 0:
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Portfolio Risk Validation",
+                error_message="Invalid stop loss distance",
+                context={
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "sl_distance": sl_distance,
+                    "action": "Trade rejected"
+                }
+            )
+            return False
+
+        # Get symbol specifications
+        point = symbol_info['point']
+        tick_value = symbol_info['tick_value']
+        currency_profit = symbol_info.get('currency_profit', 'UNKNOWN')
+        account_currency = self.connector.get_account_currency()
+
+        # Convert tick value to account currency if needed
+        from src.utils.currency_conversion_service import CurrencyConversionService
+        currency_service = CurrencyConversionService(self.logger)
+        tick_value, _ = currency_service.convert_tick_value(
+            tick_value=tick_value,
+            currency_profit=currency_profit,
+            account_currency=account_currency,
+            symbol=symbol
+        )
+
+        # Calculate new trade risk
+        sl_distance_in_points = sl_distance / point if point > 0 else sl_distance
+        new_trade_risk = sl_distance_in_points * tick_value * lot_size
+
+        # Calculate total portfolio risk
+        total_portfolio_risk = total_existing_risk + new_trade_risk
+        portfolio_risk_percent = (total_portfolio_risk / balance) * 100.0 if balance > 0 else 0
+
+        # Calculate existing portfolio risk percentage
+        existing_risk_percent = (total_existing_risk / balance) * 100.0 if balance > 0 else 0
+        new_trade_risk_percent = (new_trade_risk / balance) * 100.0 if balance > 0 else 0
+
+        # Get configured portfolio risk limit
+        max_portfolio_risk = self.risk_manager.risk_config.max_portfolio_risk_percent
+
+        # Check if portfolio risk exceeds limit
+        if portfolio_risk_percent > max_portfolio_risk:
+            # REJECT THE TRADE - Portfolio risk exceeds limit
+            self.logger.warning(
+                f"⚠️  PORTFOLIO RISK VALIDATION FAILED - Trade REJECTED",
+                symbol
+            )
+            self.logger.warning(
+                f"Current Portfolio Risk: ${total_existing_risk:.2f} ({existing_risk_percent:.2f}%) "
+                f"across {len(open_positions)} open position(s)",
+                symbol
+            )
+            self.logger.warning(
+                f"Proposed New Trade Risk: ${new_trade_risk:.2f} ({new_trade_risk_percent:.2f}%)",
+                symbol
+            )
+            self.logger.warning(
+                f"Combined Portfolio Risk: ${total_portfolio_risk:.2f} ({portfolio_risk_percent:.2f}%)",
+                symbol
+            )
+            self.logger.warning(
+                f"Portfolio Risk Limit: {max_portfolio_risk:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Risk Exceeds Limit By: {portfolio_risk_percent - max_portfolio_risk:.2f}%",
+                symbol
+            )
+
+            # Log details of existing positions
+            if position_risks:
+                self.logger.warning(
+                    f"Existing Position Risks:",
+                    symbol
+                )
+                for pos_risk in position_risks:
+                    self.logger.warning(
+                        f"  - Ticket {pos_risk['ticket']} ({pos_risk['symbol']}): "
+                        f"{pos_risk['volume']:.2f} lots = ${pos_risk['risk_amount']:.2f} risk",
+                        symbol
+                    )
+
+            self.logger.warning(
+                f"Reason: Adding this trade (${new_trade_risk:.2f} risk) to existing portfolio "
+                f"(${total_existing_risk:.2f} risk) would create {portfolio_risk_percent:.2f}% total risk, "
+                f"which exceeds the configured {max_portfolio_risk:.2f}% portfolio limit.",
+                symbol
+            )
+            self.logger.warning(
+                f"Action: Trade NOT executed. Consider closing some positions, reducing position sizes, "
+                f"or waiting for existing positions to close before opening new trades.",
+                symbol
+            )
+            return False
+
+        # Portfolio risk is within acceptable limits
+        self.logger.debug(
+            f"✓ Portfolio risk validation passed: ${total_portfolio_risk:.2f} ({portfolio_risk_percent:.2f}%) "
+            f"<= {max_portfolio_risk:.2f}% limit "
+            f"[Existing: ${total_existing_risk:.2f} ({existing_risk_percent:.2f}%), "
+            f"New: ${new_trade_risk:.2f} ({new_trade_risk_percent:.2f}%)]",
+            symbol
+        )
+
+        return True
 

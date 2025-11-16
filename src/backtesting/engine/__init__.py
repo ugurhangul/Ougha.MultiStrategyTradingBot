@@ -1,9 +1,23 @@
 ﻿"""
-Backtesting engine (deprecated - use backtesting.py library instead).
+Custom Backtesting Engine.
 
-This module is kept for reference but is no longer used.
-Use the backtesting.py library with adapters in src/backtesting/adapters/ instead.
+Multi-symbol, multi-strategy concurrent backtesting engine that accurately
+simulates the TradingController's concurrent execution architecture.
 """
 
-__all__ = []
+from src.backtesting.engine.simulated_broker import SimulatedBroker, SimulatedSymbolInfo
+from src.backtesting.engine.time_controller import TimeController, TimeMode
+from src.backtesting.engine.backtest_controller import BacktestController
+from src.backtesting.engine.data_loader import BacktestDataLoader
+from src.backtesting.engine.results_analyzer import ResultsAnalyzer
+
+__all__ = [
+    'SimulatedBroker',
+    'SimulatedSymbolInfo',
+    'TimeController',
+    'TimeMode',
+    'BacktestController',
+    'BacktestDataLoader',
+    'ResultsAnalyzer',
+]
 

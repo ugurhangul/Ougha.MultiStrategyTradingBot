@@ -118,6 +118,7 @@ class SymbolInfoCache:
                 'currency_profit': info.currency_profit,
                 'currency_margin': info.currency_margin,
                 'category': info.category,
+                'spread': info.spread,  # Current spread in points
             }
             
             return symbol_dict
