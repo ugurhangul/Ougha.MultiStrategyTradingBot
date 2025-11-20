@@ -119,7 +119,8 @@ TIME_MODE = TimeMode.MAX_SPEED
 #   - Pros: Fast execution
 #   - Cons: Misses intra-candle SL/TP hits, static spread, HFT strategy broken
 USE_TICK_DATA = True  # Set to True to enable tick-level backtesting
-TICK_TYPE = "ALL"  # "INFO" (bid/ask changes, recommended), "ALL" (all ticks), "TRADE" (trade ticks only)
+TICK_TYPE = "INFO"  # "INFO" (bid/ask changes, recommended - 10x less data than ALL), "ALL" (all ticks), "TRADE" (trade ticks only)
+# ⚠️ PERFORMANCE: Use "INFO" instead of "ALL" for 10x speedup! "ALL" includes every micro-tick.
 
 # Historical Data Buffer
 # Load extra days before START_DATE for reference candle lookback
