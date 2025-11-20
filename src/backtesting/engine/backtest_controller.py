@@ -7,6 +7,7 @@ Maintains the same concurrent architecture as live trading.
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
 import threading
+import sys
 
 from src.core.trading_controller import TradingController
 from src.backtesting.engine.simulated_broker import SimulatedBroker
@@ -82,6 +83,9 @@ class BacktestController:
         self.stop_loss_balance_threshold = 0.0  # Will be set when backtest starts
         self.trade_log: List[Dict] = []
 
+        # Track length of last printed progress line to overwrite cleanly
+        self._last_progress_len: int = 0
+
         self.logger.info("BacktestController initialized")
     
     def initialize(self, symbols: List[str]) -> bool:
@@ -137,11 +141,12 @@ class BacktestController:
         self.start_time = backtest_start_time
         self.end_time = self.broker.get_end_time()
 
-        # Update logging time provider to use simulated time from broker
+        # Update logging time provider to use a NON-BLOCKING simulated time getter from broker
         # (backtest mode was already set in backtest.py, this updates the time getter)
-        set_backtest_mode(self.broker.get_current_time, backtest_start_time)
+        # Using the non-blocking getter prevents logging from contending on broker.time_lock
+        set_backtest_mode(self.broker.get_current_time_nonblocking, backtest_start_time)
 
-        self.logger.info("Logging time provider updated to use simulated time from broker")
+        self.logger.info("Logging time provider updated to use non-blocking simulated time from broker")
         self.logger.info(f"Backtest time range: {self.start_time} to {self.end_time}")
 
         # Set stop loss threshold
@@ -156,7 +161,6 @@ class BacktestController:
 
             # Start TimeController
             self.time_controller.start()
-            self.logger.info("TimeController started")
 
             # Start TradingController (this creates all worker threads)
             self.logger.info("Starting TradingController with real threading architecture...")
@@ -204,6 +208,8 @@ class BacktestController:
 
             if not active_threads:
                 # Print final newline to move past the progress line
+                # Reset progress overwrite tracking before moving to a new line
+                self._last_progress_len = 0
                 print()  # Move to next line after progress updates
                 self.logger.info("All worker threads completed")
                 break
@@ -214,6 +220,8 @@ class BacktestController:
                 current_equity = self.broker.get_account_equity()
                 if current_equity <= self.stop_loss_balance_threshold:
                     self.stop_loss_triggered = True
+                    # Reset progress overwrite tracking before moving to a new line
+                    self._last_progress_len = 0
                     print()  # Move to next line after progress updates
                     self.logger.warning("")
                     current_balance = self.broker.get_account_balance()
@@ -238,8 +246,9 @@ class BacktestController:
             if step % 10 == 0:  # Record every 10 checks (10 seconds)
                 self._record_equity_snapshot()
 
-            # Print progress to console every second
-            self._print_progress_to_console()
+            # Console progress is now handled by broker on every tick
+            # (disabled to avoid conflicting with tick-by-tick console output)
+            # self._print_progress_to_console()
 
             # Log detailed progress to file less frequently
             if step % 100 == 0:  # Log to file every 100 checks (100 seconds)
@@ -383,11 +392,13 @@ class BacktestController:
                     if pos.sl == 0.0:  # Only check SL, not TP
                         positions_without_sl += 1
 
-            # Get barrier synchronization status (how many symbols waiting)
+            # Get barrier synchronization status (how many participants have arrived at the barrier)
+            # Note: TimeController no longer tracks a symbols_ready set; it uses an arrivals counter.
+            # We read the current arrivals under the barrier_condition lock for a consistent snapshot.
             symbols_waiting = 0
             if hasattr(self.trading_controller, 'time_controller'):
                 with self.trading_controller.time_controller.barrier_condition:
-                    symbols_waiting = len(self.trading_controller.time_controller.symbols_ready)
+                    symbols_waiting = self.trading_controller.time_controller.arrivals
                     total_participants = self.trading_controller.time_controller.total_participants
 
             # Print concise progress (overwrites previous line with \r)
@@ -399,8 +410,9 @@ class BacktestController:
             # Show barrier status (how many symbols are waiting vs total)
             barrier_status = f"Waiting: {symbols_waiting}/{total_participants}" if symbols_waiting > 0 else ""
 
-            print(
-                f"\r[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')}{tick_info} | "
+            # Build single-line status message
+            message = (
+                f"[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')}{tick_info} | "
                 f"Equity: ${stats['equity']:>10,.2f} | "
                 f"P&L: ${stats['profit']:>8,.2f} ({stats['profit_percent']:>+6.2f}%) | "
                 f"Floating: ${stats['floating_pnl']:>8,.2f} | "
@@ -408,10 +420,17 @@ class BacktestController:
                 f"WR: {metrics['win_rate']:>5.1f}% | "
                 f"PF: {pf_display:>6} | "
                 f"Open: {stats['open_positions']:>2}{warning_flag} | "
-                f"{barrier_status}",
-                end='',
-                flush=True
+                f"{barrier_status}"
             )
+
+            # Overwrite the previous line robustly without relying on ANSI support
+            # 1) Carriage return to line start
+            # 2) Write message
+            # 3) Pad with spaces if new message is shorter than the previous one
+            pad = max(0, self._last_progress_len - len(message))
+            sys.stdout.write("\r" + message + (" " * pad))
+            sys.stdout.flush()
+            self._last_progress_len = len(message)
 
     def _log_progress(self):
         """Log detailed backtest progress to file with comprehensive metrics."""

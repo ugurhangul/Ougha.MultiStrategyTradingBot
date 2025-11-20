@@ -2,6 +2,7 @@
 Main trading logger class.
 """
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict
@@ -43,6 +44,7 @@ class TradingLogger:
         self._current_log_dir: Optional[Path] = None  # Track current log directory
         self._master_file_handler: Optional[logging.FileHandler] = None  # Track master file handler
         self._console_handler: Optional[logging.Handler] = None  # Track console handler
+        self._lock = threading.RLock()  # Protect handler (re)creation against races
 
         # Disable propagation to avoid duplicate logs from parent loggers
         self.logger.propagate = False
@@ -104,47 +106,50 @@ class TradingLogger:
 
         This method is called during initialization.
         """
-        # Remove old console handler if it exists
-        if self._console_handler:
-            self.logger.removeHandler(self._console_handler)
-            self._console_handler = None
+        with self._lock:
+            # Remove old console handler if it exists
+            if self._console_handler:
+                try:
+                    self.logger.removeHandler(self._console_handler)
+                finally:
+                    self._console_handler = None
 
-        # Create console handler with colors (still using UTC)
-        if self._log_to_console:
-            # Full console logging - all levels
-            console_handler = colorlog.StreamHandler()
-            console_handler.setLevel(getattr(logging, self._log_level.upper()))
+            # Create console handler with colors (still using UTC)
+            if self._log_to_console:
+                # Full console logging - all levels
+                console_handler = colorlog.StreamHandler()
+                console_handler.setLevel(getattr(logging, self._log_level.upper()))
 
-            console_formatter = self._UTCColoredFormatter(
-                '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
-                datefmt='%H:%M:%S',
-                log_colors={
-                    'DEBUG': 'cyan',
-                    'INFO': 'white',
-                    'WARNING': 'yellow',
-                    'ERROR': 'red',
-                    'CRITICAL': 'red,bg_white',
-                }
-            )
-            console_handler.setFormatter(console_formatter)
-            self.logger.addHandler(console_handler)
-            self._console_handler = console_handler
-        else:
-            # Console logging disabled, but ALWAYS show errors and critical
-            console_handler = colorlog.StreamHandler()
-            console_handler.setLevel(logging.ERROR)  # Only ERROR and CRITICAL
+                console_formatter = self._UTCColoredFormatter(
+                    '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                    datefmt='%H:%M:%S',
+                    log_colors={
+                        'DEBUG': 'cyan',
+                        'INFO': 'white',
+                        'WARNING': 'yellow',
+                        'ERROR': 'red',
+                        'CRITICAL': 'red,bg_white',
+                    }
+                )
+                console_handler.setFormatter(console_formatter)
+                self.logger.addHandler(console_handler)
+                self._console_handler = console_handler
+            else:
+                # Console logging disabled, but ALWAYS show errors and critical
+                console_handler = colorlog.StreamHandler()
+                console_handler.setLevel(logging.ERROR)  # Only ERROR and CRITICAL
 
-            console_formatter = self._UTCColoredFormatter(
-                '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
-                datefmt='%H:%M:%S',
-                log_colors={
-                    'ERROR': 'red',
-                    'CRITICAL': 'red,bg_white',
-                }
-            )
-            console_handler.setFormatter(console_formatter)
-            self.logger.addHandler(console_handler)
-            self._console_handler = console_handler
+                console_formatter = self._UTCColoredFormatter(
+                    '%(log_color)s%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                    datefmt='%H:%M:%S',
+                    log_colors={
+                        'ERROR': 'red',
+                        'CRITICAL': 'red,bg_white',
+                    }
+                )
+                console_handler.setFormatter(console_formatter)
+                self.logger.addHandler(console_handler)
+                self._console_handler = console_handler
 
     def _setup_file_handlers(self):
         """
@@ -154,51 +159,78 @@ class TradingLogger:
         1. During initialization
         2. When the log directory changes (e.g., switching from live to backtest mode)
         """
-        # Get current log directory
-        log_dir = get_log_directory()
+        with self._lock:
+            # Get current log directory
+            log_dir = get_log_directory()
 
-        # If directory hasn't changed, no need to recreate handlers
-        if self._current_log_dir == log_dir:
-            return
+            # If directory hasn't changed, no need to recreate handlers
+            if self._current_log_dir == log_dir:
+                return
 
-        # Update current log directory
-        self._current_log_dir = log_dir
+            # Update current log directory
+            self._current_log_dir = log_dir
 
-        # Create log directory if it doesn't exist
-        log_dir.mkdir(parents=True, exist_ok=True)
+            # Create log directory if it doesn't exist
+            log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Remove old master file handler if it exists
-        if self._master_file_handler:
-            self.logger.removeHandler(self._master_file_handler)
-            self._master_file_handler.close()
+            # Remove old master file handler if it exists
+            if self._master_file_handler:
+                try:
+                    self.logger.removeHandler(self._master_file_handler)
+                finally:
+                    try:
+                        self._master_file_handler.close()
+                    finally:
+                        self._master_file_handler = None
 
-        # Create new master log file handler: logs/<mode>/main.log
-        master_log_file = log_dir / "main.log"
-        self._master_file_handler = logging.FileHandler(master_log_file, encoding='utf-8')
-        self._master_file_handler.setLevel(logging.DEBUG)
+            # Create new master log file handler: logs/<mode>/main.log
+            master_log_file = log_dir / "main.log"
 
-        # Use UTC formatter for file logs
-        file_formatter = UTCFormatter(
-            '%(asctime)s UTC | %(levelname)-8s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        self._master_file_handler.setFormatter(file_formatter)
-        self.logger.addHandler(self._master_file_handler)
+            # Proactively remove any existing handler targeting the same file (safety against races)
+            for h in list(self.logger.handlers):
+                try:
+                    if isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None):
+                        if Path(h.baseFilename) == master_log_file.resolve():
+                            self.logger.removeHandler(h)
+                            try:
+                                h.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    # Be robust; ignore issues inspecting handlers
+                    pass
 
-        # Remove old disable log handler if it exists
-        if self.disable_log_handler:
-            self.disable_log_handler.close()
+            self._master_file_handler = logging.FileHandler(master_log_file, encoding='utf-8')
+            self._master_file_handler.setLevel(logging.DEBUG)
 
-        # Create new disable log file: logs/<mode>/disable.log
-        disable_log_file = log_dir / "disable.log"
-        self.disable_log_handler = logging.FileHandler(disable_log_file, encoding='utf-8')
-        self.disable_log_handler.setLevel(logging.INFO)
-        self.disable_log_handler.setFormatter(file_formatter)
+            # Use UTC formatter for file logs
+            file_formatter = UTCFormatter(
+                '%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            self._master_file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(self._master_file_handler)
 
-        # Clear symbol handlers (they will be recreated on demand with new paths)
-        for handler in self.symbol_handlers.values():
-            handler.close()
-        self.symbol_handlers.clear()
+            # Remove old disable log handler if it exists
+            if self.disable_log_handler:
+                try:
+                    self.disable_log_handler.close()
+                finally:
+                    self.disable_log_handler = None
+
+            # Create new disable log file: logs/<mode>/disable.log
+            disable_log_file = log_dir / "disable.log"
+            self.disable_log_handler = logging.FileHandler(disable_log_file, encoding='utf-8')
+            self.disable_log_handler.setLevel(logging.INFO)
+            self.disable_log_handler.setFormatter(file_formatter)
+
+            # Clear symbol handlers (they will be recreated on demand with new paths)
+            for handler in self.symbol_handlers.values():
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+            self.symbol_handlers.clear()
 
     def _check_date_change(self):
         """
@@ -220,36 +252,38 @@ class TradingLogger:
         Returns:
             File handler for the symbol, or None if file logging is disabled
         """
-        # Check if handler already exists
-        if symbol in self.symbol_handlers:
-            return self.symbol_handlers[symbol]
+        with self._lock:
+            # Check if handler already exists
+            existing = self.symbol_handlers.get(symbol)
+            if existing is not None:
+                return existing
 
-        # Create new handler for this symbol
-        try:
-            # Get log directory from time provider (logs/live/YYYY-MM-DD/ or logs/backtest/YYYY-MM-DD/)
-            log_dir = get_log_directory()
-            log_dir.mkdir(parents=True, exist_ok=True)
+            # Create new handler for this symbol
+            try:
+                # Get log directory from time provider (logs/live/YYYY-MM-DD/ or logs/backtest/YYYY-MM-DD/)
+                log_dir = get_log_directory()
+                log_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create symbol-specific log file: logs/<mode>/YYYY-MM-DD/SYMBOL.log
-            log_file = log_dir / f"{symbol}.log"
+                # Create symbol-specific log file: logs/<mode>/YYYY-MM-DD/SYMBOL.log
+                log_file = log_dir / f"{symbol}.log"
 
-            handler = logging.FileHandler(log_file, encoding='utf-8')
-            handler.setLevel(logging.DEBUG)
+                handler = logging.FileHandler(log_file, encoding='utf-8')
+                handler.setLevel(logging.DEBUG)
 
-            # Use UTC formatter
-            formatter = UTCFormatter(
-                '%(asctime)s UTC | %(levelname)-8s | %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-            handler.setFormatter(formatter)
+                # Use UTC formatter
+                formatter = UTCFormatter(
+                    '%(asctime)s UTC | %(levelname)-8s | %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S'
+                )
+                handler.setFormatter(formatter)
 
-            # Store handler
-            self.symbol_handlers[symbol] = handler
+                # Store handler
+                self.symbol_handlers[symbol] = handler
 
-            return handler
-        except Exception as e:
-            self.logger.error(f"Failed to create log handler for {symbol}: {e}")
-            return None
+                return handler
+            except Exception as e:
+                self.logger.error(f"Failed to create log handler for {symbol}: {e}")
+                return None
 
     def _log_to_symbol_file(self, level: int, message: str, symbol: str):
         """

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from analyze_backtest_results import BacktestResultsAnalyzer
 
 
-def parse_main_log(log_file: str = "logs/backtest/2025-11-15/main.log"):
+def parse_main_log(log_file: str = "logs/backtest/2025-11-14/main.log"):
     """
     Parse main.log file to extract trade data.
     
