@@ -57,6 +57,7 @@ class ResultsAnalyzer:
             'total_trades': len(trade_log),
             'final_balance': results.get('final_balance', 0),
             'final_equity': results.get('final_equity', 0),
+            'open_positions': results.get('open_positions', 0),
         }
         
         # Add trade statistics if available

@@ -20,6 +20,18 @@ from src.indicators.technical_indicators import TechnicalIndicators
 from src.utils.logger import get_logger
 from src.utils.logging import set_backtest_mode, set_live_mode
 
+# Rich progress display (optional, with fallback to plain text)
+try:
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
 
 class BacktestController:
     """
@@ -85,6 +97,14 @@ class BacktestController:
 
         # Track length of last printed progress line to overwrite cleanly
         self._last_progress_len: int = 0
+
+        # ETA CALCULATION: Moving average window for candle mode
+        from collections import deque
+        import time
+        self.eta_window_size = 100  # Track last 100 progress updates for moving average
+        self.eta_progress_history = deque(maxlen=self.eta_window_size)  # (progress_pct, wall_clock_time) pairs
+        self.eta_warmup_updates = 10  # Wait for 10 updates before showing ETA
+        self.backtest_wall_start_time = None  # Will be set when backtest starts
 
         self.logger.info("BacktestController initialized")
     
@@ -192,9 +212,126 @@ class BacktestController:
         Wait for all worker threads to complete.
 
         Monitors thread status and logs progress periodically.
+        Uses Rich progress bar if available, otherwise falls back to plain text.
         """
         self.logger.info("Waiting for worker threads to complete...")
 
+        import time
+        step = 0
+
+        # Use Rich progress bar if available
+        if RICH_AVAILABLE:
+            self._wait_for_completion_with_rich()
+        else:
+            self._wait_for_completion_plain()
+
+    def _wait_for_completion_with_rich(self):
+        """Wait for completion with Rich progress bar display and live positions table."""
+        import time
+        step = 0
+
+        # Create Rich progress bar
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+        )
+
+        # Determine total for progress bar
+        if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
+            # Tick mode: use total ticks
+            if hasattr(self.broker, 'global_tick_timeline'):
+                total = len(self.broker.global_tick_timeline)
+            else:
+                total = 100  # Fallback to percentage
+        else:
+            # Candle mode: use time-based progress (0-100)
+            total = 100
+
+        task = progress.add_task("Backtesting", total=total)
+        console = Console()
+
+        # Use Live display to show both progress and positions table
+        with Live(console=console, refresh_per_second=1, transient=False) as live:
+            while self.running:
+                # Check if all symbol threads are still alive
+                with self.trading_controller.lock:
+                    active_threads = [
+                        symbol for symbol, thread in self.trading_controller.threads.items()
+                        if thread.is_alive()
+                    ]
+
+                if not active_threads:
+                    progress.update(task, completed=total)
+                    self.logger.info("All worker threads completed")
+                    break
+
+                # Check for early termination due to stop loss threshold
+                if self.stop_loss_threshold > 0 and not self.stop_loss_triggered:
+                    current_equity = self.broker.get_account_equity()
+                    if current_equity <= self.stop_loss_balance_threshold:
+                        self.stop_loss_triggered = True
+                        progress.stop()
+                        print()  # Move to next line
+                        self.logger.warning("")
+                        current_balance = self.broker.get_account_balance()
+                        self.logger.warning("=" * 80)
+                        self.logger.warning("⚠️  STOP LOSS THRESHOLD REACHED - TERMINATING BACKTEST")
+                        self.logger.warning("=" * 80)
+                        self.logger.warning(f"  Initial Balance:    ${self.broker.initial_balance:,.2f}")
+                        self.logger.warning(f"  Current Balance:    ${current_balance:,.2f}")
+                        self.logger.warning(f"  Current Equity:     ${current_equity:,.2f}")
+                        self.logger.warning(f"  Threshold:          ${self.stop_loss_balance_threshold:,.2f} ({self.stop_loss_threshold}%)")
+                        self.logger.warning(f"  Loss:               ${current_equity - self.broker.initial_balance:,.2f} ({((current_equity - self.broker.initial_balance) / self.broker.initial_balance * 100):.2f}%)")
+                        self.logger.warning("=" * 80)
+                        self.logger.warning("")
+
+                        # Stop the backtest
+                        self.running = False
+                        self.time_controller.stop()
+                        self.trading_controller.stop()
+                        break
+
+                # Update progress bar
+                current_progress = self._get_current_progress()
+                if current_progress is not None:
+                    if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
+                        # Tick mode: update with tick count
+                        progress.update(task, completed=current_progress)
+                    else:
+                        # Candle mode: update with percentage
+                        progress.update(task, completed=current_progress)
+
+                # Update task description with live stats
+                stats_text = self._get_progress_stats_text()
+                progress.update(task, description=f"Backtesting {stats_text}")
+
+                # Create combined display with progress and positions table
+                positions_table = self._create_positions_table()
+                display_group = Group(
+                    progress,
+                    positions_table
+                )
+                live.update(display_group)
+
+                # Record equity curve periodically
+                if step % 10 == 0:  # Record every 10 checks (10 seconds)
+                    self._record_equity_snapshot()
+
+                # Log detailed progress to file less frequently
+                if step % 100 == 0:  # Log to file every 100 checks (100 seconds)
+                    self._log_progress()
+                    self.logger.info(f"Active threads: {len(active_threads)}/{len(self.symbols)}")
+
+                step += 1
+                time.sleep(1)  # Check every second
+
+    def _wait_for_completion_plain(self):
+        """Wait for completion with plain text progress display (fallback)."""
         import time
         step = 0
 
@@ -208,19 +345,16 @@ class BacktestController:
 
             if not active_threads:
                 # Print final newline to move past the progress line
-                # Reset progress overwrite tracking before moving to a new line
                 self._last_progress_len = 0
                 print()  # Move to next line after progress updates
                 self.logger.info("All worker threads completed")
                 break
 
             # Check for early termination due to stop loss threshold
-            # Use EQUITY (balance + floating P/L) instead of just balance
             if self.stop_loss_threshold > 0 and not self.stop_loss_triggered:
                 current_equity = self.broker.get_account_equity()
                 if current_equity <= self.stop_loss_balance_threshold:
                     self.stop_loss_triggered = True
-                    # Reset progress overwrite tracking before moving to a new line
                     self._last_progress_len = 0
                     print()  # Move to next line after progress updates
                     self.logger.warning("")
@@ -247,7 +381,6 @@ class BacktestController:
                 self._record_equity_snapshot()
 
             # Console progress (lightweight, once per second)
-            # Broker's per-tick console output is disabled by default for performance
             self._print_progress_to_console()
 
             # Log detailed progress to file less frequently
@@ -257,6 +390,146 @@ class BacktestController:
 
             step += 1
             time.sleep(1)  # Check every second
+
+    def _get_current_progress(self):
+        """Get current progress value for progress bar."""
+        if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
+            # Tick mode: return current tick index
+            if hasattr(self.broker, 'global_tick_index'):
+                return self.broker.global_tick_index
+        else:
+            # Candle mode: return percentage (0-100)
+            current_time = self.broker.get_current_time()
+            if self.start_time and self.end_time and current_time:
+                total_duration = (self.end_time - self.start_time).total_seconds()
+                elapsed_duration = (current_time - self.start_time).total_seconds()
+                if total_duration > 0:
+                    progress_pct = (elapsed_duration / total_duration * 100)
+                    return max(0, min(100, progress_pct))
+        return None
+
+    def _get_progress_stats_text(self):
+        """Get concise stats text for progress bar description."""
+        stats = self.broker.get_statistics()
+        current_time = self.broker.get_current_time()
+
+        if not current_time:
+            return ""
+
+        # Get basic metrics
+        closed_trades = self.broker.closed_trades
+        total_trades = len(closed_trades)
+
+        # Calculate live metrics
+        metrics = self._calculate_live_metrics(stats, closed_trades)
+
+        # Format profit with color indicator
+        profit = stats['profit']
+        profit_sign = "+" if profit >= 0 else ""
+
+        # Format profit factor display
+        pf_display = f"{metrics['profit_factor']:.2f}" if metrics['profit_factor'] != float('inf') else "∞"
+
+        # Build concise stats text with additional metrics
+        stats_text = (
+            f"[{current_time.strftime('%H:%M')}] "
+            f"Equity: ${stats['equity']:,.0f} | "
+            f"P&L: {profit_sign}${profit:,.0f} ({stats['profit_percent']:+.1f}%) | "
+            f"Trades: {total_trades} ({metrics['total_wins']}W/{metrics['total_losses']}L) | "
+            f"WR: {metrics['win_rate']:.1f}% | "
+            f"PF: {pf_display} | "
+            f"Open: {stats['open_positions']}"
+        )
+
+        return stats_text
+
+    def _create_positions_table(self):
+        """Create a rich table showing currently open positions."""
+        if not RICH_AVAILABLE:
+            return ""
+
+        from datetime import datetime
+
+        # Get open positions from broker
+        positions = self.broker.get_positions()
+
+        # Create table
+        table = Table(
+            title=f"📊 Open Positions ({len(positions)})",
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+            title_style="bold white",
+            show_lines=False,
+            padding=(0, 1)
+        )
+
+        # Add columns
+        table.add_column("Ticket", style="cyan", width=8, justify="right")
+        table.add_column("Symbol", style="white", width=10)
+        table.add_column("Type", style="white", width=5)
+        table.add_column("Entry", style="white", width=10, justify="right")
+        table.add_column("Current", style="white", width=10, justify="right")
+        table.add_column("P&L", style="white", width=12, justify="right")
+        table.add_column("SL", style="yellow", width=10, justify="right")
+        table.add_column("TP", style="green", width=10, justify="right")
+        table.add_column("Time", style="white", width=10)
+
+        # If no positions, show empty message
+        if not positions:
+            table.add_row("—", "—", "—", "—", "—", "—", "—", "—", "—")
+            return table
+
+        # Sort positions by open time (newest first)
+        sorted_positions = sorted(positions, key=lambda p: p.open_time, reverse=True)
+
+        # Limit to most recent 10 positions to avoid cluttering the display
+        display_positions = sorted_positions
+
+        # Get current time for duration calculation
+        current_time = self.broker.get_current_time()
+
+        # Add rows for each position
+        for pos in display_positions:
+            # Calculate time held
+            if current_time and pos.open_time:
+                time_held = current_time - pos.open_time
+                hours = int(time_held.total_seconds() // 3600)
+                minutes = int((time_held.total_seconds() % 3600) // 60)
+                time_str = f"{hours}h{minutes}m" if hours > 0 else f"{minutes}m"
+            else:
+                time_str = "—"
+
+            # Color code P&L
+            profit = pos.profit
+            if profit > 0:
+                pnl_str = f"[green]+${profit:,.2f}[/green]"
+            elif profit < 0:
+                pnl_str = f"[red]${profit:,.2f}[/red]"
+            else:
+                pnl_str = f"${profit:,.2f}"
+
+            # Format position type
+            pos_type = "BUY" if pos.position_type.name == "BUY" else "SELL"
+            type_color = "green" if pos_type == "BUY" else "red"
+
+            # Format SL/TP
+            sl_str = f"{pos.sl:.5f}" if pos.sl > 0 else "—"
+            tp_str = f"{pos.tp:.5f}" if pos.tp > 0 else "—"
+
+            table.add_row(
+                f"{pos.ticket}",
+                pos.symbol,
+                f"[{type_color}]{pos_type}[/{type_color}]",
+                f"{pos.open_price:.5f}",
+                f"{pos.current_price:.5f}",
+                pnl_str,
+                sl_str,
+                tp_str,
+                time_str
+            )
+
+        return table
 
     def _record_equity_snapshot(self):
         """Record current equity for equity curve."""
@@ -381,6 +654,45 @@ class BacktestController:
                         # Clamp to 0-100 range
                         progress_pct = max(0, min(100, progress_pct))
 
+            # Calculate ETA (Estimated Time to Finish) using moving average
+            eta_display = ""
+            if progress_pct > 0:
+                import time
+                current_wall_time = time.time()
+
+                # Initialize wall start time on first call
+                if self.backtest_wall_start_time is None:
+                    self.backtest_wall_start_time = current_wall_time
+
+                    # Add current progress to the moving window
+                    self.eta_progress_history.append((progress_pct, current_wall_time))
+
+                    # Calculate ETA from the moving window (skip initial warm-up period)
+                    if len(self.eta_progress_history) >= self.eta_warmup_updates:
+                        oldest_pct, oldest_time = self.eta_progress_history[0]
+                        newest_pct, newest_time = self.eta_progress_history[-1]
+
+                        # Calculate progress rate (percentage points per second)
+                        progress_delta = newest_pct - oldest_pct
+                        time_delta = newest_time - oldest_time
+
+                        if time_delta > 0 and progress_delta > 0:
+                            pct_per_second = progress_delta / time_delta
+                            remaining_pct = 100.0 - progress_pct
+                            eta_seconds = remaining_pct / pct_per_second if pct_per_second > 0 else 0
+
+                            # Format ETA
+                            if eta_seconds < 60:
+                                eta_display = f" | ETA: {int(eta_seconds):>3}s"
+                            elif eta_seconds < 3600:
+                                eta_display = f" | ETA: {int(eta_seconds / 60):>2}m {int(eta_seconds % 60):>2}s"
+                            else:
+                                hours = int(eta_seconds / 3600)
+                                minutes = int((eta_seconds % 3600) / 60)
+                                eta_display = f" | ETA: {hours}h {minutes}m"
+                    else:
+                        eta_display = " | ETA: calculating..."
+
             # Calculate live metrics
             metrics = self._calculate_live_metrics(stats, closed_trades)
 
@@ -412,7 +724,7 @@ class BacktestController:
 
             # Build single-line status message
             message = (
-                f"[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')}{tick_info} | "
+                f"[{progress_pct:5.1f}%] {current_time.strftime('%Y-%m-%d %H:%M')}{tick_info}{eta_display} | "
                 f"Equity: ${stats['equity']:>10,.2f} | "
                 f"P&L: ${stats['profit']:>8,.2f} ({stats['profit_percent']:>+6.2f}%) | "
                 f"Floating: ${stats['floating_pnl']:>8,.2f} | "
@@ -502,6 +814,7 @@ class BacktestController:
             'final_equity': stats['equity'],
             'total_profit': stats['profit'],
             'profit_percent': stats['profit_percent'],
+            'open_positions': stats['open_positions'],
             'equity_curve': self.equity_curve,
             'trade_log': closed_trades,  # Use actual closed trades from broker
         }

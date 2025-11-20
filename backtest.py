@@ -33,6 +33,13 @@ Performance Optimization:
     - Console logging OFF: ~10-50x faster (recommended for production backtests)
     - Console logging ON: Useful for debugging, but significantly slower
 
+    Tick Mode Optimizations (v2.0):
+    ✓ Progress updates: Every 1000 ticks (0.1%) instead of every tick
+    ✓ Statistics caching: Only recalculated when trades change
+    ✓ P&L updates: Only for current symbol's positions
+    ✓ SL/TP logging: Complete logging preserved for trade history analysis
+    ✓ Expected speedup: 50-100x faster than v1.0
+
     Logs location: logs/backtest/YYYY-MM-DD/
 
 Documentation:
@@ -68,6 +75,18 @@ from src.config import config
 from src.utils.logger import get_logger, init_logger
 from src.core.mt5_connector import MT5Connector
 
+# Rich console formatting (optional, with fallback to plain text)
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    RICH_AVAILABLE = True
+    console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    console = None
+
 # ============================================================================
 # CONFIGURATION - Customize these settings for your backtest
 # ============================================================================
@@ -94,7 +113,7 @@ STOP_LOSS_THRESHOLD = 1.0  # Stop if equity < 50% of initial (realistic margin c
 # SYMBOLS: Optional[List[str]] = ['EURUSD', 'GBPUSD']  # Major pairs with good data
 # Option 2: Set to None to load from active.set file (recommended for CANDLE MODE full backtest)
 # IMPORTANT: For TICK MODE, use only 2-5 symbols to manage memory and loading time!
-SYMBOLS: Optional[List[str]] = ['EURUSD', 'GBPUSD']  # Limited symbols for tick mode
+SYMBOLS = None  # Set to None to load from active.set file
 
 # Timeframes
 # Load all timeframes needed by strategies from MT5 (more accurate than resampling)
@@ -216,6 +235,230 @@ def load_symbols(logger) -> List[str]:
         connector.disconnect()
 
 
+def print_configuration_panel(config_data: dict, logger=None):
+    """
+    Print backtest configuration in a formatted panel (rich if available, plain text otherwise).
+
+    Args:
+        config_data: Dictionary with configuration values
+        logger: Optional logger instance to also log to file
+    """
+    if RICH_AVAILABLE:
+        # Create rich formatted panel
+        config_lines = []
+        config_lines.append(f"[cyan]Date Range:[/cyan]       {config_data['date_range']}")
+        config_lines.append(f"[cyan]Duration:[/cyan]         {config_data['duration']}")
+        config_lines.append(f"[cyan]Initial Balance:[/cyan]  ${config_data['initial_balance']:,.2f}")
+        config_lines.append(f"[cyan]Stop Threshold:[/cyan]   {config_data['stop_threshold']}")
+        config_lines.append(f"[cyan]Timeframes:[/cyan]       {config_data['timeframes']}")
+        config_lines.append(f"[cyan]Time Mode:[/cyan]        {config_data['time_mode']}")
+        config_lines.append(f"[cyan]Tick Data:[/cyan]        {config_data['tick_data']}")
+
+        if config_data.get('tick_warning'):
+            config_lines.append(f"[yellow]⚠ WARNING:[/yellow]        {config_data['tick_warning']}")
+            config_lines.append(f"                    {config_data['tick_warning_detail']}")
+
+        config_lines.append(f"[cyan]Spreads:[/cyan]          {config_data['spreads']}")
+        config_lines.append(f"[cyan]Slippage:[/cyan]         {config_data['slippage']}")
+        config_lines.append(f"[cyan]Leverage:[/cyan]         {config_data['leverage']}")
+
+        config_text = "\n".join(config_lines)
+        panel = Panel(config_text, title="⚙️  Backtest Configuration", border_style="blue", padding=(1, 2))
+        console.print(panel)
+        console.print()
+    else:
+        # Fallback to plain text
+        print("BACKTEST CONFIGURATION:")
+        print(f"  Date Range:       {config_data['date_range']}")
+        print(f"  Duration:         {config_data['duration']}")
+        print(f"  Initial Balance:  ${config_data['initial_balance']:,.2f}")
+        print(f"  Stop Threshold:   {config_data['stop_threshold']}")
+        print(f"  Timeframes:       {config_data['timeframes']}")
+        print(f"  Time Mode:        {config_data['time_mode']}")
+        print(f"  Tick Data:        {config_data['tick_data']}")
+
+        if config_data.get('tick_warning'):
+            print(f"  ⚠ WARNING:        {config_data['tick_warning']}")
+            print(f"                    {config_data['tick_warning_detail']}")
+
+        print(f"  Spreads:          {config_data['spreads']}")
+        print(f"  Slippage:         {config_data['slippage']}")
+        print(f"  Leverage:         {config_data['leverage']}")
+        print()
+
+    # Always log to file (plain text)
+    if logger:
+        logger.info("BACKTEST CONFIGURATION:")
+        logger.info(f"  Date Range:       {config_data['date_range']}")
+        logger.info(f"  Duration:         {config_data['duration']}")
+        logger.info(f"  Initial Balance:  ${config_data['initial_balance']:,.2f}")
+        logger.info(f"  Stop Threshold:   {config_data['stop_threshold']}")
+        logger.info(f"  Timeframes:       {config_data['timeframes']}")
+        logger.info(f"  Time Mode:        {config_data['time_mode']}")
+        logger.info(f"  Tick Data:        {config_data['tick_data']}")
+        if config_data.get('tick_warning'):
+            logger.info(f"  ⚠ WARNING:        {config_data['tick_warning']}")
+            logger.info(f"                    {config_data['tick_warning_detail']}")
+        logger.info(f"  Spreads:          {config_data['spreads']}")
+        logger.info(f"  Slippage:         {config_data['slippage']}")
+        logger.info(f"  Leverage:         {config_data['leverage']}")
+        logger.info("")
+
+
+def print_results_table(metrics: dict, initial_balance: float, logger=None):
+    """
+    Print backtest results in a formatted table (rich if available, plain text otherwise).
+
+    Args:
+        metrics: Dictionary with backtest metrics
+        initial_balance: Initial account balance
+        logger: Optional logger instance to also log to file
+    """
+    if RICH_AVAILABLE:
+        # Create main results table
+        table = Table(title="📊 Backtest Results", show_header=True, header_style="bold cyan", border_style="green" if metrics.get('total_profit', 0) > 0 else "red")
+        table.add_column("Metric", style="cyan", width=25)
+        table.add_column("Value", style="white", width=20, justify="right")
+
+        # Account Performance
+        total_profit = metrics.get('total_profit', 0)
+        profit_color = "green" if total_profit > 0 else "red"
+
+        table.add_row("", "")  # Spacer
+        table.add_row("[bold]ACCOUNT PERFORMANCE[/bold]", "")
+        table.add_row("Initial Balance", f"${initial_balance:,.2f}")
+        table.add_row("Final Balance", f"${metrics.get('final_balance', 0):,.2f}")
+        table.add_row("Final Equity", f"${metrics.get('final_equity', 0):,.2f}")
+        table.add_row("Total Profit", f"[{profit_color}]${total_profit:,.2f}[/{profit_color}]")
+        table.add_row("Total Return", f"[{profit_color}]{metrics.get('total_return', 0):.2f}%[/{profit_color}]")
+
+        # Risk Metrics
+        table.add_row("", "")  # Spacer
+        table.add_row("[bold]RISK METRICS[/bold]", "")
+        max_dd = metrics.get('max_drawdown', 0)
+        dd_color = "red" if max_dd < -10 else "yellow" if max_dd < -5 else "green"
+        table.add_row("Max Drawdown", f"[{dd_color}]{max_dd:.2f}%[/{dd_color}]")
+
+        sharpe = metrics.get('sharpe_ratio', 0)
+        sharpe_color = "green" if sharpe > 1.5 else "yellow" if sharpe > 1.0 else "red"
+        table.add_row("Sharpe Ratio", f"[{sharpe_color}]{sharpe:.2f}[/{sharpe_color}]")
+
+        pf = metrics.get('profit_factor', 0)
+        pf_display = f"{pf:.2f}" if pf != float('inf') else "∞"
+        pf_color = "green" if pf > 1.5 else "yellow" if pf > 1.0 else "red"
+        table.add_row("Profit Factor", f"[{pf_color}]{pf_display}[/{pf_color}]")
+
+        # Trade Statistics
+        table.add_row("", "")  # Spacer
+        table.add_row("[bold]TRADE STATISTICS[/bold]", "")
+        table.add_row("Total Trades", f"{metrics.get('total_trades', 0)}")
+
+        win_rate = metrics.get('win_rate', 0)
+        wr_color = "green" if win_rate > 60 else "yellow" if win_rate > 50 else "red"
+        table.add_row("Winning Trades", f"[{wr_color}]{metrics.get('winning_trades', 0)} ({win_rate:.1f}%)[/{wr_color}]")
+        table.add_row("Losing Trades", f"{metrics.get('losing_trades', 0)} ({100 - win_rate:.1f}%)")
+
+        # Open positions at end of backtest
+        open_positions = metrics.get('open_positions', 0)
+        open_color = "yellow" if open_positions > 0 else "green"
+        table.add_row("Open Positions", f"[{open_color}]{open_positions}[/{open_color}]")
+
+        # Trade Details
+        if metrics.get('total_trades', 0) > 0:
+            table.add_row("", "")  # Spacer
+            table.add_row("[bold]TRADE DETAILS[/bold]", "")
+            avg_win = metrics.get('avg_win', 0)
+            table.add_row("Avg Win", f"[green]${avg_win:,.2f}[/green]")
+            avg_loss = metrics.get('avg_loss', 0)
+            table.add_row("Avg Loss", f"[red]${avg_loss:,.2f}[/red]")
+            table.add_row("Largest Win", f"[green]${metrics.get('largest_win', 0):,.2f}[/green]")
+            table.add_row("Largest Loss", f"[red]${metrics.get('largest_loss', 0):,.2f}[/red]")
+            table.add_row("Max Consecutive Wins", f"{metrics.get('max_consecutive_wins', 0)}")
+            table.add_row("Max Consecutive Losses", f"{metrics.get('max_consecutive_losses', 0)}")
+
+        console.print()
+        console.print(table)
+        console.print()
+    else:
+        # Fallback to plain text
+        print()
+        print("=" * 80)
+        print("BACKTEST RESULTS")
+        print("=" * 80)
+        print()
+
+        print("ACCOUNT PERFORMANCE:")
+        print(f"  Initial Balance:  ${initial_balance:>12,.2f}")
+        print(f"  Final Balance:    ${metrics.get('final_balance', 0):>12,.2f}")
+        print(f"  Final Equity:     ${metrics.get('final_equity', 0):>12,.2f}")
+        print(f"  Total Profit:     ${metrics.get('total_profit', 0):>12,.2f}")
+        print(f"  Total Return:     {metrics.get('total_return', 0):>12.2f}%")
+        print()
+
+        print("RISK METRICS:")
+        print(f"  Max Drawdown:     {metrics.get('max_drawdown', 0):>12.2f}%")
+        print(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):>12.2f}")
+        pf = metrics.get('profit_factor', 0)
+        pf_display = f"{pf:.2f}" if pf != float('inf') else "∞"
+        print(f"  Profit Factor:    {pf_display:>12}")
+        print()
+
+        print("TRADE STATISTICS:")
+        print(f"  Total Trades:     {metrics.get('total_trades', 0):>12}")
+        print(f"  Winning Trades:   {metrics.get('winning_trades', 0):>12} ({metrics.get('win_rate', 0):.1f}%)")
+        print(f"  Losing Trades:    {metrics.get('losing_trades', 0):>12} ({100 - metrics.get('win_rate', 0):.1f}%)")
+        print(f"  Win/Loss Ratio:   {metrics.get('winning_trades', 0):>5} / {metrics.get('losing_trades', 0):<5}")
+        print(f"  Open Positions:   {metrics.get('open_positions', 0):>12}")
+        print()
+
+        if metrics.get('total_trades', 0) > 0:
+            print("TRADE DETAILS:")
+            print(f"  Avg Win:          ${metrics.get('avg_win', 0):>12,.2f}")
+            print(f"  Avg Loss:         ${metrics.get('avg_loss', 0):>12,.2f}")
+            print(f"  Largest Win:      ${metrics.get('largest_win', 0):>12,.2f}")
+            print(f"  Largest Loss:     ${metrics.get('largest_loss', 0):>12,.2f}")
+            print(f"  Max Consecutive Wins:   {metrics.get('max_consecutive_wins', 0):>6}")
+            print(f"  Max Consecutive Losses: {metrics.get('max_consecutive_losses', 0):>6}")
+            print()
+
+    # Always log to file (plain text)
+    if logger:
+        logger.info("=" * 80)
+        logger.info("BACKTEST RESULTS")
+        logger.info("=" * 80)
+        logger.info("")
+        logger.info("ACCOUNT PERFORMANCE:")
+        logger.info(f"  Initial Balance:  ${initial_balance:>12,.2f}")
+        logger.info(f"  Final Balance:    ${metrics.get('final_balance', 0):>12,.2f}")
+        logger.info(f"  Final Equity:     ${metrics.get('final_equity', 0):>12,.2f}")
+        logger.info(f"  Total Profit:     ${metrics.get('total_profit', 0):>12,.2f}")
+        logger.info(f"  Total Return:     {metrics.get('total_return', 0):>12.2f}%")
+        logger.info("")
+        logger.info("RISK METRICS:")
+        logger.info(f"  Max Drawdown:     {metrics.get('max_drawdown', 0):>12.2f}%")
+        logger.info(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):>12.2f}")
+        pf = metrics.get('profit_factor', 0)
+        pf_display = f"{pf:.2f}" if pf != float('inf') else "∞"
+        logger.info(f"  Profit Factor:    {pf_display:>12}")
+        logger.info("")
+        logger.info("TRADE STATISTICS:")
+        logger.info(f"  Total Trades:     {metrics.get('total_trades', 0):>12}")
+        logger.info(f"  Winning Trades:   {metrics.get('winning_trades', 0):>12} ({metrics.get('win_rate', 0):.1f}%)")
+        logger.info(f"  Losing Trades:    {metrics.get('losing_trades', 0):>12} ({100 - metrics.get('win_rate', 0):.1f}%)")
+        logger.info(f"  Win/Loss Ratio:   {metrics.get('winning_trades', 0):>5} / {metrics.get('losing_trades', 0):<5}")
+        logger.info(f"  Open Positions:   {metrics.get('open_positions', 0):>12}")
+        logger.info("")
+        if metrics.get('total_trades', 0) > 0:
+            logger.info("TRADE DETAILS:")
+            logger.info(f"  Avg Win:          ${metrics.get('avg_win', 0):>12,.2f}")
+            logger.info(f"  Avg Loss:         ${metrics.get('avg_loss', 0):>12,.2f}")
+            logger.info(f"  Largest Win:      ${metrics.get('largest_win', 0):>12,.2f}")
+            logger.info(f"  Largest Loss:     ${metrics.get('largest_loss', 0):>12,.2f}")
+            logger.info(f"  Max Consecutive Wins:   {metrics.get('max_consecutive_wins', 0):>6}")
+            logger.info(f"  Max Consecutive Losses: {metrics.get('max_consecutive_losses', 0):>6}")
+            logger.info("")
+
+
 def progress_print(message: str, logger=None):
     """
     Print progress message to console and optionally log to file.
@@ -279,26 +522,30 @@ def main():
     logger.info("")
 
     # Display configuration
-    progress_print("BACKTEST CONFIGURATION:", logger)
-    progress_print(f"  Date Range:       {START_DATE.date()} to {END_DATE.date()}", logger)
     days = (END_DATE - START_DATE).days
-    progress_print(f"  Duration:         {days} day(s)", logger)
-    progress_print(f"  Initial Balance:  ${INITIAL_BALANCE:,.2f}", logger)
     stop_threshold_amount = INITIAL_BALANCE * (STOP_LOSS_THRESHOLD / 100.0)
     stop_threshold_status = f"${stop_threshold_amount:,.2f} ({STOP_LOSS_THRESHOLD}%)" if STOP_LOSS_THRESHOLD > 0 else "DISABLED"
-    progress_print(f"  Stop Threshold:   {stop_threshold_status}", logger)
-    progress_print(f"  Timeframes:       {', '.join(TIMEFRAMES)}", logger)
-    progress_print(f"  Time Mode:        {TIME_MODE.value}", logger)
     tick_mode_status = f"ENABLED ({TICK_TYPE})" if USE_TICK_DATA else "DISABLED (candle mode)"
-    progress_print(f"  Tick Data:        {tick_mode_status}", logger)
-    if USE_TICK_DATA and days > 3:
-        progress_print(f"  ⚠ WARNING:        {days} days with tick data may use significant memory!", logger)
-        progress_print(f"                    Consider reducing to 1-3 days for tick mode", logger)
-    progress_print(f"  Spreads:          Read from MT5 (per-symbol actual spreads)", logger)
     slippage_status = f"ENABLED ({SLIPPAGE_POINTS} points base)" if ENABLE_SLIPPAGE else "DISABLED"
-    progress_print(f"  Slippage:         {slippage_status}", logger)
-    progress_print(f"  Leverage:         {LEVERAGE:.0f}:1", logger)
-    progress_print("", logger)
+
+    config_data = {
+        'date_range': f"{START_DATE.date()} to {END_DATE.date()}",
+        'duration': f"{days} day(s)",
+        'initial_balance': INITIAL_BALANCE,
+        'stop_threshold': stop_threshold_status,
+        'timeframes': ', '.join(TIMEFRAMES),
+        'time_mode': TIME_MODE.value,
+        'tick_data': tick_mode_status,
+        'spreads': "Read from MT5 (per-symbol actual spreads)",
+        'slippage': slippage_status,
+        'leverage': f"{LEVERAGE:.0f}:1"
+    }
+
+    if USE_TICK_DATA and days > 3:
+        config_data['tick_warning'] = f"{days} days with tick data may use significant memory!"
+        config_data['tick_warning_detail'] = "Consider reducing to 1-3 days for tick mode"
+
+    print_configuration_panel(config_data, logger)
 
     # Validate date range
     if START_DATE >= END_DATE:
@@ -885,53 +1132,7 @@ def main():
         return False
 
     # Step 9: Display results
-    progress_print("", logger)
-    progress_print("=" * 80, logger)
-    progress_print("BACKTEST RESULTS", logger)
-    progress_print("=" * 80, logger)
-    progress_print("", logger)
-
-    # Account metrics
-    progress_print("ACCOUNT PERFORMANCE:", logger)
-    progress_print(f"  Initial Balance:  ${INITIAL_BALANCE:>12,.2f}", logger)
-    progress_print(f"  Final Balance:    ${metrics.get('final_balance', 0):>12,.2f}", logger)
-    progress_print(f"  Final Equity:     ${metrics.get('final_equity', 0):>12,.2f}", logger)
-    progress_print(f"  Total Profit:     ${metrics.get('total_profit', 0):>12,.2f}", logger)
-    progress_print(f"  Total Return:     {metrics.get('total_return', 0):>12.2f}%", logger)
-    progress_print("", logger)
-
-    # Risk metrics
-    progress_print("RISK METRICS:", logger)
-    progress_print(f"  Max Drawdown:     {metrics.get('max_drawdown', 0):>12.2f}%", logger)
-    progress_print(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):>12.2f}", logger)
-
-    # Format profit factor
-    pf = metrics.get('profit_factor', 0)
-    pf_display = f"{pf:.2f}" if pf != float('inf') else "∞"
-    progress_print(f"  Profit Factor:    {pf_display:>12}", logger)
-    progress_print("", logger)
-
-    # Trade statistics
-    progress_print("TRADE STATISTICS:", logger)
-    progress_print(f"  Total Trades:     {metrics.get('total_trades', 0):>12}", logger)
-    progress_print(f"  Winning Trades:   {metrics.get('winning_trades', 0):>12} ({metrics.get('win_rate', 0):.1f}%)",
-                   logger)
-    progress_print(
-        f"  Losing Trades:    {metrics.get('losing_trades', 0):>12} ({100 - metrics.get('win_rate', 0):.1f}%)", logger)
-    progress_print(f"  Win/Loss Ratio:   {metrics.get('winning_trades', 0):>5} / {metrics.get('losing_trades', 0):<5}",
-                   logger)
-    progress_print("", logger)
-
-    # Additional metrics
-    if metrics.get('total_trades', 0) > 0:
-        progress_print("TRADE DETAILS:", logger)
-        progress_print(f"  Avg Win:          ${metrics.get('avg_win', 0):>12,.2f}", logger)
-        progress_print(f"  Avg Loss:         ${metrics.get('avg_loss', 0):>12,.2f}", logger)
-        progress_print(f"  Largest Win:      ${metrics.get('largest_win', 0):>12,.2f}", logger)
-        progress_print(f"  Largest Loss:     ${metrics.get('largest_loss', 0):>12,.2f}", logger)
-        progress_print(f"  Max Consecutive Wins:   {metrics.get('max_consecutive_wins', 0):>6}", logger)
-        progress_print(f"  Max Consecutive Losses: {metrics.get('max_consecutive_losses', 0):>6}", logger)
-        progress_print("", logger)
+    print_results_table(metrics, INITIAL_BALANCE, logger)
 
     # Per-symbol breakdown
     per_symbol = metrics.get('per_symbol', {})

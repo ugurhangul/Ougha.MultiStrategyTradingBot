@@ -23,6 +23,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils.comment_parser import CommentParser
 
+# Rich console formatting (optional, with fallback to plain text)
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    RICH_AVAILABLE = True
+    console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    console = None
+
 
 class BacktestResultsAnalyzer:
     """Analyze backtest results from SimulatedBroker trade data."""
@@ -207,10 +218,6 @@ class BacktestResultsAnalyzer:
 
     def print_summary_by_symbol(self):
         """Print summary statistics grouped by symbol."""
-        print(f"\n{'='*120}")
-        print(f"PERFORMANCE BY SYMBOL (All Strategies Combined)")
-        print(f"{'='*120}")
-
         # Aggregate by symbol
         symbol_stats = defaultdict(lambda: {
             'total_trades': 0,
@@ -249,23 +256,53 @@ class BacktestResultsAnalyzer:
         # Sort by total profit
         symbol_list.sort(key=lambda x: x[1]['total_profit'], reverse=True)
 
-        print(f"{'Symbol':<12} {'Trades':<8} {'Win%':<8} {'Profit':<12} {'PF':<8} {'Avg/Trade':<12}")
-        print(f"{'-'*120}")
+        if RICH_AVAILABLE:
+            # Rich formatted table
+            table = Table(title="📈 Performance by Symbol (All Strategies Combined)", show_header=True, header_style="bold cyan")
+            table.add_column("Symbol", style="cyan", width=12)
+            table.add_column("Trades", justify="right", width=8)
+            table.add_column("Win%", justify="right", width=8)
+            table.add_column("Profit", justify="right", width=12)
+            table.add_column("PF", justify="right", width=8)
+            table.add_column("Avg/Trade", justify="right", width=12)
 
-        for symbol, stats in symbol_list:
-            pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
-            print(f"{symbol:<12} {stats['total_trades']:<8} "
-                  f"{stats['win_rate']:<8.2f} ${stats['total_profit']:<11.2f} "
-                  f"{pf_display:<8} ${stats['avg_profit']:<11.2f}")
+            for symbol, stats in symbol_list:
+                pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
+                profit = stats['total_profit']
+                profit_color = "green" if profit > 0 else "red"
+                win_rate = stats['win_rate']
+                wr_color = "green" if win_rate > 60 else "yellow" if win_rate > 50 else "white"
 
-        print()
+                table.add_row(
+                    symbol,
+                    str(stats['total_trades']),
+                    f"[{wr_color}]{win_rate:.2f}%[/{wr_color}]",
+                    f"[{profit_color}]${profit:,.2f}[/{profit_color}]",
+                    pf_display,
+                    f"${stats['avg_profit']:,.2f}"
+                )
+
+            console.print()
+            console.print(table)
+            console.print()
+        else:
+            # Plain text fallback
+            print(f"\n{'='*120}")
+            print(f"PERFORMANCE BY SYMBOL (All Strategies Combined)")
+            print(f"{'='*120}")
+            print(f"{'Symbol':<12} {'Trades':<8} {'Win%':<8} {'Profit':<12} {'PF':<8} {'Avg/Trade':<12}")
+            print(f"{'-'*120}")
+
+            for symbol, stats in symbol_list:
+                pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
+                print(f"{symbol:<12} {stats['total_trades']:<8} "
+                      f"{stats['win_rate']:<8.2f} ${stats['total_profit']:<11.2f} "
+                      f"{pf_display:<8} ${stats['avg_profit']:<11.2f}")
+
+            print()
 
     def print_summary_by_strategy(self):
         """Print summary statistics grouped by strategy."""
-        print(f"\n{'='*120}")
-        print(f"PERFORMANCE BY STRATEGY (All Symbols Combined)")
-        print(f"{'='*120}")
-
         # Aggregate by strategy
         strategy_stats = defaultdict(lambda: {
             'total_trades': 0,
@@ -307,16 +344,50 @@ class BacktestResultsAnalyzer:
         # Sort by total profit
         strategy_list.sort(key=lambda x: x[1]['total_profit'], reverse=True)
 
-        print(f"{'Strategy':<20} {'Trades':<8} {'Win%':<8} {'Profit':<12} {'PF':<8} {'Avg/Trade':<12}")
-        print(f"{'-'*120}")
+        if RICH_AVAILABLE:
+            # Rich formatted table
+            table = Table(title="🎯 Performance by Strategy (All Symbols Combined)", show_header=True, header_style="bold cyan")
+            table.add_column("Strategy", style="cyan", width=20)
+            table.add_column("Trades", justify="right", width=8)
+            table.add_column("Win%", justify="right", width=8)
+            table.add_column("Profit", justify="right", width=12)
+            table.add_column("PF", justify="right", width=8)
+            table.add_column("Avg/Trade", justify="right", width=12)
 
-        for strategy, stats in strategy_list:
-            pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
-            print(f"{strategy:<20} {stats['total_trades']:<8} "
-                  f"{stats['win_rate']:<8.2f} ${stats['total_profit']:<11.2f} "
-                  f"{pf_display:<8} ${stats['avg_profit']:<11.2f}")
+            for strategy, stats in strategy_list:
+                pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
+                profit = stats['total_profit']
+                profit_color = "green" if profit > 0 else "red"
+                win_rate = stats['win_rate']
+                wr_color = "green" if win_rate > 60 else "yellow" if win_rate > 50 else "white"
 
-        print()
+                table.add_row(
+                    strategy,
+                    str(stats['total_trades']),
+                    f"[{wr_color}]{win_rate:.2f}%[/{wr_color}]",
+                    f"[{profit_color}]${profit:,.2f}[/{profit_color}]",
+                    pf_display,
+                    f"${stats['avg_profit']:,.2f}"
+                )
+
+            console.print()
+            console.print(table)
+            console.print()
+        else:
+            # Plain text fallback
+            print(f"\n{'='*120}")
+            print(f"PERFORMANCE BY STRATEGY (All Symbols Combined)")
+            print(f"{'='*120}")
+            print(f"{'Strategy':<20} {'Trades':<8} {'Win%':<8} {'Profit':<12} {'PF':<8} {'Avg/Trade':<12}")
+            print(f"{'-'*120}")
+
+            for strategy, stats in strategy_list:
+                pf_display = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "∞"
+                print(f"{strategy:<20} {stats['total_trades']:<8} "
+                      f"{stats['win_rate']:<8.2f} ${stats['total_profit']:<11.2f} "
+                      f"{pf_display:<8} ${stats['avg_profit']:<11.2f}")
+
+            print()
 
     def export_to_csv(self, output_file: str = "backtest_analysis.csv"):
         """Export detailed analysis to CSV file."""

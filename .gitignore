@@ -16,3 +16,4 @@ src/utils/__pycache__/*
 /ea/tester/*
 /notebooks/logs/*
 src/backtesting/__pycache__/*
+*.pkl
