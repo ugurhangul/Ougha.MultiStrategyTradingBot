@@ -277,6 +277,11 @@ class SimulatedBroker:
         self.tick_sl_hits: int = 0   # Count of SL hits detected on ticks
         self.tick_tp_hits: int = 0   # Count of TP hits detected on ticks
 
+        # PERFORMANCE OPTIMIZATION: Batch SL/TP logging
+        # Buffer log messages and write in batches instead of on every hit
+        self.sl_tp_log_buffer: List[str] = []
+        self.sl_tp_log_batch_size: int = 100  # Write every 100 hits
+
         # TICK-LEVEL BACKTESTING: Real-time candle builders
         # Build candles from ticks in real-time (M1, M5, M15, H1, H4)
         self.candle_builders: Dict[str, MultiTimeframeCandleBuilder] = {}  # symbol -> builder
@@ -2190,16 +2195,34 @@ class SimulatedBroker:
                     elif reason == 'TP':
                         self.tick_tp_hits += 1
 
-                    # Log every SL/TP hit with full details for analysis
-                    # Note: This is preserved for complete trade history logging
-                    # Trade data is also captured in closed_trades for programmatic analysis
-                    self.logger.info(
+                    # PERFORMANCE OPTIMIZATION: Batch SL/TP logging
+                    # Buffer log messages and write in batches to reduce I/O overhead
+                    log_msg = (
                         f"[{position.symbol}] {reason} hit on tick at {current_time.strftime('%Y-%m-%d %H:%M:%S')} | "
                         f"Ticket: {ticket} | Close price: {close_price:.5f} | "
                         f"Total {reason} hits: {self.tick_sl_hits if reason == 'SL' else self.tick_tp_hits}"
                     )
+                    self.sl_tp_log_buffer.append(log_msg)
+
+                    # Flush buffer when it reaches batch size
+                    if len(self.sl_tp_log_buffer) >= self.sl_tp_log_batch_size:
+                        for msg in self.sl_tp_log_buffer:
+                            self.logger.info(msg)
+                        self.sl_tp_log_buffer.clear()
 
                     self._close_position_internal(ticket, close_price=close_price, close_time=current_time)
+
+    def flush_sl_tp_logs(self):
+        """
+        Flush any remaining SL/TP logs in the buffer.
+
+        PERFORMANCE OPTIMIZATION: Call this at the end of backtest to ensure
+        all buffered log messages are written.
+        """
+        if self.sl_tp_log_buffer:
+            for msg in self.sl_tp_log_buffer:
+                self.logger.info(msg)
+            self.sl_tp_log_buffer.clear()
 
     def advance_time(self, symbol: str) -> bool:
         """

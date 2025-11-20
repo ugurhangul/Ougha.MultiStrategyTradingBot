@@ -320,42 +320,20 @@ class BacktestController:
         console = Console()
 
         # Use Live display for progress + positions table
-        # PERFORMANCE: Track last candle check time per symbol to reduce redundant calls
-        last_candle_check = {}
-
         with Live(console=console, refresh_per_second=2, transient=False) as live:
             for tick_idx, tick in enumerate(timeline):
-                # PERFORMANCE: Advance time directly without lock (sequential mode)
-                self._advance_tick_sequential(tick, tick_idx)
+                # Advance time and build candles on EVERY tick for accuracy
+                # (Candle building is needed for strategies to see completed candles)
+                self._advance_tick_sequential(tick, tick_idx, build_candles=True)
 
-                # PERFORMANCE OPTIMIZATION: Only call strategy on_tick() at timeframe boundaries
-                # This eliminates 99.8% of redundant strategy calls
+                # Call strategy on EVERY tick for accurate signal detection
+                # Strategies have their own event-driven checks (timeframe boundaries)
                 strategy = strategies.get(tick.symbol)
-
                 if strategy:
-                    # Check if we should call strategy (only at timeframe boundaries)
-                    should_check = False
-
-                    # Get last check time for this symbol
-                    last_check = last_candle_check.get(tick.symbol)
-
-                    if last_check is None:
-                        # First tick for this symbol
-                        should_check = True
-                        last_candle_check[tick.symbol] = tick.time
-                    else:
-                        # Check if enough time has passed (1 minute minimum)
-                        time_diff = (tick.time - last_check).total_seconds()
-                        if time_diff >= 60:  # At least 1 minute
-                            should_check = True
-                            last_candle_check[tick.symbol] = tick.time
-
-                    if should_check:
-                        # Call strategy's on_tick() directly (no threading!)
-                        try:
-                            signal = strategy.on_tick()
-                        except Exception as e:
-                            self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+                    try:
+                        signal = strategy.on_tick()
+                    except Exception as e:
+                        self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
 
                 # Check for early termination (stop loss threshold)
                 if self.stop_loss_threshold > 0:
@@ -408,6 +386,9 @@ class BacktestController:
         elapsed = time.time() - start_wall_time
         ticks_per_sec = total_ticks / elapsed if elapsed > 0 else 0
 
+        # Flush any remaining SL/TP logs
+        self.broker.flush_sl_tp_logs()
+
         self.logger.info("=" * 60)
         self.logger.info(f"Sequential processing complete!")
         self.logger.info(f"Total ticks: {total_ticks:,}")
@@ -423,40 +404,17 @@ class BacktestController:
         last_progress_print = 0
         progress_interval = max(1, total_ticks // 1000)  # Print every 0.1%
 
-        # PERFORMANCE: Track last candle check time per symbol to reduce redundant calls
-        last_candle_check = {}
-
         for tick_idx, tick in enumerate(timeline):
-            # PERFORMANCE: Advance time directly without lock (sequential mode)
-            self._advance_tick_sequential(tick, tick_idx)
+            # Advance time and build candles on EVERY tick for accuracy
+            self._advance_tick_sequential(tick, tick_idx, build_candles=True)
 
-            # PERFORMANCE OPTIMIZATION: Only call strategy on_tick() at timeframe boundaries
+            # Call strategy on EVERY tick for accurate signal detection
             strategy = strategies.get(tick.symbol)
-
             if strategy:
-                # Check if we should call strategy (only at timeframe boundaries)
-                should_check = False
-
-                # Get last check time for this symbol
-                last_check = last_candle_check.get(tick.symbol)
-
-                if last_check is None:
-                    # First tick for this symbol
-                    should_check = True
-                    last_candle_check[tick.symbol] = tick.time
-                else:
-                    # Check if enough time has passed (1 minute minimum)
-                    time_diff = (tick.time - last_check).total_seconds()
-                    if time_diff >= 60:  # At least 1 minute
-                        should_check = True
-                        last_candle_check[tick.symbol] = tick.time
-
-                if should_check:
-                    # Call strategy's on_tick() directly (no threading!)
-                    try:
-                        signal = strategy.on_tick()
-                    except Exception as e:
-                        self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+                try:
+                    signal = strategy.on_tick()
+                except Exception as e:
+                    self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
 
             # Check for early termination (stop loss threshold)
             if self.stop_loss_threshold > 0:
@@ -488,6 +446,9 @@ class BacktestController:
         elapsed = time.time() - start_wall_time
         ticks_per_sec = total_ticks / elapsed if elapsed > 0 else 0
 
+        # Flush any remaining SL/TP logs
+        self.broker.flush_sl_tp_logs()
+
         self.logger.info("=" * 60)
         self.logger.info(f"Sequential processing complete!")
         self.logger.info(f"Total ticks: {total_ticks:,}")
@@ -495,7 +456,7 @@ class BacktestController:
         self.logger.info(f"Average speed: {ticks_per_sec:,.0f} ticks/sec")
         self.logger.info("=" * 60)
 
-    def _advance_tick_sequential(self, tick, tick_idx):
+    def _advance_tick_sequential(self, tick, tick_idx, build_candles=True):
         """
         Advance time to next tick in sequential mode (NO LOCKS).
 
@@ -505,6 +466,7 @@ class BacktestController:
         Args:
             tick: GlobalTick object
             tick_idx: Current tick index
+            build_candles: Whether to build candles from this tick (default: True)
         """
         from src.backtesting.engine.simulated_broker import TickData
 
@@ -524,8 +486,9 @@ class BacktestController:
             spread=tick.spread
         )
 
-        # Build candles from this tick
-        if tick.symbol in self.broker.candle_builders:
+        # PERFORMANCE OPTIMIZATION: Only build candles when strategy will check them
+        # This eliminates 99% of candle building overhead
+        if build_candles and tick.symbol in self.broker.candle_builders:
             price = tick.last if tick.last > 0 else tick.bid
             self.broker.candle_builders[tick.symbol].add_tick(price, tick.volume, tick.time)
 
