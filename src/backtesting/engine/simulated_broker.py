@@ -711,14 +711,10 @@ class SimulatedBroker:
         if earliest_bar_time is not None:
             import threading
             tid = threading.current_thread().name
-            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquiring time_lock (init current_time)")
             with self.time_lock:
-                self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquired time_lock (init current_time)")
                 self.current_time = earliest_bar_time
                 # Update non-blocking snapshot as well
                 self.current_time_snapshot = self.current_time
-            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Released time_lock (init current_time)")
-            self.logger.info(f"  Initialized simulated time to: {earliest_bar_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     # ========================================================================
     # Connection Management (MT5Connector interface)
@@ -1803,21 +1799,16 @@ class SimulatedBroker:
         """
         import threading
         tid = threading.current_thread().name
-        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (has_more_data)")
         with self.time_lock:
-            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (has_more_data)")
-
             # TICK MODE: Check global tick timeline
             if self.use_tick_data:
                 # In tick mode, all symbols share the same global timeline
                 # Check if there are more ticks to process
                 result = self.global_tick_index < len(self.global_tick_timeline)
-                self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data TICK mode - result={result})")
                 return result
 
             # CANDLE MODE: Check per-symbol data
             if symbol not in self.current_indices:
-                self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data - no indices)")
                 return False
 
             # Fast bounds check using cached length
@@ -1826,7 +1817,6 @@ class SimulatedBroker:
 
             # Check if there's more data after current index
             result = current_idx < data_length - 1
-            self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data CANDLE mode - result={result})")
             return result
 
     def advance_global_time(self) -> bool:
@@ -1925,45 +1915,19 @@ class SimulatedBroker:
 
         import threading
         tid = threading.current_thread().name
-        self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Attempting to acquire time_lock (advance_tick, index={self.global_tick_index})")
         acquired = self.time_lock.acquire(timeout=1)
         if not acquired:
-            self.logger.error(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: DEADLOCK! Could not acquire time_lock after 1 second!")
-            self.logger.error(f"[TICK] This means another thread is holding time_lock and not releasing it")
             return False
 
         try:
-            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquired time_lock (advance_tick, index={self.global_tick_index})")
-            if self.global_tick_index < 3:
-                self.logger.info(f"[TICK] Acquired time_lock (index={self.global_tick_index})")
+
             # Log start of tick-by-tick processing (first tick only)
             if self.global_tick_index == 0 and len(self.global_tick_timeline) > 0:
-                first_tick = self.global_tick_timeline[0]
-                last_tick = self.global_tick_timeline[-1]
-                self.logger.info("=" * 80)
-                self.logger.info("STARTING TICK-BY-TICK BACKTEST")
-                self.logger.info("=" * 80)
-                self.logger.info(f"Total ticks: {len(self.global_tick_timeline):,}")
-                self.logger.info(f"First tick: {first_tick.time.strftime('%Y-%m-%d %H:%M:%S')} ({first_tick.symbol})")
-                self.logger.info(f"Last tick: {last_tick.time.strftime('%Y-%m-%d %H:%M:%S')} ({last_tick.symbol})")
-                self.logger.info(f"Status updates every 1,000 ticks (file logs)")
-                self.logger.info(f"Console progress updates every 1 second (via BacktestController)")
-                self.logger.info("=" * 80)
-
-                # Initialize timing for ETA calculation
                 import time
                 self.backtest_start_time = time.time()
 
             # Check if we have more ticks
             if self.global_tick_index >= len(self.global_tick_timeline):
-                self.logger.info("=" * 80)
-                self.logger.info("TICK-BY-TICK BACKTEST COMPLETE")
-                self.logger.info("=" * 80)
-                self.logger.info(f"Total ticks processed: {self.global_tick_index:,}")
-                self.logger.info(f"Stop-Loss hits detected on ticks: {self.tick_sl_hits}")
-                self.logger.info(f"Take-Profit hits detected on ticks: {self.tick_tp_hits}")
-                self.logger.info(f"Total SL/TP hits on ticks: {self.tick_sl_hits + self.tick_tp_hits}")
-                self.logger.info("=" * 80)
                 return False
 
             # Get next tick from global timeline
@@ -2066,22 +2030,10 @@ class SimulatedBroker:
                 message = message[:terminal_width - 4] + "..."
             sys.stdout.write("\r" + message.ljust(terminal_width - 1))
             sys.stdout.flush()
-
-            # Log progress periodically to file only (every 1,000 ticks)
-            if self.global_tick_index % 1000 == 0:
-                self.logger.info(
-                    f"[TICK {self.global_tick_index:,}/{len(self.global_tick_timeline):,}] "
-                    f"Progress: {progress_pct:.2f}% | Symbol: {next_tick.symbol} | "
-                    f"Time: {self.current_time.strftime('%Y-%m-%d %H:%M:%S')} | "
-                    f"Equity: ${stats['equity']:.2f} | P&L: ${stats['profit']:.2f} | "
-                    f"Trades: {total_trades} ({wins}W/{losses}L)"
-                )
-
             return True
         finally:
             import threading
             tid = threading.current_thread().name
-            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Releasing time_lock (advance_tick, index={self.global_tick_index})")
             self.time_lock.release()
 
     def _check_sl_tp_for_tick(self, symbol: str, tick: GlobalTick, current_time: datetime):

@@ -246,9 +246,9 @@ class BacktestController:
             if step % 10 == 0:  # Record every 10 checks (10 seconds)
                 self._record_equity_snapshot()
 
-            # Console progress is now handled by broker on every tick
-            # (disabled to avoid conflicting with tick-by-tick console output)
-            # self._print_progress_to_console()
+            # Console progress (lightweight, once per second)
+            # Broker's per-tick console output is disabled by default for performance
+            self._print_progress_to_console()
 
             # Log detailed progress to file less frequently
             if step % 100 == 0:  # Log to file every 100 checks (100 seconds)

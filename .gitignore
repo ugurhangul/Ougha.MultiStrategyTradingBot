@@ -15,3 +15,4 @@ src/utils/__pycache__/*
 /.idea/*
 /ea/tester/*
 /notebooks/logs/*
+src/backtesting/__pycache__/*

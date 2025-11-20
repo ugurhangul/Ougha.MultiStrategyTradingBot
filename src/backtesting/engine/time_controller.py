@@ -195,8 +195,12 @@ class TimeController:
                 if self.total_steps < 3:
                     self.logger.info(f"[BARRIER] All arrived! Steps={self.total_steps}")
 
+                # Wake everyone immediately so the coordinator can proceed without timeout
+                # Workers will re-wait until generation increments
+                self.barrier_condition.notify_all()
+
         # Phase 2: ALL threads wait for generation change FIRST
-        # This ensures coordinator waits for all participants before checking advance_needed
+        # Coordinator exits immediately if a completed cycle needs advancement
         with self.barrier_condition:
             if self.total_steps < 3:
                 self.logger.info(
@@ -204,16 +208,22 @@ class TimeController:
                     f"(arrival={arrival_generation}, current={self.barrier_generation})"
                 )
 
-            while self.running and self.barrier_generation == arrival_generation and not self.paused:
-                # Use short timeout for MAX_SPEED mode, longer for visual modes
-                timeout = 0.01 if self.mode == TimeMode.MAX_SPEED else 1.0
-                self.barrier_condition.wait(timeout=timeout)
+            def _should_continue_waiting() -> bool:
+                if not self.running or self.paused:
+                    return False
+                # Workers wait until generation changes
+                if not is_coordinator:
+                    return self.barrier_generation == arrival_generation
+                # Coordinator waits unless it's time to advance for this generation
+                if self.advance_needed and self.barrier_generation == arrival_generation:
+                    return False
+                return self.barrier_generation == arrival_generation
 
-                # COORDINATOR: After waking up, check if we need to advance time
-                # This handles the case where coordinator wakes up from timeout and all have arrived
-                if is_coordinator and self.advance_needed and self.barrier_generation == arrival_generation:
-                    # We need to advance time - break out of wait loop to do it
-                    break
+            while _should_continue_waiting():
+                # No timeout needed in MAX_SPEED; rely on notify_all
+                # Use a long timeout as a safety for non-max modes
+                timeout = None if self.mode == TimeMode.MAX_SPEED else 1.0
+                self.barrier_condition.wait(timeout=timeout)
 
             if self.total_steps < 3:
                 self.logger.info(
@@ -353,21 +363,15 @@ class TimeController:
         """
         import threading
         tid = threading.current_thread().name
-        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (set_current_time)")
         with self.time_lock:
-            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (set_current_time)")
             self.current_time = current_time
-        self.logger.debug(f"[LOCK_DEBUG] {tid}: Released time_lock (set_current_time)")
 
     def get_current_time(self) -> Optional[datetime]:
         """Get current simulated time."""
         import threading
         tid = threading.current_thread().name
-        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (get_current_time)")
         with self.time_lock:
-            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (get_current_time)")            
             result = self.current_time
-        self.logger.debug(f"[LOCK_DEBUG] {tid}: Released time_lock (get_current_time)")
         return result
 
     def get_statistics(self) -> Dict:
