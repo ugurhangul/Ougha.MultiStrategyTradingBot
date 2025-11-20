@@ -234,6 +234,10 @@ class SimulatedBroker:
         self.next_ticket = 1
         self.position_lock = threading.Lock()
 
+        # PERFORMANCE OPTIMIZATION: Indexed position tracking for O(1) SL/TP checks
+        # Instead of iterating all positions on every tick, we maintain symbol-indexed lists
+        self.positions_by_symbol: Dict[str, List[int]] = {}  # symbol -> list of ticket numbers
+
         # Historical data for each symbol and timeframe
         # Key: (symbol, timeframe), Value: DataFrame with OHLC
         self.symbol_data: Dict[Tuple[str, str], pd.DataFrame] = {}
@@ -1514,6 +1518,11 @@ class SimulatedBroker:
 
             self.positions[ticket] = position
 
+            # PERFORMANCE OPTIMIZATION: Add to symbol index for O(1) SL/TP checks
+            if symbol not in self.positions_by_symbol:
+                self.positions_by_symbol[symbol] = []
+            self.positions_by_symbol[symbol].append(ticket)
+
             # WARNING: Check for missing SL (TP can be 0.0 legitimately)
             if sl == 0.0:
                 self.logger.warning(
@@ -1640,6 +1649,17 @@ class SimulatedBroker:
 
         # Remove from open positions
         del self.positions[ticket]
+
+        # PERFORMANCE OPTIMIZATION: Remove from symbol index
+        if position.symbol in self.positions_by_symbol:
+            try:
+                self.positions_by_symbol[position.symbol].remove(ticket)
+                # Clean up empty lists
+                if not self.positions_by_symbol[position.symbol]:
+                    del self.positions_by_symbol[position.symbol]
+            except ValueError:
+                # Ticket not in list (shouldn't happen, but defensive)
+                pass
 
         # Remove from persistence (if available)
         # This ensures backtest behavior matches live trading where positions are removed from persistence when closed
@@ -2109,6 +2129,9 @@ class SimulatedBroker:
         """
         Check if any positions for this symbol hit SL/TP on this tick.
 
+        PERFORMANCE OPTIMIZATION: Uses indexed position lookup for O(1) access
+        instead of iterating all positions on every tick.
+
         Args:
             symbol: Symbol to check
             tick: The tick that just arrived
@@ -2116,10 +2139,18 @@ class SimulatedBroker:
         with self.position_lock:
             positions_to_close = []
 
-            for ticket, position in self.positions.items():
-                # Only check positions for this symbol
-                if position.symbol != symbol:
-                    continue
+            # OPTIMIZATION: Only check positions for this symbol using index
+            # This is O(n) where n = positions for this symbol, not all positions
+            if symbol not in self.positions_by_symbol:
+                return  # No positions for this symbol
+
+            # Get tickets for this symbol from index
+            symbol_tickets = self.positions_by_symbol[symbol]
+
+            for ticket in symbol_tickets:
+                position = self.positions.get(ticket)
+                if position is None:
+                    continue  # Position was closed (shouldn't happen, but defensive)
 
                 # Check SL/TP hit
                 if position.position_type == PositionType.BUY:

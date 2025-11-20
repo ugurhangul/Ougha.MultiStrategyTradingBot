@@ -283,6 +283,10 @@ class FakeoutStrategy(BaseStrategy):
         """
         Process tick event and check for trade signals.
 
+        PERFORMANCE OPTIMIZATION: Event-driven signal generation
+        Only processes signals when new candles form, not on every tick.
+        This eliminates redundant get_candles() calls and indicator calculations.
+
         Returns:
             TradeSignal if conditions met, None otherwise
         """
@@ -290,6 +294,22 @@ class FakeoutStrategy(BaseStrategy):
             return None
 
         try:
+            # OPTIMIZATION: Only check for new candles at timeframe boundaries
+            # This avoids calling get_candles() on every tick
+            current_time = self.connector.get_current_time()
+            if current_time is None:
+                return None
+
+            # Get confirmation timeframe duration in minutes
+            from src.utils.timeframe_converter import TimeframeConverter
+            tf_minutes = TimeframeConverter.get_duration_minutes(self.config.range_config.breakout_timeframe)
+
+            # Check if we're at a timeframe boundary (new candle could have formed)
+            # Only check when current_time is aligned to the timeframe
+            if current_time.minute % tf_minutes != 0:
+                # Not at a timeframe boundary, skip processing
+                return None
+
             # Check for new reference candle
             self._check_reference_candle()
 
