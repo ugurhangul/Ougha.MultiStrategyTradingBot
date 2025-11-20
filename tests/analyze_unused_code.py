@@ -167,7 +167,7 @@ class UnusedCodeAnalyzer:
 
 def main():
     """Main entry point."""
-    analyzer = UnusedCodeAnalyzer('.')
+    analyzer = UnusedCodeAnalyzer('..')
     findings = analyzer.analyze_all()
     
     # Print results
