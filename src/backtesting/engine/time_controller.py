@@ -20,6 +20,12 @@ class TimeMode(Enum):
     MAX_SPEED = "max"  # As fast as possible
 
 
+class TimeGranularity(Enum):
+    """Time granularity for backtesting."""
+    TICK = "tick"      # Advance tick-by-tick (highest fidelity)
+    MINUTE = "minute"  # Advance minute-by-minute (candle-based)
+
+
 class TimeController:
     """
     Controls synchronized time advancement across multiple symbol threads.
@@ -34,39 +40,54 @@ class TimeController:
     """
 
     def __init__(self, symbols: List[str], mode: TimeMode = TimeMode.MAX_SPEED,
-                 include_position_monitor: bool = True, broker=None):
+                 granularity: TimeGranularity = TimeGranularity.MINUTE,
+                 include_position_monitor: bool = True, broker=None,
+                 coordinator_id: str = "position_monitor"):
         """
         Initialize time controller.
 
         Args:
             symbols: List of symbols to synchronize
-            mode: Time advancement mode
+            mode: Time advancement mode (REALTIME, FAST, MAX_SPEED)
+            granularity: Time granularity (TICK or MINUTE)
             include_position_monitor: Whether to include position monitor in barrier (default: True)
             broker: SimulatedBroker instance for global time advancement (backtest only)
+            coordinator_id: ID of the coordinator thread that advances time (default: "position_monitor")
         """
         self.logger = get_logger()
         self.symbols = symbols
         self.mode = mode
+        self.granularity = granularity
         self.include_position_monitor = include_position_monitor
         self.broker = broker  # For global time advancement
+        self.coordinator_id = coordinator_id  # Only this thread advances time
 
         # Time synchronization
         self.current_time: Optional[datetime] = None
-        self.time_lock = threading.Lock()
+        # Use RLock to allow reentrant acquisition
+        self.time_lock = threading.RLock()
 
-        # Barrier synchronization
-        # Each symbol thread + position monitor signals when done processing current bar
-        self.symbols_ready: Set[str] = set()
+        # Barrier synchronization - Coordinator-based approach
+        # Simple arrival counter instead of set (more efficient and clearer)
         self.barrier_lock = threading.Lock()
         self.barrier_condition = threading.Condition(self.barrier_lock)
+        self.arrivals = 0  # Counter for barrier arrivals
 
         # Total participants in barrier = symbols + position_monitor (if enabled)
         self.total_participants = len(symbols) + (1 if include_position_monitor else 0)
 
-        # Two-phase barrier: track current generation to prevent race conditions
-        # When all threads arrive, we increment the generation number
-        # Threads wait until generation changes before proceeding
+        # Auto-select coordinator when position monitor is not participating
+        # If coordinator is left as default ("position_monitor") but not included, pick first symbol
+        if not include_position_monitor:
+            if coordinator_id == "position_monitor" or coordinator_id not in symbols:
+                # Fall back to first symbol as coordinator
+                self.coordinator_id = symbols[0] if symbols else coordinator_id
+
+        # Barrier generation: incremented each cycle to track progress
+        # Threads wait for generation to change before proceeding
         self.barrier_generation = 0
+        # Flag indicating that a completed barrier cycle needs coordinator advancement
+        self.advance_needed = False
 
         # Control flags
         self.running = False
@@ -79,10 +100,27 @@ class TimeController:
         participants_str = f"{len(symbols)} symbols"
         if include_position_monitor:
             participants_str += " + position monitor"
-        self.logger.info(f"TimeController initialized for {participants_str} in {mode.value} mode")
+        coord_info = f" | coordinator: {self.coordinator_id}"
+        self.logger.info(f"TimeController initialized for {participants_str} in {mode.value} mode{coord_info}")
 
     def start(self):
         """Start time controller."""
+        # Validate tick timeline if in tick mode
+        if self.granularity == TimeGranularity.TICK:
+            if self.broker is None:
+                self.logger.error("TICK mode requires broker to be set!")
+                return
+            if not hasattr(self.broker, 'global_tick_timeline'):
+                self.logger.error("TICK mode enabled but broker has no global_tick_timeline!")
+                self.logger.error("Make sure tick data is loaded before starting TimeController")
+                return
+            if len(self.broker.global_tick_timeline) == 0:
+                self.logger.error("TICK mode enabled but global_tick_timeline is EMPTY!")
+                self.logger.error("Check that tick data was loaded in STEP 2 and STEP 4.5")
+                return
+
+            self.logger.info(f"TICK mode validated: {len(self.broker.global_tick_timeline):,} ticks in timeline")
+
         self.running = True
         self.paused = False
         self.start_time = datetime.now(timezone.utc)
@@ -109,17 +147,15 @@ class TimeController:
 
     def wait_for_next_step(self, participant: str) -> bool:
         """
-        Wait for all participants (symbols + position monitor) to be ready for next time step.
+        Wait for all participants to be ready for next time step (coordinator-based barrier).
 
-        Called by each symbol thread and position monitor after processing current bar.
+        COORDINATOR-BASED APPROACH:
+        - ONE designated thread (coordinator_id, usually "position_monitor") advances time
+        - All other threads (workers) just increment counter and wait
+        - Coordinator checks if all arrived, advances time, increments generation, notifies all
+        - ALL threads (including coordinator) wait for generation change before proceeding
 
-        Uses a two-phase barrier to prevent race conditions:
-        1. Phase 1: Thread marks itself as ready and waits for all others
-        2. Phase 2: When all ready, barrier generation increments and all threads are released
-        3. Each thread waits until it sees the new generation before proceeding
-
-        This ensures no thread can loop back and process the next tick until ALL threads
-        have been released from the current barrier.
+        This eliminates the race condition where multiple threads thought they were "last to arrive".
 
         Args:
             participant: Participant identifier (symbol name or "position_monitor")
@@ -130,51 +166,112 @@ class TimeController:
         if not self.running:
             return False
 
-        with self.barrier_condition:
-            # Mark this participant as ready
-            self.symbols_ready.add(participant)
+        is_coordinator = (participant == self.coordinator_id)
+        all_arrived = False
+        arrival_generation = 0
 
-            # Remember the current generation when we arrived
+        # Phase 1: Register arrival
+        with self.barrier_condition:
+            self.arrivals += 1
             arrival_generation = self.barrier_generation
 
-            # Check if all participants are ready
-            if len(self.symbols_ready) == self.total_participants:
-                # All participants ready - advance time
+            # Debug logging
+            if self.total_steps < 3:
+                role = "COORDINATOR" if is_coordinator else "worker"
+                self.logger.info(
+                    f"[BARRIER] {participant} ({role}) arrived "
+                    f"(gen={arrival_generation}, arrivals={self.arrivals}/{self.total_participants})"
+                )
+
+            # Check if all participants have arrived
+            if self.arrivals == self.total_participants:
+                all_arrived = True
+                # Reset counter for next cycle
+                self.arrivals = 0
                 self.total_steps += 1
+                # Mark that the coordinator must advance time for this generation
+                self.advance_needed = True
 
-                # Clear ready set for next step
-                self.symbols_ready.clear()
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] All arrived! Steps={self.total_steps}")
 
-                # Apply time delay based on mode
+        # Phase 2: ALL threads wait for generation change FIRST
+        # This ensures coordinator waits for all participants before checking advance_needed
+        with self.barrier_condition:
+            if self.total_steps < 3:
+                self.logger.info(
+                    f"[BARRIER] {participant} waiting for gen change "
+                    f"(arrival={arrival_generation}, current={self.barrier_generation})"
+                )
+
+            while self.running and self.barrier_generation == arrival_generation and not self.paused:
+                # Use short timeout for MAX_SPEED mode, longer for visual modes
+                timeout = 0.01 if self.mode == TimeMode.MAX_SPEED else 1.0
+                self.barrier_condition.wait(timeout=timeout)
+
+                # COORDINATOR: After waking up, check if we need to advance time
+                # This handles the case where coordinator wakes up from timeout and all have arrived
+                if is_coordinator and self.advance_needed and self.barrier_generation == arrival_generation:
+                    # We need to advance time - break out of wait loop to do it
+                    break
+
+            if self.total_steps < 3:
+                self.logger.info(
+                    f"[BARRIER] {participant} released from wait "
+                    f"(gen={self.barrier_generation}, running={self.running})"
+                )
+
+        # Phase 3: Coordinator advances time (OUTSIDE lock to avoid deadlock)
+        should_advance = False
+        if is_coordinator:
+            with self.barrier_condition:
+                # Only advance if a cycle completed for the generation we arrived at
+                if self.advance_needed and self.barrier_generation == arrival_generation:
+                    self.advance_needed = False
+                    should_advance = True
+
+            if should_advance:
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] Coordinator advancing time...")
+
+                # Apply time delay
                 self._apply_time_delay()
 
-                # Advance global time by one minute (if broker is available)
+                # Advance global time
                 if self.broker is not None:
-                    if not self.broker.advance_global_time():
-                        # All symbols exhausted, stop backtest
-                        self.running = False
+                    if self.granularity == TimeGranularity.TICK:
+                        if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
+                            self.logger.error("TICK mode enabled but no tick timeline loaded!")
+                            self.running = False
+                        else:
+                            if not self.broker.advance_global_time_tick_by_tick():
+                                # All ticks processed
+                                self.running = False
+                    else:  # MINUTE
+                        if not self.broker.advance_global_time():
+                            # All symbols exhausted
+                            self.running = False
 
-                # Increment generation to signal barrier release
-                # This is the key fix: all threads (including this one) must see the new generation
-                self.barrier_generation += 1
+                # Increment generation and notify all waiting threads
+                with self.barrier_condition:
+                    self.barrier_generation += 1
+                    if self.total_steps < 3:
+                        self.logger.info(f"[BARRIER] Generation incremented to {self.barrier_generation}, notifying all")
+                    self.barrier_condition.notify_all()
 
-                # Notify all waiting threads
-                self.barrier_condition.notify_all()
+        # Phase 4: ALL threads wait again for generation change (if coordinator just advanced)
+        if is_coordinator and should_advance:
+            # Coordinator already incremented generation, so we're done
+            pass
+        else:
+            # Non-coordinators or coordinator that didn't advance: wait for generation change
+            with self.barrier_condition:
+                while self.running and self.barrier_generation == arrival_generation and not self.paused:
+                    # Use short timeout for MAX_SPEED mode, longer for visual modes
+                    timeout = 0.01 if self.mode == TimeMode.MAX_SPEED else 1.0
+                    self.barrier_condition.wait(timeout=timeout)
 
-                # IMPORTANT: The last thread to arrive must also wait for the barrier to be released
-                # This prevents it from racing ahead and processing the next tick before others wake up
-                # We wait until we see the new generation (which we just incremented)
-                # Since we just incremented it, we'll see it immediately and exit the loop
-                # But this ensures consistent behavior for all threads
-
-            # Wait for barrier to be released (generation to change)
-            # All threads (including the last one to arrive) wait here
-            while (self.running and
-                   self.barrier_generation == arrival_generation and
-                   not self.paused):
-                self.barrier_condition.wait(timeout=1.0)
-
-            return self.running
+        return self.running
 
     def remove_participant(self, participant: str):
         """
@@ -185,21 +282,59 @@ class TimeController:
         Args:
             participant: The participant identifier (symbol name or "position_monitor")
         """
-        with self.barrier_condition:
-            self.total_participants -= 1
-            # Remove from ready set if present
-            self.symbols_ready.discard(participant)
+        # In the coordinator-based barrier, we track arrivals with a counter.
+        # If a participant leaves in the middle of a barrier cycle, it's possible that
+        # the remaining arrivals already equal the new total_participants. In that case
+        # we must perform the coordinator's advancement work (time advance + generation increment)
+        # to release all waiting threads. We emulate the coordinator here safely.
 
-            # If we now have all remaining participants ready, notify them
-            if len(self.symbols_ready) == self.total_participants:
+        should_advance = False
+        with self.barrier_condition:
+            # Decrease total participants for subsequent cycles
+            self.total_participants -= 1
+
+            # If after removal, the number of arrivals equals the new total participants,
+            # the barrier for this generation is effectively complete.
+            if self.running and self.arrivals == self.total_participants and self.total_participants >= 0:
+                # Mark that we should advance time outside the lock
+                should_advance = True
+                # Prepare next cycle
+                self.arrivals = 0
                 self.total_steps += 1
-                self.symbols_ready.clear()
-                self._apply_time_delay()
-                # Increment generation to release waiting threads
+
+        if should_advance:
+            # Phase 2 work (coordinator) performed here by the remover thread
+            if self.total_steps < 3:
+                self.logger.info(f"[BARRIER] Participant '{participant}' removal completed a cycle - advancing time as coordinator surrogate...")
+
+            # Apply time delay per mode
+            self._apply_time_delay()
+
+            # Advance global time
+            if self.broker is not None:
+                if self.granularity == TimeGranularity.TICK:
+                    if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
+                        self.logger.error("TICK mode enabled but no tick timeline loaded!")
+                        self.running = False
+                    else:
+                        if not self.broker.advance_global_time_tick_by_tick():
+                            # All ticks processed
+                            self.running = False
+                else:  # MINUTE
+                    if not self.broker.advance_global_time():
+                        # All symbols exhausted
+                        self.running = False
+
+            # Increment generation and notify waiting threads
+            with self.barrier_condition:
+                # Ensure no double-advance will be attempted by coordinator
+                self.advance_needed = False
                 self.barrier_generation += 1
+                if self.total_steps < 3:
+                    self.logger.info(f"[BARRIER] Generation incremented to {self.barrier_generation} after participant removal - notifying all")
                 self.barrier_condition.notify_all()
 
-            self.logger.info(f"Removed participant '{participant}' from barrier. Remaining: {self.total_participants}")
+        self.logger.info(f"Removed participant '{participant}' from barrier. Remaining: {self.total_participants}")
 
     def _apply_time_delay(self):
         """Apply time delay based on mode."""
@@ -216,13 +351,24 @@ class TimeController:
         Args:
             current_time: Current time
         """
+        import threading
+        tid = threading.current_thread().name
+        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (set_current_time)")
         with self.time_lock:
+            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (set_current_time)")
             self.current_time = current_time
+        self.logger.debug(f"[LOCK_DEBUG] {tid}: Released time_lock (set_current_time)")
 
     def get_current_time(self) -> Optional[datetime]:
         """Get current simulated time."""
+        import threading
+        tid = threading.current_thread().name
+        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (get_current_time)")
         with self.time_lock:
-            return self.current_time
+            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (get_current_time)")            
+            result = self.current_time
+        self.logger.debug(f"[LOCK_DEBUG] {tid}: Released time_lock (get_current_time)")
+        return result
 
     def get_statistics(self) -> Dict:
         """Get time controller statistics."""
@@ -241,7 +387,6 @@ class TimeController:
     def reset(self):
         """Reset time controller for new backtest."""
         with self.barrier_condition:
-            self.symbols_ready.clear()
             self.barrier_generation = 0
             self.total_steps = 0
             self.current_time = None

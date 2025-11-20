@@ -44,19 +44,20 @@ class TimeProvider:
             time_getter: Callable that returns the current simulated time (e.g., SimulatedBroker.get_current_time)
             start_time: Backtest start time (used for log directory naming). If None, uses current simulated time.
         """
+        # Compute start time OUTSIDE lock to avoid potential lock inversion with broker locks
+        computed_start_time: Optional[datetime] = start_time
+        if computed_start_time is None:
+            try:
+                computed_start_time = time_getter() or datetime.now(timezone.utc)
+            except Exception:
+                # In case time_getter raises (e.g., during early init), fallback to now
+                computed_start_time = datetime.now(timezone.utc)
+
+        # Now set mode and fields atomically
         with self._lock:
             self._mode = "backtest"
             self._simulated_time_getter = time_getter
-            # Use provided start_time or get from time_getter or fallback to current time
-            if start_time:
-                self._backtest_start_time = start_time
-            else:
-                # Try to get from time_getter
-                simulated_time = time_getter()
-                if simulated_time:
-                    self._backtest_start_time = simulated_time
-                else:
-                    self._backtest_start_time = datetime.now(timezone.utc)
+            self._backtest_start_time = computed_start_time
 
         # Notify logger to recreate file handlers for new log directory
         self._notify_mode_change()
@@ -68,14 +69,22 @@ class TimeProvider:
         Returns:
             Current time (real or simulated)
         """
+        # Snapshot mode and getter to avoid holding provider lock while invoking callback
         with self._lock:
-            if self._mode == "backtest" and self._simulated_time_getter is not None:
-                simulated_time = self._simulated_time_getter()
+            mode = self._mode
+            getter = self._simulated_time_getter
+
+        if mode == "backtest" and getter is not None:
+            try:
+                simulated_time = getter()
                 if simulated_time is not None:
                     return simulated_time
-            
-            # Fallback to real time
-            return datetime.now(timezone.utc)
+            except Exception:
+                # Ignore getter errors and fall back to real time
+                pass
+
+        # Fallback to real time
+        return datetime.now(timezone.utc)
     
     def is_backtest_mode(self) -> bool:
         """Check if currently in backtest mode."""
@@ -89,39 +98,43 @@ class TimeProvider:
         Returns:
             Path: logs/live/YYYY-MM-DD/ for live mode, logs/backtest/YYYY-MM-DD/ for backtest mode
         """
+        # Snapshot state to avoid holding provider lock while invoking callback
         with self._lock:
-            # Get current time (real or simulated) - must be done inside lock
-            if self._mode == "backtest":
-                # In backtest mode, use simulated time if available, otherwise use backtest start time
-                if self._simulated_time_getter is not None:
-                    simulated_time = self._simulated_time_getter()
-                    if simulated_time is not None:
-                        current_time = simulated_time
-                    elif self._backtest_start_time is not None:
-                        # Backtest hasn't started yet, use backtest start time
-                        current_time = self._backtest_start_time
-                    else:
-                        # Fallback to current time (shouldn't happen)
-                        current_time = datetime.now(timezone.utc)
-                elif self._backtest_start_time is not None:
-                    # No time getter, use backtest start time
-                    current_time = self._backtest_start_time
+            mode = self._mode
+            getter = self._simulated_time_getter
+            start_time_snapshot = self._backtest_start_time
+
+        # Determine current time based on mode without holding TimeProvider lock
+        if mode == "backtest":
+            current_time: datetime
+            if getter is not None:
+                try:
+                    simulated_time = getter()
+                except Exception:
+                    simulated_time = None
+                if simulated_time is not None:
+                    current_time = simulated_time
+                elif start_time_snapshot is not None:
+                    # Backtest hasn't started yet, use backtest start time
+                    current_time = start_time_snapshot
                 else:
                     # Fallback to current time (shouldn't happen)
                     current_time = datetime.now(timezone.utc)
+            elif start_time_snapshot is not None:
+                # No time getter, use backtest start time
+                current_time = start_time_snapshot
             else:
-                # Live mode: use real time
+                # Fallback to current time (shouldn't happen)
                 current_time = datetime.now(timezone.utc)
 
-            # Format date as YYYY-MM-DD
+            # Format date and return backtest log directory
             date_str = current_time.strftime("%Y-%m-%d")
-
-            if self._mode == "backtest":
-                # Backtest mode: logs/backtest/YYYY-MM-DD/
-                return Path("logs") / "backtest" / date_str
-            else:
-                # Live mode: logs/live/YYYY-MM-DD/
-                return Path("logs") / "live" / date_str
+            return Path("logs") / "backtest" / date_str
+        else:
+            # Live mode: use real time
+            current_time = datetime.now(timezone.utc)
+            date_str = current_time.strftime("%Y-%m-%d")
+            return Path("logs") / "live" / date_str
 
     def _notify_mode_change(self):
         """

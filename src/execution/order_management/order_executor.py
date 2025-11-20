@@ -15,6 +15,7 @@ from src.utils.autotrading_cooldown import AutoTradingCooldown
 from src.utils.price_normalization_service import PriceNormalizationService
 from src.execution.order_management.stop_validator import StopValidator
 from src.execution.order_management.market_checker import MarketChecker
+from src.config import config
 from src.constants import (
     DEFAULT_PRICE_DEVIATION,
     DEFAULT_RISK_REWARD_RATIO,
@@ -59,6 +60,14 @@ class OrderExecutor:
         self.stop_validator = StopValidator(connector, price_normalizer, logger)
         self.market_checker = MarketChecker(connector, cooldown, logger)
         self.filling_mode_resolver = FillingModeResolver(logger)
+
+        # Order validation statistics
+        self.validation_stats = {
+            'total_validations': 0,
+            'validation_passed': 0,
+            'validation_failed': 0,
+            'rejection_reasons': {}  # retcode -> count
+        }
 
     def execute_signal(self, signal: TradeSignal) -> Optional[int]:
         """
@@ -284,6 +293,16 @@ class OrderExecutor:
                 )
                 return None
 
+            # Validate order with broker before sending (if enabled)
+            if config.advanced.enable_order_prevalidation:
+                is_valid, error_message = self._validate_order_with_broker(request, symbol)
+                if not is_valid:
+                    self.logger.warning(
+                        f"Order rejected by broker validation: {error_message}",
+                        symbol
+                    )
+                    return None
+
             result = mt5.order_send(request)
 
             if result is None:
@@ -458,6 +477,124 @@ class OrderExecutor:
             self.logger.error(f"Position {result.order} opened in MT5 but not tracked in bot!", symbol)
 
         return result.order
+
+    def _validate_order_with_broker(self, request: dict, symbol: str) -> tuple[bool, str]:
+        """
+        Validate order request with broker using mt5.order_check().
+
+        This performs a pre-flight check to ensure the order would be accepted
+        by the broker before actually sending it. This prevents order rejections
+        and provides detailed error messages.
+
+        Args:
+            request: Order request dictionary
+            symbol: Symbol name (for logging)
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        try:
+            # Update statistics
+            self.validation_stats['total_validations'] += 1
+
+            # Skip order_check in backtest mode (SimulatedBroker doesn't support it)
+            # SimulatedBroker will validate the order when order_send is called
+            if hasattr(self.connector, 'is_simulated') or \
+               self.connector.__class__.__name__ == 'SimulatedBroker':
+                self.validation_stats['validation_passed'] += 1
+                return True, ""
+
+            # Validate order with broker
+            check_result = mt5.order_check(request)
+
+            if check_result is None:
+                error_code, error_msg = mt5.last_error()
+                error_message = f"Order check failed: ({error_code}) {error_msg}"
+                self.logger.trade_error(
+                    symbol=symbol,
+                    error_type="Order Validation",
+                    error_message=error_message,
+                    context={"request": request}
+                )
+                self.validation_stats['validation_failed'] += 1
+                return False, error_message
+
+            # Check if validation passed
+            if check_result.retcode != mt5.TRADE_RETCODE_DONE:
+                error_message = (
+                    f"Order validation failed: {check_result.comment} "
+                    f"(retcode: {check_result.retcode})"
+                )
+
+                # Track rejection reason
+                retcode_str = str(check_result.retcode)
+                self.validation_stats['rejection_reasons'][retcode_str] = \
+                    self.validation_stats['rejection_reasons'].get(retcode_str, 0) + 1
+
+                # Log detailed validation failure
+                self.logger.trade_error(
+                    symbol=symbol,
+                    error_type="Order Validation",
+                    error_message=error_message,
+                    context={
+                        "retcode": check_result.retcode,
+                        "comment": check_result.comment,
+                        "margin_required": check_result.margin,
+                        "margin_free": check_result.margin_free,
+                        "balance": check_result.balance,
+                        "equity": check_result.equity,
+                        "request": request
+                    }
+                )
+                self.validation_stats['validation_failed'] += 1
+                return False, error_message
+
+            # Validation passed - log margin impact
+            self.logger.verbose(
+                f"Order validation passed | "
+                f"Margin required: ${check_result.margin:.2f} | "
+                f"Free margin after: ${check_result.margin_free:.2f} | "
+                f"Margin level: {check_result.margin_level:.2f}%",
+                symbol
+            )
+
+            self.validation_stats['validation_passed'] += 1
+            return True, ""
+
+        except Exception as e:
+            error_message = f"Exception during order validation: {type(e).__name__}: {e}"
+            self.logger.trade_error(
+                symbol=symbol,
+                error_type="Order Validation",
+                error_message=error_message,
+                context={"request": request}
+            )
+            self.validation_stats['validation_failed'] += 1
+            return False, error_message
+
+    def get_validation_stats(self) -> dict:
+        """Get order validation statistics."""
+        return self.validation_stats.copy()
+
+    def log_validation_stats(self):
+        """Log order validation statistics."""
+        stats = self.validation_stats
+
+        if stats['total_validations'] == 0:
+            return
+
+        pass_rate = (stats['validation_passed'] / stats['total_validations']) * 100
+
+        self.logger.info("=== Order Validation Statistics ===")
+        self.logger.info(f"Total Validations: {stats['total_validations']}")
+        self.logger.info(f"Passed: {stats['validation_passed']}")
+        self.logger.info(f"Failed: {stats['validation_failed']}")
+        self.logger.info(f"Pass Rate: {pass_rate:.1f}%")
+
+        if stats['rejection_reasons']:
+            self.logger.info("Rejection Reasons:")
+            for retcode, count in stats['rejection_reasons'].items():
+                self.logger.info(f"  {retcode}: {count} times")
 
     def _validate_pre_trade_risk(self, symbol: str, lot_size: float,
                                   entry_price: float, stop_loss: float) -> bool:
@@ -786,6 +923,123 @@ class OrderExecutor:
             f"<= {max_portfolio_risk:.2f}% limit "
             f"[Existing: ${total_existing_risk:.2f} ({existing_risk_percent:.2f}%), "
             f"New: ${new_trade_risk:.2f} ({new_trade_risk_percent:.2f}%)]",
+            symbol
+        )
+
+        # TIER 3: Validate instrument group risk limits
+        # This prevents over-concentration in correlated instruments (e.g., multiple BTC pairs)
+        group_risk_valid = self._validate_group_risk(symbol, lot_size, entry_price, stop_loss, open_positions, balance)
+        if not group_risk_valid:
+            return False
+
+        return True
+
+    def _validate_group_risk(self, symbol: str, lot_size: float, entry_price: float,
+                             stop_loss: float, open_positions: list, balance: float) -> bool:
+        """
+        Validate that adding this trade won't exceed instrument group risk limits.
+
+        This prevents over-concentration in correlated instruments (e.g., multiple BTC pairs).
+
+        Args:
+            symbol: Symbol name for new trade
+            lot_size: Lot size for new trade
+            entry_price: Entry price for new trade
+            stop_loss: Stop loss for new trade
+            open_positions: List of currently open positions
+            balance: Account balance
+
+        Returns:
+            True if group risk is within limits, False if trade should be rejected
+        """
+        from src.config.instrument_groups import get_instrument_group, get_group_risk_limit
+
+        # Calculate current group risk from existing positions
+        group_risk = self.risk_manager.calculate_group_risk(open_positions, balance)
+
+        # Calculate risk for the proposed new trade
+        symbol_info = self.connector.get_symbol_info(symbol)
+        if symbol_info is None:
+            return True  # Can't validate, allow trade (already validated in other checks)
+
+        point = symbol_info['point']
+        tick_value = symbol_info['tick_value']
+        sl_distance = abs(entry_price - stop_loss)
+        sl_distance_points = sl_distance / point if point > 0 else sl_distance
+
+        # Convert tick value to account currency
+        from src.utils.currency_conversion_service import CurrencyConversionService
+        currency_service = CurrencyConversionService(self.logger)
+        currency_profit = symbol_info.get('currency_profit', 'USD')
+        account_currency = self.connector.get_account_currency()
+
+        tick_value_converted, _ = currency_service.convert_tick_value(
+            tick_value=tick_value,
+            currency_profit=currency_profit,
+            account_currency=account_currency,
+            symbol=symbol
+        )
+
+        new_trade_risk = sl_distance_points * tick_value_converted * lot_size
+        new_trade_risk_percent = (new_trade_risk / balance) * 100.0 if balance > 0 else 0
+
+        # Determine which group this symbol belongs to
+        new_trade_group = get_instrument_group(symbol)
+
+        # Calculate combined group risk
+        current_group_risk = group_risk.get(new_trade_group, 0.0)
+        combined_group_risk = current_group_risk + new_trade_risk_percent
+
+        # Get limit for this group
+        group_limit = get_group_risk_limit(new_trade_group)
+
+        # Check if group risk exceeds limit
+        if combined_group_risk > group_limit:
+            self.logger.warning(
+                f"⚠️  INSTRUMENT GROUP RISK VALIDATION FAILED - Trade REJECTED",
+                symbol
+            )
+            self.logger.warning(
+                f"Instrument Group: {new_trade_group.value}",
+                symbol
+            )
+            self.logger.warning(
+                f"Current Group Risk: {current_group_risk:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Proposed New Trade Risk: {new_trade_risk_percent:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Combined Group Risk: {combined_group_risk:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Group Risk Limit: {group_limit:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Risk Exceeds Limit By: {combined_group_risk - group_limit:.2f}%",
+                symbol
+            )
+            self.logger.warning(
+                f"Reason: Adding this {symbol} trade ({new_trade_risk_percent:.2f}% risk) to existing "
+                f"{new_trade_group.value} positions ({current_group_risk:.2f}% risk) would create "
+                f"{combined_group_risk:.2f}% total group risk, which exceeds the {group_limit:.2f}% limit.",
+                symbol
+            )
+            self.logger.warning(
+                f"Action: Trade NOT executed. Consider closing some {new_trade_group.value} positions "
+                f"or waiting for existing positions to close before opening new trades in this group.",
+                symbol
+            )
+            return False
+
+        # Group risk is within limits
+        self.logger.debug(
+            f"✓ Group risk validation passed: {new_trade_group.value} group risk {combined_group_risk:.2f}% "
+            f"<= {group_limit:.2f}% limit [Existing: {current_group_risk:.2f}%, New: {new_trade_risk_percent:.2f}%]",
             symbol
         )
 

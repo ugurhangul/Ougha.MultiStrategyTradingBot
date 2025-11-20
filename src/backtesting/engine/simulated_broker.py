@@ -72,6 +72,52 @@ class SimulatedTick:
 
 
 @dataclass
+class GlobalTick:
+    """
+    Single tick in the global tick timeline.
+
+    Used for tick-by-tick backtesting where all ticks from all symbols
+    are merged into a single chronologically-sorted timeline.
+    """
+    time: datetime
+    symbol: str
+    bid: float
+    ask: float
+    last: float
+    volume: int
+
+    @property
+    def spread(self) -> float:
+        """Calculate spread from bid/ask."""
+        return self.ask - self.bid
+
+    @property
+    def mid(self) -> float:
+        """Calculate mid price."""
+        return (self.bid + self.ask) / 2.0
+
+
+@dataclass
+class TickData:
+    """
+    Tick data for a specific symbol at a specific time.
+
+    Used to store the current tick for each symbol during backtesting.
+    """
+    time: datetime
+    bid: float
+    ask: float
+    last: float
+    volume: int
+    spread: float
+
+    @property
+    def mid(self) -> float:
+        """Calculate mid price."""
+        return (self.bid + self.ask) / 2.0
+
+
+@dataclass
 class OrderResult:
     """Result of order execution."""
     success: bool
@@ -104,6 +150,9 @@ class SimulatedBroker:
             leverage: Leverage ratio (e.g., 100.0 for 100:1 leverage, default: 100.0)
         """
         self.logger = get_logger()
+
+        # Marker to identify this as a simulated broker (for backtest mode detection)
+        self.is_simulated = True
 
         # Mock symbol cache for compatibility with TradingController
         self.symbol_cache = MockSymbolInfoCache()
@@ -158,30 +207,58 @@ class SimulatedBroker:
         self.symbols_with_data_next: Set[str] = set()     # Written during barrier
         self.bitmap_swap_lock = threading.Lock()          # Only for atomic swap
 
+        # TICK-LEVEL BACKTESTING: Global tick timeline
+        # All ticks from all symbols merged into single chronologically-sorted timeline
+        self.global_tick_timeline: List[GlobalTick] = []  # Merged tick timeline
+        self.global_tick_index: int = 0                   # Current position in timeline
+        self.use_tick_data: bool = False                  # Flag to enable tick-level mode
+        self.current_tick_symbol: Optional[str] = None    # Symbol that owns current tick
+
+        # TICK-LEVEL BACKTESTING: Per-symbol tick data
+        self.symbol_ticks: Dict[str, pd.DataFrame] = {}   # symbol -> tick DataFrame
+        self.current_ticks: Dict[str, TickData] = {}      # symbol -> current tick
+        self.tick_timestamps: Dict[str, np.ndarray] = {}  # symbol -> tick timestamps (for fast lookup)
+
+        # TICK-LEVEL BACKTESTING: Statistics
+        self.tick_sl_hits: int = 0   # Count of SL hits detected on ticks
+        self.tick_tp_hits: int = 0   # Count of TP hits detected on ticks
+
         # Current simulated time
         self.current_time: Optional[datetime] = None
-        self.time_lock = threading.Lock()
+        # Non-blocking snapshot of current simulated time for logging/time provider
+        # Updated whenever current_time changes while holding time_lock
+        self.current_time_snapshot: Optional[datetime] = None
+        # Use RLock (reentrant lock) instead of Lock to allow same thread to acquire multiple times
+        # This prevents deadlock if a method that holds the lock calls another method that also needs the lock
+        self.time_lock = threading.RLock()
         
+        # Instance ID for debugging multiple instances
+        self.instance_id = id(self)
+
         # Trading status
         self.autotrading_enabled = True
         self.trading_enabled_symbols: Dict[str, bool] = {}  # symbol -> enabled
-        
+
         # Connection status
         self.is_connected = True
 
         # Trade history for results analysis
         self.closed_trades: List[Dict] = []  # List of closed trade records
 
-        self.logger.info(f"SimulatedBroker initialized with balance: ${initial_balance:,.2f}")
+        self.logger.info(f"SimulatedBroker initialized with balance: ${initial_balance:,.2f} [Instance: {self.instance_id}]")
     
     def load_symbol_data(self, symbol: str, data: pd.DataFrame, symbol_info: Dict, timeframe: str = "M1"):
         """
         Load historical data for a symbol and timeframe.
 
+        IMPORTANT: tick_value in symbol_info MUST be converted to account currency (USD)
+        before calling this method! The SimulatedBroker uses tick_value directly for
+        profit calculations and assumes it's already in USD.
+
         Args:
             symbol: Symbol name
             data: DataFrame with columns [time, open, high, low, close, volume]
-            symbol_info: Dictionary with symbol information (point, digits, etc.)
+            symbol_info: Dictionary with symbol information (point, digits, tick_value in USD, etc.)
             timeframe: Timeframe of the data (e.g., "M1", "M5", "M15", "H4")
         """
         # Store data with (symbol, timeframe) key
@@ -242,6 +319,250 @@ class SimulatedBroker:
         else:
             self.logger.info(f"Loaded {len(data)} bars for {symbol} {timeframe}")
 
+    def load_tick_data(self, symbol: str, ticks: pd.DataFrame, symbol_info: Dict):
+        """
+        Load tick data for a symbol (for tick-level backtesting).
+
+        Args:
+            symbol: Symbol name
+            ticks: DataFrame with columns [time, bid, ask, last, volume]
+            symbol_info: Dictionary with symbol information
+        """
+        # Store tick data
+        self.symbol_ticks[symbol] = ticks.copy()
+
+        # Pre-compute timestamps for fast lookup
+        timestamps = pd.to_datetime(ticks['time'], utc=True)
+        self.tick_timestamps[symbol] = np.array([
+            ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else ts
+            for ts in timestamps
+        ])
+
+        # Store symbol info (same as load_symbol_data)
+        if symbol not in self.symbol_info:
+            self.symbol_info[symbol] = SimulatedSymbolInfo(
+                point=symbol_info.get('point', 0.00001),
+                digits=symbol_info.get('digits', 5),
+                tick_value=symbol_info.get('tick_value', 1.0),
+                tick_size=symbol_info.get('tick_size', 0.00001),
+                min_lot=symbol_info.get('min_lot', 0.01),
+                max_lot=symbol_info.get('max_lot', 100.0),
+                lot_step=symbol_info.get('lot_step', 0.01),
+                contract_size=symbol_info.get('contract_size', 100000.0),
+                filling_mode=symbol_info.get('filling_mode', 1),
+                stops_level=symbol_info.get('stops_level', 0),
+                freeze_level=symbol_info.get('freeze_level', 0),
+                trade_mode=symbol_info.get('trade_mode', 4),
+                currency_base=symbol_info.get('currency_base', 'EUR'),
+                currency_profit=symbol_info.get('currency_profit', 'USD'),
+                currency_margin=symbol_info.get('currency_margin', 'USD'),
+                category=symbol_info.get('category', 'Forex')
+            )
+
+            # Store spread from symbol_info
+            spread = symbol_info.get('spread', None)
+            if spread is not None and spread > 0:
+                self.symbol_spreads[symbol] = float(spread)
+            else:
+                self.symbol_spreads[symbol] = self.default_spread_points
+
+        # Enable trading for this symbol
+        self.trading_enabled_symbols[symbol] = True
+
+        self.logger.info(f"Loaded {len(ticks):,} ticks for {symbol}")
+
+    def load_ticks_from_cache_files(self, cache_files: dict):
+        """
+        Load ticks directly from cached parquet files and merge into global timeline.
+
+        This is more memory-efficient than load_tick_data() + merge_global_tick_timeline()
+        because it doesn't store DataFrames in memory.
+
+        Args:
+            cache_files: Dict mapping symbol -> parquet file path
+        """
+        import psutil
+        import os
+        from pathlib import Path
+
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+
+        self.logger.info("=" * 60)
+        self.logger.info("Loading ticks from cache files (memory-efficient mode)...")
+        self.logger.info(f"  Memory before loading: {mem_before:.1f} MB")
+
+        all_ticks = []
+
+        # Load ticks from each cache file
+        for symbol, cache_file in cache_files.items():
+            cache_path = Path(cache_file)
+            if not cache_path.exists():
+                self.logger.warning(f"  Cache file not found: {cache_file}")
+                continue
+
+            self.logger.info(f"  Loading {symbol} from {cache_path.name}...")
+
+            # Read parquet file in chunks to reduce memory usage
+            df = pd.read_parquet(cache_path)
+
+            self.logger.info(f"    {len(df):,} ticks loaded")
+
+            # Convert to GlobalTick objects
+            for _, row in df.iterrows():
+                tick_time = row['time']
+                if isinstance(tick_time, pd.Timestamp):
+                    tick_time = tick_time.to_pydatetime()
+                if tick_time.tzinfo is None:
+                    tick_time = tick_time.replace(tzinfo=timezone.utc)
+
+                all_ticks.append(GlobalTick(
+                    time=tick_time,
+                    symbol=symbol,
+                    bid=float(row['bid']),
+                    ask=float(row['ask']),
+                    last=float(row['last']),
+                    volume=int(row['volume'])
+                ))
+
+            # Clear DataFrame to free memory immediately
+            del df
+
+        # Sort by timestamp
+        self.logger.info(f"  Sorting {len(all_ticks):,} ticks chronologically...")
+        all_ticks.sort(key=lambda t: t.time)
+
+        self.global_tick_timeline = all_ticks
+        self.global_tick_index = 0
+        self.use_tick_data = True
+
+        # Set initial time
+        if len(all_ticks) > 0:
+            self.current_time = all_ticks[0].time
+            # Also update snapshot for non-blocking time provider
+            self.current_time_snapshot = self.current_time
+
+            mem_after = process.memory_info().rss / 1024 / 1024  # MB
+            mem_used = mem_after - mem_before
+
+            self.logger.info(f"  ✓ Global timeline created: {len(all_ticks):,} ticks")
+            self.logger.info(f"  Time range: {all_ticks[0].time} to {all_ticks[-1].time}")
+            self.logger.info(f"  Memory after loading: {mem_after:.1f} MB")
+            self.logger.info(f"  Memory used: {mem_used:.1f} MB")
+
+            # Calculate statistics
+            time_span = (all_ticks[-1].time - all_ticks[0].time).total_seconds()
+            ticks_per_second = len(all_ticks) / time_span if time_span > 0 else 0
+            self.logger.info(f"  Duration: {time_span/3600:.1f} hours")
+            self.logger.info(f"  Average: {ticks_per_second:.1f} ticks/second")
+
+            # Symbol distribution
+            symbol_counts = {}
+            for tick in all_ticks:
+                symbol_counts[tick.symbol] = symbol_counts.get(tick.symbol, 0) + 1
+
+            self.logger.info("  Symbol distribution:")
+            for symbol, count in sorted(symbol_counts.items()):
+                pct = 100.0 * count / len(all_ticks)
+                self.logger.info(f"    {symbol}: {count:,} ticks ({pct:.1f}%)")
+        else:
+            self.logger.warning("  No ticks loaded!")
+
+        self.logger.info("=" * 60)
+
+    def merge_global_tick_timeline(self):
+        """
+        Merge all symbol tick data into a single chronologically-sorted global timeline.
+
+        This creates the global tick timeline used for tick-by-tick backtesting.
+        Each tick in the timeline contains: time, symbol, bid, ask, last, volume.
+
+        Must be called after all symbols' tick data has been loaded via load_tick_data().
+
+        MEMORY OPTIMIZATION: Clears symbol_ticks DataFrames after merging to free memory.
+        """
+        import psutil
+        import os
+
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+
+        self.logger.info("=" * 60)
+        self.logger.info("Merging global tick timeline...")
+        self.logger.info(f"  Memory before merge: {mem_before:.1f} MB")
+
+        all_ticks = []
+
+        # Collect ticks from all symbols
+        for symbol, ticks_df in self.symbol_ticks.items():
+            self.logger.info(f"  Adding {len(ticks_df):,} ticks from {symbol}")
+
+            # Convert each tick to GlobalTick object
+            for _, row in ticks_df.iterrows():
+                tick_time = row['time']
+                if isinstance(tick_time, pd.Timestamp):
+                    tick_time = tick_time.to_pydatetime()
+                if tick_time.tzinfo is None:
+                    tick_time = tick_time.replace(tzinfo=timezone.utc)
+
+                all_ticks.append(GlobalTick(
+                    time=tick_time,
+                    symbol=symbol,
+                    bid=float(row['bid']),
+                    ask=float(row['ask']),
+                    last=float(row['last']),
+                    volume=int(row['volume'])
+                ))
+
+        # MEMORY OPTIMIZATION: Clear DataFrames - we don't need them anymore
+        self.logger.info(f"  Clearing {len(self.symbol_ticks)} symbol DataFrames to free memory...")
+        self.symbol_ticks.clear()
+
+        mem_after_clear = process.memory_info().rss / 1024 / 1024  # MB
+        mem_freed = mem_before - mem_after_clear
+        self.logger.info(f"  Memory after clearing DataFrames: {mem_after_clear:.1f} MB (freed {mem_freed:.1f} MB)")
+
+        # Sort by timestamp (CRITICAL for tick-by-tick replay!)
+        self.logger.info(f"  Sorting {len(all_ticks):,} ticks chronologically...")
+        all_ticks.sort(key=lambda t: t.time)
+
+        self.global_tick_timeline = all_ticks
+        self.global_tick_index = 0
+        self.use_tick_data = True
+
+        # Set initial time to first tick
+        if len(all_ticks) > 0:
+            self.current_time = all_ticks[0].time
+            # Also update snapshot for non-blocking time provider
+            self.current_time_snapshot = self.current_time
+
+            mem_after_merge = process.memory_info().rss / 1024 / 1024  # MB
+
+            self.logger.info(f"  Global timeline created: {len(all_ticks):,} ticks")
+            self.logger.info(f"  Time range: {all_ticks[0].time} to {all_ticks[-1].time}")
+            self.logger.info(f"  Memory after merge: {mem_after_merge:.1f} MB")
+            self.logger.info(f"  Memory used by timeline: ~{mem_after_merge - mem_after_clear:.1f} MB")
+
+            # Calculate statistics
+            time_span = (all_ticks[-1].time - all_ticks[0].time).total_seconds()
+            ticks_per_second = len(all_ticks) / time_span if time_span > 0 else 0
+            self.logger.info(f"  Duration: {time_span/3600:.1f} hours")
+            self.logger.info(f"  Average: {ticks_per_second:.1f} ticks/second")
+
+            # Symbol distribution
+            symbol_counts = {}
+            for tick in all_ticks:
+                symbol_counts[tick.symbol] = symbol_counts.get(tick.symbol, 0) + 1
+
+            self.logger.info("  Symbol distribution:")
+            for symbol, count in sorted(symbol_counts.items()):
+                pct = 100.0 * count / len(all_ticks)
+                self.logger.info(f"    {symbol}: {count:,} ticks ({pct:.1f}%)")
+        else:
+            self.logger.warning("  No ticks loaded - global timeline is empty!")
+
+        self.logger.info("=" * 60)
+
     def set_start_time(self, start_time: datetime):
         """
         Set the starting time for the backtest.
@@ -292,8 +613,15 @@ class SimulatedBroker:
         # Initialize current_time with the earliest bar time
         # This ensures logs show simulated time instead of system time
         if earliest_bar_time is not None:
+            import threading
+            tid = threading.current_thread().name
+            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquiring time_lock (init current_time)")
             with self.time_lock:
+                self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquired time_lock (init current_time)")
                 self.current_time = earliest_bar_time
+                # Update non-blocking snapshot as well
+                self.current_time_snapshot = self.current_time
+            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Released time_lock (init current_time)")
             self.logger.info(f"  Initialized simulated time to: {earliest_bar_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     # ========================================================================
@@ -470,6 +798,61 @@ class SimulatedBroker:
         """Get account currency."""
         return self.currency
 
+    def get_account_free_margin(self) -> Optional[float]:
+        """
+        Get account free margin (available for new positions).
+
+        In backtest mode, we use a simplified calculation:
+        Free Margin = Equity - Used Margin
+
+        For simplicity, we assume 100:1 leverage and calculate used margin
+        as the sum of all open position notional values / 100.
+        """
+        equity = self.get_account_equity()
+
+        # Calculate used margin from open positions
+        used_margin = 0.0
+        with self.position_lock:
+            for pos in self.positions.values():
+                # Get symbol info
+                if pos.symbol not in self.symbol_info:
+                    continue
+
+                info = self.symbol_info[pos.symbol]
+                # Notional value = volume * contract_size * current_price
+                notional = pos.volume * info.contract_size * pos.price_open
+                # Assume 100:1 leverage
+                used_margin += notional / 100.0
+
+        free_margin = equity - used_margin
+        return max(0.0, free_margin)  # Can't be negative
+
+    def calculate_margin(self, symbol: str, volume: float, price: float) -> Optional[float]:
+        """
+        Calculate required margin for opening a position.
+
+        In backtest mode, we use a simplified calculation:
+        Margin = (volume * contract_size * price) / leverage
+
+        Args:
+            symbol: Symbol name
+            volume: Lot size
+            price: Entry price
+
+        Returns:
+            Required margin in account currency
+        """
+        if symbol not in self.symbol_info:
+            return None
+
+        info = self.symbol_info[symbol]
+        # Notional value = volume * contract_size * price
+        notional = volume * info.contract_size * price
+        # Assume 100:1 leverage
+        margin = notional / 100.0
+
+        return margin
+
     def get_currency_conversion_rate(self, from_currency: str, to_currency: str) -> Optional[float]:
         """Get currency conversion rate (simplified - returns 1.0)."""
         if from_currency == to_currency:
@@ -600,6 +983,19 @@ class SimulatedBroker:
         Returns:
             Current price or None
         """
+        # TICK-LEVEL MODE: Return price from current tick
+        if self.use_tick_data and symbol in self.current_ticks:
+            tick = self.current_ticks[symbol]
+            if price_type == 'bid':
+                return tick.bid
+            elif price_type == 'ask':
+                return tick.ask
+            elif price_type == 'mid':
+                return tick.mid
+            else:
+                return tick.bid  # Default to bid
+
+        # CANDLE MODE: Return price from latest candle
         candle = self.get_latest_candle(symbol, "")
         if not candle:
             # Try to get price from inverse pair for currency conversion
@@ -1022,10 +1418,14 @@ class SimulatedBroker:
         Returns:
             True if successful
         """
-        with self.position_lock:
-            return self._close_position_internal(ticket)
+        # Get current time BEFORE acquiring lock to avoid deadlock
+        # (get_current_time acquires time_lock)
+        close_time = self.get_current_time()
 
-    def _close_position_internal(self, ticket: int) -> bool:
+        with self.position_lock:
+            return self._close_position_internal(ticket, close_time=close_time)
+
+    def _close_position_internal(self, ticket: int, close_price: Optional[float] = None, close_time: Optional[datetime] = None) -> bool:
         """
         Internal method to close a position without acquiring lock.
 
@@ -1050,7 +1450,14 @@ class SimulatedBroker:
         self.balance += position.profit
 
         # Record closed trade for analysis
-        close_time = self.get_current_time()
+        if close_time is None:
+            # Fallback if not provided (though it should be to avoid deadlock)
+            # We can't call get_current_time() here if we hold time_lock!
+            # But if we are here, we might hold position_lock.
+            # If we don't hold time_lock, this is safe.
+            # If we DO hold time_lock (e.g. from advance_global_time), we MUST pass close_time.
+            close_time = self.get_current_time()
+
         trade_record = {
             'ticket': ticket,
             'symbol': position.symbol,
@@ -1095,6 +1502,10 @@ class SimulatedBroker:
         Update all open positions with current prices and check for SL/TP hits.
         Called by TimeController on each time step.
         """
+        # Get current time BEFORE acquiring position_lock to avoid deadlock
+        # (get_current_time acquires time_lock)
+        current_time = self.get_current_time()
+
         with self.position_lock:
             positions_to_close = []
 
@@ -1108,7 +1519,7 @@ class SimulatedBroker:
 
             # Close positions that hit SL/TP (using internal method to avoid deadlock)
             for ticket in positions_to_close:
-                self._close_position_internal(ticket)
+                self._close_position_internal(ticket, close_time=current_time)
 
     def _update_position_profit(self, position: PositionInfo):
         """Update position's current price and profit."""
@@ -1230,6 +1641,9 @@ class SimulatedBroker:
         """
         Check if a symbol has data at the current global time.
 
+        TICK MODE: Returns True only if this symbol owns the current tick
+        CANDLE MODE: Returns True if symbol has a bar at current_time
+
         OPTIMIZATIONS APPLIED:
         - #1: Uses pre-computed timestamps (no Pandas access, no timestamp conversion)
         - #3b: Lock-free bitmap read using double-buffering (Phase 2)
@@ -1244,8 +1658,15 @@ class SimulatedBroker:
             symbol: Symbol to check
 
         Returns:
-            True if symbol has a bar at current_time, False otherwise
+            True if symbol has data at current_time, False otherwise
         """
+        # TICK MODE: Check if this symbol owns the current tick
+        if self.use_tick_data:
+            # In tick mode, only the symbol that owns the current tick should process it
+            # All other symbols wait at the barrier without processing
+            return symbol == self.current_tick_symbol
+
+        # CANDLE MODE: Check bitmap for bar at current time
         # OPTIMIZATION #3b: Lock-free read from stable buffer
         # No lock needed - we read from the 'current' buffer which is stable
         # The swap happens atomically, so we always see a consistent state
@@ -1255,7 +1676,8 @@ class SimulatedBroker:
         """
         Check if a symbol has any more data available.
 
-        OPTIMIZATION #1: Uses cached data length for fast check.
+        TICK MODE: Checks if there are more ticks in the global timeline
+        CANDLE MODE: Uses cached data length for fast check
 
         Args:
             symbol: Symbol to check
@@ -1263,8 +1685,23 @@ class SimulatedBroker:
         Returns:
             True if symbol has more data, False if at end
         """
+        import threading
+        tid = threading.current_thread().name
+        self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquiring time_lock (has_more_data)")
         with self.time_lock:
+            self.logger.debug(f"[LOCK_DEBUG] {tid}: Acquired time_lock (has_more_data)")
+
+            # TICK MODE: Check global tick timeline
+            if self.use_tick_data:
+                # In tick mode, all symbols share the same global timeline
+                # Check if there are more ticks to process
+                result = self.global_tick_index < len(self.global_tick_timeline)
+                self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data TICK mode - result={result})")
+                return result
+
+            # CANDLE MODE: Check per-symbol data
             if symbol not in self.current_indices:
+                self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data - no indices)")
                 return False
 
             # Fast bounds check using cached length
@@ -1272,7 +1709,9 @@ class SimulatedBroker:
             data_length = self.symbol_data_lengths.get(symbol, 0)
 
             # Check if there's more data after current index
-            return current_idx < data_length - 1
+            result = current_idx < data_length - 1
+            self.logger.debug(f"[LOCK_DEBUG] {tid}: Releasing time_lock (has_more_data CANDLE mode - result={result})")
+            return result
 
     def advance_global_time(self) -> bool:
         """
@@ -1326,6 +1765,8 @@ class SimulatedBroker:
             # Advance global time by 1 minute
             from datetime import timedelta
             self.current_time = self.current_time + timedelta(minutes=1)
+            # Update non-blocking snapshot as well
+            self.current_time_snapshot = self.current_time
 
             # OPTIMIZATION #3b: Update NEXT buffer (not visible to threads yet)
             # Threads are still reading from 'current' buffer (stable, no lock needed)
@@ -1349,6 +1790,224 @@ class SimulatedBroker:
 
             return True
 
+    def advance_global_time_tick_by_tick(self) -> bool:
+        """
+        Advance global time by one tick (tick-by-tick mode).
+
+        This method processes the next tick in the global tick timeline.
+        Only the symbol that owns the current tick will have its current_ticks updated.
+
+        Thread-safe: Should only be called by one thread (the last to reach barrier).
+
+        Returns:
+            True if time advanced successfully, False if no more ticks
+        """
+        if self.global_tick_index < 3:
+            import threading
+            self.logger.info(f"[TICK] advance_global_time_tick_by_tick() called by {threading.current_thread().name} (index={self.global_tick_index})")
+            self.logger.info(f"[TICK] Attempting to acquire time_lock...")
+
+        import threading
+        tid = threading.current_thread().name
+        self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Attempting to acquire time_lock (advance_tick, index={self.global_tick_index})")
+        acquired = self.time_lock.acquire(timeout=1)
+        if not acquired:
+            self.logger.error(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: DEADLOCK! Could not acquire time_lock after 1 second!")
+            self.logger.error(f"[TICK] This means another thread is holding time_lock and not releasing it")
+            return False
+
+        try:
+            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Acquired time_lock (advance_tick, index={self.global_tick_index})")
+            if self.global_tick_index < 3:
+                self.logger.info(f"[TICK] Acquired time_lock (index={self.global_tick_index})")
+            # Log start of tick-by-tick processing (first tick only)
+            if self.global_tick_index == 0 and len(self.global_tick_timeline) > 0:
+                first_tick = self.global_tick_timeline[0]
+                last_tick = self.global_tick_timeline[-1]
+                self.logger.info("=" * 80)
+                self.logger.info("STARTING TICK-BY-TICK BACKTEST")
+                self.logger.info("=" * 80)
+                self.logger.info(f"Total ticks: {len(self.global_tick_timeline):,}")
+                self.logger.info(f"First tick: {first_tick.time.strftime('%Y-%m-%d %H:%M:%S')} ({first_tick.symbol})")
+                self.logger.info(f"Last tick: {last_tick.time.strftime('%Y-%m-%d %H:%M:%S')} ({last_tick.symbol})")
+                self.logger.info(f"Status updates every 1,000 ticks (file logs)")
+                self.logger.info(f"Console progress updates every 1 second (via BacktestController)")
+                self.logger.info("=" * 80)
+
+                # Initialize timing for ETA calculation
+                import time
+                self.backtest_start_time = time.time()
+
+            # Check if we have more ticks
+            if self.global_tick_index >= len(self.global_tick_timeline):
+                self.logger.info("=" * 80)
+                self.logger.info("TICK-BY-TICK BACKTEST COMPLETE")
+                self.logger.info("=" * 80)
+                self.logger.info(f"Total ticks processed: {self.global_tick_index:,}")
+                self.logger.info(f"Stop-Loss hits detected on ticks: {self.tick_sl_hits}")
+                self.logger.info(f"Take-Profit hits detected on ticks: {self.tick_tp_hits}")
+                self.logger.info(f"Total SL/TP hits on ticks: {self.tick_sl_hits + self.tick_tp_hits}")
+                self.logger.info("=" * 80)
+                return False
+
+            # Get next tick from global timeline
+            next_tick = self.global_tick_timeline[self.global_tick_index]
+
+            # Advance global time to this tick's timestamp
+            self.current_time = next_tick.time
+            # Update non-blocking snapshot as well
+            self.current_time_snapshot = self.current_time
+
+            # Set which symbol owns this tick (for has_data_at_current_time check)
+            self.current_tick_symbol = next_tick.symbol
+
+            # Update current tick for the symbol that owns this tick
+            self.current_ticks[next_tick.symbol] = TickData(
+                time=next_tick.time,
+                bid=next_tick.bid,
+                ask=next_tick.ask,
+                last=next_tick.last,
+                volume=next_tick.volume,
+                spread=next_tick.spread
+            )
+
+            # Check SL/TP for positions of this symbol
+            # Pass current time to avoid re-acquiring time_lock
+            self._check_sl_tp_for_tick(next_tick.symbol, next_tick, self.current_time)
+
+            # Advance index
+            self.global_tick_index += 1
+
+            # Print backtest results to console on EVERY tick
+            progress_pct = 100.0 * self.global_tick_index / len(self.global_tick_timeline)
+
+            # Get current statistics
+            stats = self.get_statistics()
+            total_trades = len(self.closed_trades)
+
+            # Calculate win/loss
+            wins = sum(1 for t in self.closed_trades if t['profit'] > 0)
+            losses = sum(1 for t in self.closed_trades if t['profit'] < 0)
+            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
+            # Calculate profit factor
+            gross_profit = sum(t['profit'] for t in self.closed_trades if t['profit'] > 0)
+            gross_loss = abs(sum(t['profit'] for t in self.closed_trades if t['profit'] < 0))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0)
+            pf_display = f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞"
+
+            # Get open positions count
+            open_positions = len(self.positions)
+
+            # Calculate ETA (Estimated Time to Finish)
+            eta_display = "calculating..."
+            if hasattr(self, 'backtest_start_time') and self.global_tick_index > 100:
+                import time
+                elapsed_time = time.time() - self.backtest_start_time
+                ticks_per_second = self.global_tick_index / elapsed_time
+                remaining_ticks = len(self.global_tick_timeline) - self.global_tick_index
+                eta_seconds = remaining_ticks / ticks_per_second if ticks_per_second > 0 else 0
+
+                # Format ETA
+                if eta_seconds < 60:
+                    eta_display = f"{int(eta_seconds)}s"
+                elif eta_seconds < 3600:
+                    eta_display = f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    hours = int(eta_seconds / 3600)
+                    minutes = int((eta_seconds % 3600) / 60)
+                    eta_display = f"{hours}h {minutes}m"
+
+            import sys
+            message = (
+                f"[{progress_pct:5.1f}%] {self.current_time.strftime('%Y-%m-%d %H:%M')} | "
+                f"Tick: {self.global_tick_index:,}/{len(self.global_tick_timeline):,} | "
+                f"ETA: {eta_display:>10} | "
+                f"Equity: ${stats['equity']:>10,.2f} | "
+                f"P&L: ${stats['profit']:>8,.2f} ({stats['profit_percent']:>+6.2f}%) | "
+                f"Floating: ${stats['floating_pnl']:>8,.2f} | "
+                f"Trades: {total_trades:>4} ({wins}W/{losses}L) | "
+                f"WR: {win_rate:>5.1f}% | "
+                f"PF: {pf_display:>6} | "
+                f"Open: {open_positions:>2}"
+            )
+            # Get terminal width, truncate message if needed, then pad to clear old text
+            import shutil
+            terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+            if len(message) > terminal_width - 1:
+                message = message[:terminal_width - 4] + "..."
+            sys.stdout.write("\r" + message.ljust(terminal_width - 1))
+            sys.stdout.flush()
+
+            # Log progress periodically to file only (every 1,000 ticks)
+            if self.global_tick_index % 1000 == 0:
+                self.logger.info(
+                    f"[TICK {self.global_tick_index:,}/{len(self.global_tick_timeline):,}] "
+                    f"Progress: {progress_pct:.2f}% | Symbol: {next_tick.symbol} | "
+                    f"Time: {self.current_time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"Equity: ${stats['equity']:.2f} | P&L: ${stats['profit']:.2f} | "
+                    f"Trades: {total_trades} ({wins}W/{losses}L)"
+                )
+
+            return True
+        finally:
+            import threading
+            tid = threading.current_thread().name
+            self.logger.info(f"[LOCK_DEBUG] {tid} [Broker:{self.instance_id}]: Releasing time_lock (advance_tick, index={self.global_tick_index})")
+            self.time_lock.release()
+
+    def _check_sl_tp_for_tick(self, symbol: str, tick: GlobalTick, current_time: datetime):
+        """
+        Check if any positions for this symbol hit SL/TP on this tick.
+
+        Args:
+            symbol: Symbol to check
+            tick: The tick that just arrived
+        """
+        with self.position_lock:
+            positions_to_close = []
+
+            for ticket, position in self.positions.items():
+                # Only check positions for this symbol
+                if position.symbol != symbol:
+                    continue
+
+                # Check SL/TP hit
+                if position.type == PositionType.BUY:
+                    # For BUY: check if bid hit SL or TP
+                    if position.sl > 0 and tick.bid <= position.sl:
+                        # Stop loss hit
+                        positions_to_close.append((ticket, tick.bid, 'SL'))
+                    elif position.tp > 0 and tick.bid >= position.tp:
+                        # Take profit hit
+                        positions_to_close.append((ticket, tick.bid, 'TP'))
+
+                elif position.type == PositionType.SELL:
+                    # For SELL: check if ask hit SL or TP
+                    if position.sl > 0 and tick.ask >= position.sl:
+                        # Stop loss hit
+                        positions_to_close.append((ticket, tick.ask, 'SL'))
+                    elif position.tp > 0 and tick.ask <= position.tp:
+                        # Take profit hit
+                        positions_to_close.append((ticket, tick.ask, 'TP'))
+
+            # Close positions that hit SL/TP
+            for ticket, close_price, reason in positions_to_close:
+                position = self.positions.get(ticket)
+                if position:
+                    # Track statistics
+                    if reason == 'SL':
+                        self.tick_sl_hits += 1
+                    elif reason == 'TP':
+                        self.tick_tp_hits += 1
+
+                    self.logger.info(
+                        f"[{position.symbol}] {reason} hit on tick at {tick.time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"Ticket: {ticket} | Close price: {close_price:.5f} | "
+                        f"Total {reason} hits: {self.tick_sl_hits if reason == 'SL' else self.tick_tp_hits}"
+                    )
+                    self._close_position_internal(ticket, close_price=close_price, close_time=current_time)
+
     def advance_time(self, symbol: str) -> bool:
         """
         DEPRECATED: This method is kept for backward compatibility.
@@ -1368,6 +2027,13 @@ class SimulatedBroker:
         """Get current simulated time."""
         with self.time_lock:
             return self.current_time
+
+    def get_current_time_nonblocking(self) -> Optional[datetime]:
+        """Get current simulated time snapshot without acquiring time_lock.
+
+        This is safe for logging/time provider to avoid lock contention.
+        """
+        return self.current_time_snapshot
 
     def get_start_time(self) -> Optional[datetime]:
         """
@@ -1439,7 +2105,18 @@ class SimulatedBroker:
         return (self.current_indices[symbol], len(m1_data))
 
     def is_data_available(self, symbol: str) -> bool:
-        """Check if more data is available for a symbol."""
+        """
+        Check if more data is available for a symbol.
+
+        TICK MODE: Checks if there are more ticks in the global timeline
+        CANDLE MODE: Checks if symbol has more M1 candles
+        """
+        # TICK MODE: Check global tick timeline
+        if self.use_tick_data:
+            # In tick mode, all symbols share the same global timeline
+            return self.global_tick_index < len(self.global_tick_timeline)
+
+        # CANDLE MODE: Check per-symbol M1 data
         if symbol not in self.current_indices:
             return False
 

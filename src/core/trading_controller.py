@@ -769,10 +769,12 @@ class TradingController:
                 known_positions = current_tickets
 
                 # BACKTEST MODE: Update positions with current prices and check SL/TP
-                if self.is_backtest_mode:
+                # ONLY in CANDLE mode - TICK mode already checks SL/TP in advance_global_time_tick_by_tick
+                if self.is_backtest_mode and not getattr(self.connector, 'use_tick_data', False):
                     # Call SimulatedBroker's update_positions to:
                     # 1. Update all position profits with current prices
                     # 2. Check for SL/TP hits and close positions automatically
+                    # NOTE: In tick mode, this is handled by _check_sl_tp_for_tick() during time advancement
                     self.connector.update_positions()
 
                     # Get fresh position list after update_positions() may have closed some

@@ -2,9 +2,11 @@
 Risk management and position sizing.
 Ported from FMS_TradeExecution.mqh
 """
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
+from collections import defaultdict
 from src.core.mt5_connector import MT5Connector
 from src.config.configs import RiskConfig
+from src.config.instrument_groups import get_instrument_group, get_group_risk_limit, InstrumentGroup
 from src.models.data_models import PositionType
 from src.utils.logger import get_logger
 from src.utils.currency_conversion_service import CurrencyConversionService
@@ -33,36 +35,37 @@ class RiskManager:
         self.risk_config = risk_config
         self.logger = get_logger()
         self.persistence = persistence
-        self.currency_service = CurrencyConversionService(self.logger)
+        # Pass connector to currency service for backtest support
+        self.currency_service = CurrencyConversionService(self.logger, connector)
     
-    def calculate_lot_size(self, symbol: str, entry_price: float, 
+    def calculate_lot_size(self, symbol: str, entry_price: float,
                           stop_loss: float) -> float:
         """
         Calculate lot size based on risk percentage.
-        
+
         Args:
             symbol: Symbol name
             entry_price: Entry price
             stop_loss: Stop loss price
-            
+
         Returns:
-            Lot size
+            Lot size (0.0 if calculation fails or instrument should be skipped)
         """
         # Get account balance
         balance = self.connector.get_account_balance()
         if balance <= 0:
             self.logger.error("Invalid account balance", symbol)
             return 0.0
-        
+
         # Get symbol info
         symbol_info = self.connector.get_symbol_info(symbol)
         if symbol_info is None:
             self.logger.error("Failed to get symbol info", symbol)
             return 0.0
-        
+
         # Calculate risk amount in account currency
         risk_amount = balance * (self.risk_config.risk_percent_per_trade / 100.0)
-        
+
         # Calculate stop loss distance in points
         sl_distance = abs(entry_price - stop_loss)
         if sl_distance <= 0:
@@ -104,6 +107,15 @@ class RiskManager:
             self.logger.error("Invalid tick value or SL distance", symbol)
             return 0.0
 
+        # Warn about extremely tight stop losses that may cause margin issues
+        sl_percent = (sl_distance / entry_price) * 100.0
+        if sl_percent < 0.5:  # Less than 0.5% stop loss
+            self.logger.warning(
+                f"Extremely tight stop loss detected: {sl_distance_in_points:.0f} points "
+                f"({sl_percent:.2f}% of price). This may cause excessive lot sizes and margin issues.",
+                symbol
+            )
+
         # Calculate lot size
         # This matches MQL5: lotSize = riskAmount / (stopLossPoints * tickValue)
         # tick_value already represents the value per lot per point
@@ -123,6 +135,58 @@ class RiskManager:
         # Round to lot step
         lot_size = round(lot_size_raw / lot_step) * lot_step
         self.logger.debug(f"After rounding to lot_step: {lot_size:.4f}", symbol)
+
+        # CRITICAL: Cap lot size based on available margin to prevent MT5 rejection
+        # Use MT5's order_calc_margin() to get actual required margin
+        margin_required = self.connector.calculate_margin(symbol, lot_size, entry_price)
+
+        if margin_required is not None and margin_required > 0:
+            # Get available margin (free margin)
+            free_margin = self.connector.get_account_free_margin()
+
+            if free_margin is not None and free_margin > 0:
+                # If required margin exceeds 80% of free margin, reduce lot size
+                max_safe_margin = free_margin * 0.8  # Use max 80% of free margin
+
+                if margin_required > max_safe_margin:
+                    # Calculate maximum safe lot size
+                    margin_ratio = max_safe_margin / margin_required
+                    max_safe_lot_size = lot_size * margin_ratio
+                    max_safe_lot_size = round(max_safe_lot_size / lot_step) * lot_step
+
+                    self.logger.warning(
+                        f"Lot size {lot_size:.2f} requires ${margin_required:,.2f} margin "
+                        f"(exceeds 80% of free margin ${free_margin:,.2f}). "
+                        f"Reducing to {max_safe_lot_size:.2f} lots.",
+                        symbol
+                    )
+                    lot_size = max_safe_lot_size
+
+        # Check if calculated lot size is below symbol minimum
+        # This happens for expensive instruments (BTC, gold) or when balance is low
+        if lot_size_raw < min_lot:
+            # Calculate what risk the minimum lot would create
+            actual_risk_with_min_lot = sl_distance_in_points * tick_value * min_lot
+            actual_risk_percent = (actual_risk_with_min_lot / balance) * 100.0
+
+            # Define maximum acceptable risk multiplier (e.g., 3x configured risk)
+            max_risk_multiplier = 3.0
+            max_acceptable_risk = self.risk_config.risk_percent_per_trade * max_risk_multiplier
+
+            if actual_risk_percent > max_acceptable_risk:
+                self.logger.warning(
+                    f"Instrument filtered: Minimum lot ({min_lot:.4f}) would create {actual_risk_percent:.2f}% risk "
+                    f"(>{max_acceptable_risk:.2f}%). Calculated lot: {lot_size_raw:.6f}. Skipping trade.",
+                    symbol
+                )
+                return 0.0
+            else:
+                self.logger.info(
+                    f"Using minimum lot ({min_lot:.4f}) - actual risk: {actual_risk_percent:.2f}% "
+                    f"(calculated: {lot_size_raw:.6f})",
+                    symbol
+                )
+                lot_size = min_lot
 
         # Apply min/max constraints
         lot_size_before_symbol_clamp = lot_size
@@ -144,8 +208,8 @@ class RiskManager:
                 symbol
             )
 
-        # Note: If max_lot_size is 0 or negative, use symbol's min_lot
-        user_max_lot = self.risk_config.max_lot_size if self.risk_config.max_lot_size > 0 else min_lot
+        # Note: If max_lot_size is 0 or negative, use symbol's max_lot
+        user_max_lot = self.risk_config.max_lot_size if self.risk_config.max_lot_size > 0 else max_lot
         lot_size_before_user_max = lot_size
         lot_size = min(user_max_lot, lot_size)
         if lot_size != lot_size_before_user_max:
@@ -217,8 +281,60 @@ class RiskManager:
         sl = round(sl, digits)
         
         return sl
-    
-    def calculate_take_profit(self, symbol: str, entry_price: float, 
+
+    def calculate_group_risk(self, positions: list, balance: float) -> Dict[InstrumentGroup, float]:
+        """
+        Calculate current risk exposure by instrument group.
+
+        Args:
+            positions: List of open positions
+            balance: Account balance
+
+        Returns:
+            Dictionary mapping InstrumentGroup to risk percentage
+        """
+        group_risk: Dict[InstrumentGroup, float] = defaultdict(float)
+
+        for pos in positions:
+            # Get symbol info for risk calculation
+            symbol_info = self.connector.get_symbol_info(pos.symbol)
+            if symbol_info is None:
+                continue
+
+            # Calculate risk for this position
+            point = symbol_info['point']
+            tick_value = symbol_info['tick_value']
+
+            # Convert tick value to account currency if needed
+            currency_profit = symbol_info.get('currency_profit', 'USD')
+            account_currency = self.connector.get_account_currency()
+
+            tick_value_converted, _ = self.currency_service.convert_tick_value(
+                tick_value=tick_value,
+                currency_profit=currency_profit,
+                account_currency=account_currency,
+                symbol=pos.symbol
+            )
+
+            # Calculate SL distance
+            if pos.position_type == PositionType.BUY:
+                sl_distance = abs(pos.open_price - pos.sl) if pos.sl > 0 else 0
+            else:
+                sl_distance = abs(pos.sl - pos.open_price) if pos.sl > 0 else 0
+
+            sl_distance_points = sl_distance / point if point > 0 else 0
+
+            # Calculate risk amount
+            risk_amount = sl_distance_points * tick_value_converted * pos.volume
+            risk_percent = (risk_amount / balance) * 100.0 if balance > 0 else 0
+
+            # Add to group total
+            group = get_instrument_group(pos.symbol)
+            group_risk[group] += risk_percent
+
+        return dict(group_risk)
+
+    def calculate_take_profit(self, symbol: str, entry_price: float,
                              stop_loss: float, risk_reward_ratio: float) -> float:
         """
         Calculate take profit based on R:R ratio.

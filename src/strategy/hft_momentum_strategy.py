@@ -32,9 +32,11 @@ from src.risk.risk_manager import RiskManager
 from src.strategy.base_strategy import BaseStrategy, ValidationResult
 from src.strategy.strategy_factory import register_strategy
 from src.strategy.validation_decorator import validation_check, auto_register_validations
+from src.strategy.adaptive_filter import AdaptiveFilter
 from src.strategy.symbol_performance_persistence import SymbolPerformancePersistence
 from src.config.configs import HFTMomentumConfig
 from src.config.strategies import MartingaleType
+from src.config.trading_config import TradingConfig
 from src.utils.strategy import (
     SymbolCategoryUtils, StopLossCalculator,
     ValidationThresholdsCalculator, SignalValidationHelpers
@@ -130,6 +132,9 @@ class HFTMomentumStrategy(BaseStrategy):
         self.atr_avg_indicator = ATRAverageIndicator()
         self.spread_indicator = SpreadIndicator()
 
+        # Adaptive filter (will be initialized after symbol_params is loaded)
+        self.adaptive_filter: Optional[AdaptiveFilter] = None
+
         # All validations must pass (AND logic)
         self._validation_mode = "all"
         self.key = "HFT"  # Format: "HFT" (no range_id)
@@ -154,16 +159,32 @@ class HFTMomentumStrategy(BaseStrategy):
             mt5_category = symbol_info.get('category', '')
             self.category = SymbolCategoryUtils.detect_category(self.symbol, mt5_category)
 
-            # Store symbol info for later use (no persistence needed - can be retrieved from MT5)
-            self.symbol_params = {
-                'symbol': self.symbol,
-                'category': self.category,
-                'point': symbol_info['point'],
-                'digits': symbol_info['digits'],
-                'min_lot': symbol_info['min_lot'],
-                'max_lot': symbol_info['max_lot'],
-                'lot_step': symbol_info['lot_step']
-            }
+            # Load symbol parameters from repository
+            from src.config.symbols import SymbolParametersRepository
+            default_params = SymbolParameters()
+            self.symbol_params = SymbolParametersRepository.get_parameters(
+                self.category, default_params
+            )
+
+            # Initialize adaptive filter
+            trading_config = TradingConfig()
+            self.adaptive_filter = AdaptiveFilter(
+                symbol=self.symbol,
+                config=trading_config.adaptive_filters,
+                symbol_params=self.symbol_params
+            )
+
+            # Initialize filter state based on configuration
+            if trading_config.adaptive_filters.start_with_filters_enabled:
+                self.adaptive_filter.state.volume_confirmation_active = True
+                self.adaptive_filter.state.divergence_confirmation_active = True
+                self.symbol_params.volume_confirmation_enabled = True
+                self.symbol_params.divergence_confirmation_enabled = True
+
+            self.logger.info(
+                f"Adaptive filters initialized: enabled={trading_config.adaptive_filters.use_adaptive_filters}",
+                self.symbol
+            )
 
             # Get validation thresholds from shared utility
             self.validation_thresholds = ValidationThresholdsCalculator.get_thresholds(self.category)
@@ -875,6 +896,17 @@ class HFTMomentumStrategy(BaseStrategy):
         # Only process if it's for this symbol
         if symbol != self.symbol:
             return
+
+        # Log result
+        is_win = profit > 0
+        self.logger.info(
+            f"Position closed: {'WIN' if is_win else 'LOSS'} ${profit:.2f}",
+            self.symbol
+        )
+
+        # Update adaptive filter state
+        if self.adaptive_filter is not None:
+            self.adaptive_filter.on_trade_result(is_win)
 
         # Delegate to internal method
         if self.position_sizer is not None:

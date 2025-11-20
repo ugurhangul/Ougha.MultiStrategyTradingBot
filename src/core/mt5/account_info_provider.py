@@ -40,6 +40,14 @@ class AccountInfoProvider:
         account_info = mt5.account_info()
         return account_info.equity if account_info else 0.0
 
+    def get_account_free_margin(self) -> Optional[float]:
+        """Get current account free margin (available for new positions)"""
+        if not self.connection_manager.is_connected:
+            return None
+
+        account_info = mt5.account_info()
+        return account_info.margin_free if account_info else None
+
     def get_account_currency(self) -> str:
         """Get account currency"""
         if not self.connection_manager.is_connected:
@@ -47,6 +55,34 @@ class AccountInfoProvider:
 
         account_info = mt5.account_info()
         return account_info.currency if account_info else ""
+
+    def calculate_margin(self, symbol: str, volume: float, price: float) -> Optional[float]:
+        """
+        Calculate required margin for opening a position.
+
+        Uses MT5's order_calc_margin() to get accurate margin requirements.
+
+        Args:
+            symbol: Symbol name (e.g., 'EURUSD')
+            volume: Lot size (e.g., 0.1)
+            price: Entry price
+
+        Returns:
+            Required margin in account currency, or None if calculation fails
+        """
+        if not self.connection_manager.is_connected:
+            return None
+
+        # Use MT5's built-in margin calculation
+        # order_calc_margin(action, symbol, volume, price)
+        # action: ORDER_TYPE_BUY (0) or ORDER_TYPE_SELL (1)
+        # We use BUY as margin is typically the same for both
+        margin = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, volume, price)
+
+        if margin is None or margin < 0:
+            return None
+
+        return margin
 
     def get_currency_conversion_rate(self, from_currency: str, to_currency: str) -> Optional[float]:
         """
