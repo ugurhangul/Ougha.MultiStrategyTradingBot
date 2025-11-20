@@ -943,8 +943,17 @@ class SimulatedBroker:
         return self.balance
 
     def get_account_equity(self) -> float:
-        """Get current account equity (balance + floating P&L)."""
+        """
+        Get current account equity (balance + floating P&L).
+
+        PERFORMANCE OPTIMIZATION: Lazy P&L calculation
+        Updates P&L for all positions on-demand when equity is queried.
+        """
         with self.position_lock:
+            # Update P&L for all positions before calculating equity
+            for position in self.positions.values():
+                self._update_position_profit(position)
+
             floating_pnl = sum(pos.profit for pos in self.positions.values())
         return self.balance + floating_pnl
 
