@@ -334,6 +334,25 @@ class MultiStrategyOrchestrator:
                 strategy_key=strategy_key
             )
 
+    def get_required_timeframes(self) -> List[str]:
+        """
+        Get list of timeframes required by all sub-strategies.
+
+        PERFORMANCE OPTIMIZATION: Aggregates timeframe requirements from all sub-strategies
+        to enable event-driven strategy calls (only call on_tick() when relevant candles update).
+
+        Returns:
+            List of unique timeframe strings required by any sub-strategy
+        """
+        required_timeframes = set()
+
+        for strategy in self.strategies.values():
+            if hasattr(strategy, 'get_required_timeframes'):
+                timeframes = strategy.get_required_timeframes()
+                required_timeframes.update(timeframes)
+
+        return sorted(list(required_timeframes))
+
     def get_status(self) -> Dict:
         """
         Get status of all strategies.

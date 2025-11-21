@@ -501,7 +501,24 @@ def main():
     # Set log_to_console=True to see real-time output (useful for debugging, but slower)
     ENABLE_CONSOLE_LOGS = False  # Set to True for debugging, False for max speed
 
-    init_logger(log_to_file=True, log_to_console=ENABLE_CONSOLE_LOGS, log_level="INFO")
+    # PERFORMANCE OPTIMIZATION #2: Enable async logging (background thread for I/O)
+    # This prevents logging from blocking the main tick processing loop
+    # Expected speedup: 1.13x-1.25x (13-25% faster)
+    USE_ASYNC_LOGGING = True  # Set to False to disable async logging (for debugging)
+
+    # PERFORMANCE OPTIMIZATION #5: Reduce log verbosity during backtesting
+    # INFO logs are useful but create overhead. WARNING+ logs are kept for important events.
+    # Trade execution, SL/TP hits, and errors are still logged (WARNING level or higher)
+    # Expected speedup: 1.05x-1.10x (5-10% faster)
+    BACKTEST_LOG_LEVEL = "WARNING"  # Options: "DEBUG", "INFO", "WARNING", "ERROR"
+    # Note: Set to "INFO" for detailed debugging, "WARNING" for production backtests
+
+    init_logger(
+        log_to_file=True,
+        log_to_console=ENABLE_CONSOLE_LOGS,
+        log_level=BACKTEST_LOG_LEVEL,
+        use_async_logging=USE_ASYNC_LOGGING
+    )
     logger = get_logger()
 
     # Set backtest mode IMMEDIATELY to ensure all logs go to logs/backtest/
@@ -1377,7 +1394,127 @@ def main():
     broker.set_start_time(START_DATE)
     logger.info("")
 
-    # Step 4.5: Load Tick Timeline (if tick-level backtesting enabled)
+    # Step 4.5: Early Strategy Initialization (to collect required timeframes)
+    # PERFORMANCE OPTIMIZATION: Initialize strategies BEFORE loading ticks so we can
+    # collect required timeframes and only build candles for what's actually needed
+    if USE_TICK_DATA:
+        console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
+        console.print("[bold cyan]STEP 4.5: Early Strategy Initialization (for timeframe collection)[/bold cyan]")
+        console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
+
+        logger.info("=" * 80)
+        logger.info("STEP 4.5: Early Strategy Initialization (for timeframe collection)")
+        logger.info("=" * 80)
+        logger.info("  PERFORMANCE OPTIMIZATION: Initializing strategies early to collect required timeframes")
+        logger.info("  This allows us to only build candles for timeframes that strategies actually use")
+        logger.info("")
+
+        # Initialize TimeController (needed for strategy initialization)
+        time_granularity = TimeGranularity.TICK
+        time_controller = TimeController(
+            symbols,
+            mode=TIME_MODE,
+            granularity=time_granularity,
+            include_position_monitor=True,
+            broker=broker
+        )
+        logger.info(f"  ✓ TimeController initialized (early)")
+
+        # Initialize trading components (needed for strategy initialization)
+        risk_manager = RiskManager(
+            connector=broker,
+            risk_config=config.risk,
+            persistence=backtest_persistence
+        )
+        logger.info("  ✓ RiskManager initialized (early)")
+
+        order_manager = OrderManager(
+            connector=broker,
+            magic_number=config.advanced.magic_number,
+            trade_comment=config.advanced.trade_comment,
+            persistence=backtest_persistence,
+            risk_manager=risk_manager
+        )
+        logger.info("  ✓ OrderManager initialized (early)")
+
+        indicators = TechnicalIndicators()
+        logger.info("  ✓ TechnicalIndicators initialized (early)")
+
+        trade_manager = TradeManager(
+            connector=broker,
+            order_manager=order_manager,
+            trailing_config=config.trailing_stop,
+            use_breakeven=config.advanced.use_breakeven,
+            breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
+            indicators=indicators,
+            range_configs=config.range_config.ranges
+        )
+        logger.info("  ✓ TradeManager initialized (early)")
+
+        # Initialize BacktestController and strategies
+        backtest_controller = BacktestController(
+            simulated_broker=broker,
+            time_controller=time_controller,
+            order_manager=order_manager,
+            risk_manager=risk_manager,
+            trade_manager=trade_manager,
+            indicators=indicators,
+            stop_loss_threshold=STOP_LOSS_THRESHOLD
+        )
+
+        if not backtest_controller.initialize(symbols):
+            logger.error("Failed to initialize BacktestController")
+            logger.error("Check your .env configuration and strategy settings")
+            return False
+
+        logger.info("  ✓ Strategies initialized (early)")
+        logger.info("")
+
+        # Collect required timeframes from all strategies
+        logger.info("  Collecting required timeframes from strategies...")
+        required_timeframes_set = set()
+        for symbol, strategy in backtest_controller.trading_controller.strategies.items():
+            # MultiStrategyOrchestrator has 'strategies' dict attribute
+            if hasattr(strategy, 'strategies') and isinstance(strategy.strategies, dict):
+                # This is a MultiStrategyOrchestrator - iterate through sub-strategies
+                for strategy_key, sub_strategy in strategy.strategies.items():
+                    timeframes = sub_strategy.get_required_timeframes()
+                    if timeframes:
+                        required_timeframes_set.update(timeframes)
+                        logger.info(f"    {symbol} - {strategy_key}: {timeframes}")
+                    else:
+                        logger.info(f"    {symbol} - {strategy_key}: [] (tick-only)")
+            else:
+                # Single strategy (not orchestrator)
+                timeframes = strategy.get_required_timeframes()
+                if timeframes:
+                    required_timeframes_set.update(timeframes)
+                    strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
+                    logger.info(f"    {symbol} - {strategy_name}: {timeframes}")
+                else:
+                    strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
+                    logger.info(f"    {symbol} - {strategy_name}: [] (tick-only)")
+
+        required_timeframes = sorted(list(required_timeframes_set))
+        if required_timeframes:
+            logger.info("")
+            logger.info(f"  ⚡ OPTIMIZATION: Will build only {len(required_timeframes)} timeframes: {required_timeframes}")
+            logger.info(f"  ⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes")
+            console.print(f"\n[green]⚡ OPTIMIZATION: Building only {len(required_timeframes)} timeframes: {required_timeframes}[/green]")
+            console.print(f"[green]⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes[/green]\n")
+        else:
+            logger.info("")
+            logger.info(f"  ⚡ OPTIMIZATION: No candles required (all strategies are tick-only)")
+            logger.info(f"  ⚡ SPEEDUP: Skipping ALL candle building (maximum performance)")
+            console.print(f"\n[green]⚡ OPTIMIZATION: No candles required (all strategies are tick-only)[/green]")
+            console.print(f"[green]⚡ SPEEDUP: Skipping ALL candle building (maximum performance)[/green]\n")
+        logger.info("=" * 80)
+        logger.info("")
+    else:
+        # Non-tick mode: use default timeframes
+        required_timeframes = None
+
+    # Step 4.6: Load Tick Timeline (if tick-level backtesting enabled)
     if USE_TICK_DATA:
         console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
         console.print("[bold cyan]STEP 4.5: Loading Tick Timeline[/bold cyan]")
@@ -1398,7 +1535,7 @@ def main():
             logger.info("Using STREAMING mode (ticks read from disk on-demand)")
             logger.info("  Memory usage: ~2-3 GB (vs ~20-30 GB for loading all ticks)")
             logger.info("")
-            broker.load_ticks_streaming(tick_cache_files, chunk_size=100000)
+            broker.load_ticks_streaming(tick_cache_files, chunk_size=100000, required_timeframes=required_timeframes)
         else:
             # TRADITIONAL MODE: Load all ticks into memory (faster but uses more RAM)
             console.print("[yellow]Using TRADITIONAL mode (all ticks loaded into memory)[/yellow]")
@@ -1491,107 +1628,116 @@ def main():
 
             # Load with progress display
             with Live(create_tick_loading_table(), console=console, refresh_per_second=4) as live:
-                broker.load_ticks_from_cache_files(tick_cache_files, progress_callback=progress_callback, live_display=live, table_creator=create_tick_loading_table)
+                broker.load_ticks_from_cache_files(tick_cache_files, progress_callback=progress_callback, live_display=live, table_creator=create_tick_loading_table, required_timeframes=required_timeframes)
 
         console.print("[green]✓ Global tick timeline initialized[/green]\n")
         logger.info("  ✓ Global tick timeline initialized")
         log_memory(logger, "after timeline loading")
         logger.info("")
 
-    # Step 5: Initialize TimeController
-    logger.info("=" * 80)
-    logger.info("STEP 5: Initializing Time Controller")
-    logger.info("=" * 80)
+    # Step 5: Initialize TimeController (if not already initialized in Step 4.5)
+    if not USE_TICK_DATA:
+        logger.info("=" * 80)
+        logger.info("STEP 5: Initializing Time Controller")
+        logger.info("=" * 80)
 
-    # Determine time granularity based on tick data mode
-    time_granularity = TimeGranularity.TICK if USE_TICK_DATA else TimeGranularity.MINUTE
+        # Determine time granularity based on tick data mode
+        time_granularity = TimeGranularity.MINUTE
 
-    # Include position monitor in barrier synchronization
-    # Pass broker for global time advancement
-    time_controller = TimeController(
-        symbols,
-        mode=TIME_MODE,
-        granularity=time_granularity,
-        include_position_monitor=True,
-        broker=broker
-    )
-    logger.info(f"  ✓ TimeController initialized")
-    logger.info(f"  ✓ Time mode: {TIME_MODE.value}")
-    logger.info(f"  ✓ Time granularity: {time_granularity.value}")
-    logger.info(f"  ✓ Barrier participants: {len(symbols)} symbols + 1 position monitor")
-
-    if USE_TICK_DATA:
-        total_ticks = len(broker.global_tick_timeline)
-        logger.info(f"  ✓ Global time advancement: tick-by-tick ({total_ticks:,} ticks)")
-        logger.info(f"  ⚠ Performance: ~{total_ticks:,} time steps (slower but highest fidelity)")
-    else:
+        # Include position monitor in barrier synchronization
+        # Pass broker for global time advancement
+        time_controller = TimeController(
+            symbols,
+            mode=TIME_MODE,
+            granularity=time_granularity,
+            include_position_monitor=True,
+            broker=broker
+        )
+        logger.info(f"  ✓ TimeController initialized")
+        logger.info(f"  ✓ Time mode: {TIME_MODE.value}")
+        logger.info(f"  ✓ Time granularity: {time_granularity.value}")
+        logger.info(f"  ✓ Barrier participants: {len(symbols)} symbols + 1 position monitor")
         logger.info(f"  ✓ Global time advancement: minute-by-minute")
-    logger.info("")
+        logger.info("")
 
-    # Step 6: Initialize trading components
-    logger.info("=" * 80)
-    logger.info("STEP 6: Initializing Trading Components")
-    logger.info("=" * 80)
+        # Step 6: Initialize trading components
+        logger.info("=" * 80)
+        logger.info("STEP 6: Initializing Trading Components")
+        logger.info("=" * 80)
 
-    # RiskManager (initialize first, needed by OrderManager)
-    risk_manager = RiskManager(
-        connector=broker,
-        risk_config=config.risk,
-        persistence=backtest_persistence
-    )
-    logger.info("  ✓ RiskManager initialized")
+        # RiskManager (initialize first, needed by OrderManager)
+        risk_manager = RiskManager(
+            connector=broker,
+            risk_config=config.risk,
+            persistence=backtest_persistence
+        )
+        logger.info("  ✓ RiskManager initialized")
 
-    # OrderManager (with risk_manager for position limit checks)
-    order_manager = OrderManager(
-        connector=broker,
-        magic_number=config.advanced.magic_number,
-        trade_comment=config.advanced.trade_comment,
-        persistence=backtest_persistence,
-        risk_manager=risk_manager  # ✅ Pass risk_manager for position limit checks
-    )
-    logger.info("  ✓ OrderManager initialized (with position limit checks enabled)")
+        # OrderManager (with risk_manager for position limit checks)
+        order_manager = OrderManager(
+            connector=broker,
+            magic_number=config.advanced.magic_number,
+            trade_comment=config.advanced.trade_comment,
+            persistence=backtest_persistence,
+            risk_manager=risk_manager
+        )
+        logger.info("  ✓ OrderManager initialized (with position limit checks enabled)")
 
-    # TechnicalIndicators
-    indicators = TechnicalIndicators()
-    logger.info("  ✓ TechnicalIndicators initialized")
+        # TechnicalIndicators
+        indicators = TechnicalIndicators()
+        logger.info("  ✓ TechnicalIndicators initialized")
 
-    # TradeManager
-    trade_manager = TradeManager(
-        connector=broker,
-        order_manager=order_manager,
-        trailing_config=config.trailing_stop,
-        use_breakeven=config.advanced.use_breakeven,
-        breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
-        indicators=indicators,
-        range_configs=config.range_config.ranges  # ✅ Pass range configs for ATR trailing
-    )
-    logger.info("  ✓ TradeManager initialized (with range-specific ATR timeframes)")
-    logger.info("")
+        # TradeManager
+        trade_manager = TradeManager(
+            connector=broker,
+            order_manager=order_manager,
+            trailing_config=config.trailing_stop,
+            use_breakeven=config.advanced.use_breakeven,
+            breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
+            indicators=indicators,
+            range_configs=config.range_config.ranges
+        )
+        logger.info("  ✓ TradeManager initialized (with range-specific ATR timeframes)")
+        logger.info("")
 
-    # Step 6: Initialize BacktestController
-    logger.info("=" * 80)
-    logger.info("STEP 6: Initializing Backtest Controller")
-    logger.info("=" * 80)
+        # Step 6: Initialize BacktestController
+        logger.info("=" * 80)
+        logger.info("STEP 6: Initializing Backtest Controller")
+        logger.info("=" * 80)
 
-    backtest_controller = BacktestController(
-        simulated_broker=broker,
-        time_controller=time_controller,
-        order_manager=order_manager,
-        risk_manager=risk_manager,
-        trade_manager=trade_manager,
-        indicators=indicators,
-        stop_loss_threshold=STOP_LOSS_THRESHOLD
-    )
+        backtest_controller = BacktestController(
+            simulated_broker=broker,
+            time_controller=time_controller,
+            order_manager=order_manager,
+            risk_manager=risk_manager,
+            trade_manager=trade_manager,
+            indicators=indicators,
+            stop_loss_threshold=STOP_LOSS_THRESHOLD
+        )
 
-    # Initialize with symbols (this creates strategies based on .env configuration)
-    if not backtest_controller.initialize(symbols):
-        logger.error("Failed to initialize BacktestController")
-        logger.error("Check your .env configuration and strategy settings")
-        return False
+        # Initialize with symbols (this creates strategies based on .env configuration)
+        if not backtest_controller.initialize(symbols):
+            logger.error("Failed to initialize BacktestController")
+            logger.error("Check your .env configuration and strategy settings")
+            return False
 
-    logger.info("  ✓ BacktestController initialized")
-    logger.info("  ✓ Strategies loaded from .env configuration")
-    logger.info("")
+        logger.info("  ✓ BacktestController initialized")
+        logger.info("  ✓ Strategies loaded from .env configuration")
+        logger.info("")
+    else:
+        # Already initialized in Step 4.5 for tick mode
+        logger.info("=" * 80)
+        logger.info("STEP 5-6: Components Already Initialized (in Step 4.5)")
+        logger.info("=" * 80)
+        logger.info("  ✓ TimeController, trading components, and strategies already initialized")
+        logger.info("  ✓ Skipping duplicate initialization")
+
+        if USE_TICK_DATA:
+            total_ticks = len(broker.global_tick_timeline)
+            logger.info(f"  ✓ Global time advancement: tick-by-tick ({total_ticks:,} ticks)")
+            logger.info(f"  ⚠ Performance: ~{total_ticks:,} time steps (slower but highest fidelity)")
+        logger.info("=" * 80)
+        logger.info("")
 
     # Step 7: Run backtest
     progress_print("=" * 80, logger)
@@ -1734,6 +1880,10 @@ def main():
     # Restore live mode now that all backtest logging is complete
     from src.utils.logging import set_live_mode
     set_live_mode()
+
+    # PERFORMANCE OPTIMIZATION: Shutdown logger to flush all pending async logs
+    logger.info("Flushing async logs...")
+    logger.shutdown()
 
     return True
 

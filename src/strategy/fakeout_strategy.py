@@ -9,7 +9,7 @@ Implements a fakeout/reversal strategy that requires:
 
 Supports multiple range configurations (4H_5M, 15M_1M) operating independently.
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
@@ -128,6 +128,20 @@ class FakeoutStrategy(BaseStrategy):
 
         # Auto-register validation methods using decorator
         auto_register_validations(self)
+
+    def get_required_timeframes(self) -> List[str]:
+        """
+        Get list of timeframes required by this strategy.
+
+        PERFORMANCE OPTIMIZATION: Only build candles for timeframes we actually use.
+
+        Returns:
+            List of required timeframes
+        """
+        return [
+            self.config.range_config.reference_timeframe,  # e.g., 'M15' or 'H4'
+            self.config.range_config.breakout_timeframe    # e.g., 'M1' or 'M5'
+        ]
 
         # Add divergence check if enabled (conditional validation - hybrid approach)
         if self.config.check_divergence:

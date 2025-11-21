@@ -1,13 +1,21 @@
 ﻿"""
 Candle-related data models.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
 @dataclass
 class CandleData:
-    """OHLCV candle data"""
+    """
+    OHLCV candle data.
+
+    PERFORMANCE OPTIMIZATION #7: Uses __slots__ to reduce memory overhead
+    and improve attribute access speed. Candles are created frequently during
+    backtesting, so this optimization provides significant memory savings.
+    """
+    __slots__ = ('time', 'open', 'high', 'low', 'close', 'volume')
+
     time: datetime
     open: float
     high: float
@@ -32,19 +40,25 @@ class CandleData:
         return self.high - self.low
 
 
-@dataclass
 class ReferenceCandle:
     """
     Generic reference candle for range-based breakout detection.
     Can represent any timeframe (4H, 15M, etc.)
+
+    PERFORMANCE OPTIMIZATION #7: Uses __slots__ to reduce memory overhead.
+    Note: Not using @dataclass to avoid conflicts with __slots__ and default values.
     """
-    time: datetime
-    high: float
-    low: float
-    open: float
-    close: float
-    timeframe: str  # e.g., "H4", "M15"
-    is_processed: bool = False
+    __slots__ = ('time', 'high', 'low', 'open', 'close', 'timeframe', 'is_processed')
+
+    def __init__(self, time: datetime, high: float, low: float, open: float, close: float,
+                 timeframe: str, is_processed: bool = False):
+        self.time = time
+        self.high = high
+        self.low = low
+        self.open = open
+        self.close = close
+        self.timeframe = timeframe
+        self.is_processed = is_processed
 
     @property
     def range(self) -> float:

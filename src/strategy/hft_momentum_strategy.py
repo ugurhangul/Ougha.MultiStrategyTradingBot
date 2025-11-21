@@ -142,6 +142,17 @@ class HFTMomentumStrategy(BaseStrategy):
         # Auto-register validation methods using decorator
         auto_register_validations(self)
 
+    def get_required_timeframes(self) -> List[str]:
+        """
+        Get list of timeframes required by this strategy.
+
+        PERFORMANCE OPTIMIZATION: HFT strategy is tick-only, doesn't use candles.
+
+        Returns:
+            Empty list (no candles required)
+        """
+        return []  # Tick-only strategy, no candles needed
+
     def initialize(self) -> bool:
         """
         Initialize the strategy.

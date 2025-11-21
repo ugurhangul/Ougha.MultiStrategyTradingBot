@@ -191,11 +191,34 @@ class BaseStrategy(ABC):
     def get_symbol(self) -> str:
         """
         Get the trading symbol.
-        
+
         Returns:
             Symbol name
         """
         return self.symbol
+
+    def get_required_timeframes(self) -> List[str]:
+        """
+        Get list of timeframes required by this strategy for candle data.
+
+        PERFORMANCE OPTIMIZATION: This method allows the backtesting engine
+        to only build candles for timeframes that strategies actually use,
+        significantly reducing CPU overhead during tick processing.
+
+        Subclasses should override this method to declare their timeframe requirements.
+
+        Returns:
+            List of timeframe strings (e.g., ['M1', 'M15', 'H1'])
+            Empty list means strategy doesn't use candles (tick-only, like HFT)
+
+        Examples:
+            - FakeoutStrategy (15M/1M): ['M15', 'M1']
+            - TrueBreakoutStrategy (4H/5M): ['H4', 'M5']
+            - HFTMomentumStrategy: [] (tick-only, no candles)
+        """
+        # Default: return empty list (no candles required)
+        # Subclasses should override this
+        return []
 
     def is_ready(self) -> bool:
         """

@@ -9,7 +9,7 @@ Implements a breakout strategy that requires:
 
 Supports multiple range configurations (4H_5M, 15M_1M) operating independently.
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
@@ -137,6 +137,20 @@ class TrueBreakoutStrategy(BaseStrategy):
             symbol,
             strategy_key=self.key
         )
+
+    def get_required_timeframes(self) -> List[str]:
+        """
+        Get list of timeframes required by this strategy.
+
+        PERFORMANCE OPTIMIZATION: Only build candles for timeframes we actually use.
+
+        Returns:
+            List of required timeframes
+        """
+        return [
+            self.config.range_config.reference_timeframe,  # e.g., 'M15' or 'H4'
+            self.config.range_config.breakout_timeframe    # e.g., 'M1' or 'M5'
+        ]
     
     def initialize(self) -> bool:
         """

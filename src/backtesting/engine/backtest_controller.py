@@ -319,21 +319,48 @@ class BacktestController:
         task = progress.add_task("Processing ticks", total=total_ticks)
         console = Console()
 
+        # PERFORMANCE OPTIMIZATION #8: Pre-compute required timeframes for each strategy
+        # This avoids calling hasattr() and get_required_timeframes() on every tick
+        # PERFORMANCE OPTIMIZATION #13: Combine strategy and timeframes into single dict
+        # This reduces dictionary lookups from 2 to 1 per tick
+        strategy_info = {}  # symbol -> (strategy, required_timeframes_set)
+        for symbol, strategy in strategies.items():
+            if hasattr(strategy, 'get_required_timeframes'):
+                required_tfs = strategy.get_required_timeframes()
+                required_tfs_set = set(required_tfs) if required_tfs else None
+            else:
+                required_tfs_set = None  # Legacy strategy - call on every tick
+            strategy_info[symbol] = (strategy, required_tfs_set)
+
         # Use Live display for progress + positions table
         with Live(console=console, refresh_per_second=2, transient=False) as live:
             for tick_idx, tick in enumerate(timeline):
                 # Advance time and build candles on EVERY tick for accuracy
-                # (Candle building is needed for strategies to see completed candles)
-                self._advance_tick_sequential(tick, tick_idx, build_candles=True)
+                # Returns set of timeframes that had new candles formed
+                new_candles = self._advance_tick_sequential(tick, tick_idx, build_candles=True)
 
-                # Call strategy on EVERY tick for accurate signal detection
-                # Strategies have their own event-driven checks (timeframe boundaries)
-                strategy = strategies.get(tick.symbol)
-                if strategy:
-                    try:
-                        signal = strategy.on_tick()
-                    except Exception as e:
-                        self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+                # PERFORMANCE OPTIMIZATION #13: Single dictionary lookup instead of two
+                # Get both strategy and required timeframes in one lookup
+                info = strategy_info.get(tick.symbol)
+                if info:
+                    strategy, required_timeframes = info
+
+                    # Check if strategy needs to be called (using pre-computed timeframes)
+                    if required_timeframes is None:
+                        # Tick-only strategy (e.g., HFT) or legacy - call on every tick
+                        should_call = True
+                    elif new_candles:
+                        # Check if any required timeframe had a new candle
+                        should_call = bool(new_candles.intersection(required_timeframes))
+                    else:
+                        # No new candles formed
+                        should_call = False
+
+                    if should_call:
+                        try:
+                            signal = strategy.on_tick()
+                        except Exception as e:
+                            self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
 
                 # Check for early termination (stop loss threshold)
                 if self.stop_loss_threshold > 0:
@@ -346,11 +373,11 @@ class BacktestController:
                         self.stop_loss_triggered = True
                         break
 
-                # Update progress bar
-                progress.update(task, completed=tick_idx + 1)
-
-                # Update display every 0.5 seconds
+                # PERFORMANCE OPTIMIZATION #18: Update progress and display together
+                # Only update every 1000 ticks instead of every tick
                 if tick_idx % 1000 == 0 or tick_idx == total_ticks - 1:
+                    # Update progress bar
+                    progress.update(task, completed=tick_idx + 1)
                     # Create positions table
                     positions_table = self._create_positions_table()
 
@@ -400,21 +427,47 @@ class BacktestController:
         """Process ticks with plain text progress (fallback when Rich not available)."""
         import time
 
+        # PERFORMANCE OPTIMIZATION #8: Pre-compute required timeframes for each strategy
+        # PERFORMANCE OPTIMIZATION #13: Combine strategy and timeframes into single dict
+        strategy_info = {}  # symbol -> (strategy, required_timeframes_set)
+        for symbol, strategy in strategies.items():
+            if hasattr(strategy, 'get_required_timeframes'):
+                required_tfs = strategy.get_required_timeframes()
+                required_tfs_set = set(required_tfs) if required_tfs else None
+            else:
+                required_tfs_set = None  # Legacy strategy - call on every tick
+            strategy_info[symbol] = (strategy, required_tfs_set)
+
         # Progress tracking
         last_progress_print = 0
         progress_interval = max(1, total_ticks // 1000)  # Print every 0.1%
 
         for tick_idx, tick in enumerate(timeline):
             # Advance time and build candles on EVERY tick for accuracy
-            self._advance_tick_sequential(tick, tick_idx, build_candles=True)
+            # Returns set of timeframes that had new candles formed
+            new_candles = self._advance_tick_sequential(tick, tick_idx, build_candles=True)
 
-            # Call strategy on EVERY tick for accurate signal detection
-            strategy = strategies.get(tick.symbol)
-            if strategy:
-                try:
-                    signal = strategy.on_tick()
-                except Exception as e:
-                    self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+            # PERFORMANCE OPTIMIZATION #13: Single dictionary lookup instead of two
+            info = strategy_info.get(tick.symbol)
+            if info:
+                strategy, required_timeframes = info
+
+                # Check if strategy needs to be called (using pre-computed timeframes)
+                if required_timeframes is None:
+                    # Tick-only strategy (e.g., HFT) or legacy - call on every tick
+                    should_call = True
+                elif new_candles:
+                    # Check if any required timeframe had a new candle
+                    should_call = bool(new_candles.intersection(required_timeframes))
+                else:
+                    # No new candles formed
+                    should_call = False
+
+                if should_call:
+                    try:
+                        signal = strategy.on_tick()
+                    except Exception as e:
+                        self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
 
             # Check for early termination (stop loss threshold)
             if self.stop_loss_threshold > 0:
@@ -467,18 +520,26 @@ class BacktestController:
             tick: GlobalTick object
             tick_idx: Current tick index
             build_candles: Whether to build candles from this tick (default: True)
+
+        Returns:
+            Set of timeframes that had new candles formed (empty set if build_candles=False)
         """
         from src.backtesting.engine.simulated_broker import TickData
 
+        # PERFORMANCE OPTIMIZATION #14: Cache broker reference to reduce attribute lookups
+        broker = self.broker
+
         # Update broker time (no lock needed in sequential mode)
-        self.broker.current_time = tick.time
-        self.broker.current_time_snapshot = tick.time
-        self.broker.current_tick_symbol = tick.symbol
-        self.broker.global_tick_index = tick_idx + 1
+        tick_time = tick.time
+        broker.current_time = tick_time
+        broker.current_time_snapshot = tick_time
+        broker.current_tick_symbol = tick.symbol
+        broker.global_tick_index = tick_idx + 1
 
         # Update current tick for this symbol
-        self.broker.current_ticks[tick.symbol] = TickData(
-            time=tick.time,
+        symbol = tick.symbol
+        broker.current_ticks[symbol] = TickData(
+            time=tick_time,
             bid=tick.bid,
             ask=tick.ask,
             last=tick.last,
@@ -486,14 +547,18 @@ class BacktestController:
             spread=tick.spread
         )
 
-        # PERFORMANCE OPTIMIZATION: Only build candles when strategy will check them
-        # This eliminates 99% of candle building overhead
-        if build_candles and tick.symbol in self.broker.candle_builders:
-            price = tick.last if tick.last > 0 else tick.bid
-            self.broker.candle_builders[tick.symbol].add_tick(price, tick.volume, tick.time)
+        # PERFORMANCE OPTIMIZATION: Build candles and track which timeframes updated
+        new_candles = set()
+        if build_candles:
+            candle_builder = broker.candle_builders.get(symbol)
+            if candle_builder:
+                price = tick.last if tick.last > 0 else tick.bid
+                new_candles = candle_builder.add_tick(price, tick.volume, tick_time)
 
         # Check SL/TP for this symbol's positions
-        self.broker._check_sl_tp_for_tick(tick.symbol, tick, tick.time)
+        broker._check_sl_tp_for_tick(symbol, tick, tick_time)
+
+        return new_candles
 
     def _wait_for_completion(self):
         """
