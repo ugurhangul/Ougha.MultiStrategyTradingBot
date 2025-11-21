@@ -22,6 +22,7 @@ from src.config.configs import (
     VolumeConfig,
     DivergenceConfig,
     HFTMomentumConfig,
+    TickArchiveConfig,
 )
 
 
@@ -217,6 +218,17 @@ class TradingConfig:
 
         # Symbol-specific optimization enabled
         self.use_symbol_specific_settings: bool = os.getenv('USE_SYMBOL_SPECIFIC_SETTINGS', 'true').lower() == 'true'
+
+        # Tick archive configuration (for backtesting)
+        self.tick_archive = TickArchiveConfig(
+            enabled=os.getenv('TICK_ARCHIVE_ENABLED', 'false').lower() == 'true',
+            archive_url_pattern=os.getenv('TICK_ARCHIVE_URL_PATTERN',
+                'https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{BROKER}_{SYMBOL}_{YEAR}.zip'),
+            download_timeout_seconds=int(os.getenv('TICK_ARCHIVE_TIMEOUT', '300')),
+            max_retries=int(os.getenv('TICK_ARCHIVE_MAX_RETRIES', '3')),
+            save_downloaded_archives=os.getenv('TICK_ARCHIVE_SAVE', 'true').lower() == 'true',
+            archive_cache_dir=os.getenv('TICK_ARCHIVE_CACHE_DIR', 'data/tick_archives')
+        )
 
     def load_symbols_from_active_set(self, file_path: str = "data/active.set", connector=None, logger=None) -> bool:
         """

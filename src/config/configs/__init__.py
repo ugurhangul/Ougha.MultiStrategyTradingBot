@@ -16,40 +16,44 @@ from src.config.configs.logging_config import LoggingConfig
 from src.config.configs.adaptive_config import AdaptiveFilterConfig, SymbolAdaptationConfig
 from src.config.configs.volume_divergence_config import VolumeConfig, DivergenceConfig
 from src.config.configs.hft_momentum_config import HFTMomentumConfig
+from src.config.configs.tick_archive_config import TickArchiveConfig
 
 __all__ = [
     # MT5 Configuration
     'MT5Config',
-    
+
     # Strategy Configuration
     'StrategyConfig',
     'StrategyEnableConfig',
-    
+
     # Risk Management
     'RiskConfig',
     'TrailingStopConfig',
-    
+
     # Trading Hours
     'TradingHoursConfig',
-    
+
     # Advanced Settings
     'AdvancedConfig',
-    
+
     # Range Configuration
     'RangeConfigSettings',
-    
+
     # Logging
     'LoggingConfig',
-    
+
     # Adaptive Filters
     'AdaptiveFilterConfig',
     'SymbolAdaptationConfig',
-    
+
     # Volume & Divergence
     'VolumeConfig',
     'DivergenceConfig',
-    
+
     # HFT Momentum
     'HFTMomentumConfig',
+
+    # Tick Archive
+    'TickArchiveConfig',
 ]
 

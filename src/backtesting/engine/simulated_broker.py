@@ -441,7 +441,97 @@ class SimulatedBroker:
 
         self.logger.info(f"Loaded {len(ticks):,} ticks for {symbol}")
 
-    def load_ticks_from_cache_files(self, cache_files: dict):
+    def load_ticks_streaming(self, cache_files: dict, chunk_size: int = 100000):
+        """
+        Initialize streaming tick mode - ticks are read from disk on-demand.
+
+        This is the most memory-efficient mode for long backtests.
+        Memory usage: ~2-3 GB instead of ~20-30 GB for full year backtest.
+
+        Args:
+            cache_files: Dict mapping symbol -> parquet file path
+            chunk_size: Number of ticks to read per chunk (default: 100,000)
+        """
+        from src.backtesting.engine.streaming_tick_loader import StreamingTickTimeline
+        import psutil
+        import os
+
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+
+        self.logger.info("=" * 60)
+        self.logger.info("Initializing STREAMING tick mode (memory-efficient)...")
+        self.logger.info(f"  Memory before initialization: {mem_before:.1f} MB")
+        self.logger.info(f"  Chunk size: {chunk_size:,} ticks")
+        self.logger.info("")
+
+        # Create streaming timeline
+        self.logger.info("Counting ticks in cache files...")
+        streaming_timeline = StreamingTickTimeline(cache_files, chunk_size)
+
+        total_ticks = len(streaming_timeline)
+        self.logger.info(f"  Total ticks to stream: {total_ticks:,}")
+        self.logger.info("")
+
+        # Set as global timeline (it's iterable like a list)
+        self.global_tick_timeline = streaming_timeline
+        self.global_tick_index = 0
+        self.use_tick_data = True
+
+        # Initialize candle builders
+        self.logger.info("Initializing real-time candle builders...")
+        timeframes = ['M1', 'M5', 'M15', 'H1', 'H4']
+
+        # Define maximum lookback candles for seeding (to avoid loading entire history)
+        # This provides enough history for indicators while keeping memory usage low
+        max_lookback_candles = {
+            'M1': 500,   # ~8 hours of M1 candles
+            'M5': 500,   # ~42 hours of M5 candles
+            'M15': 500,  # ~5 days of M15 candles
+            'H1': 500,   # ~21 days of H1 candles
+            'H4': 200    # ~33 days of H4 candles
+        }
+
+        for symbol in cache_files.keys():
+            self.candle_builders[symbol] = MultiTimeframeCandleBuilder(symbol, timeframes)
+
+            # Pre-seed with LIMITED historical OHLC data (only recent lookback period)
+            for tf in timeframes:
+                data_key = (symbol, tf)
+                if data_key in self.symbol_data:
+                    # Get only the LAST N candles for seeding (not entire history)
+                    full_historical_df = self.symbol_data[data_key]
+                    max_candles = max_lookback_candles.get(tf, 200)
+
+                    # Take only the last N candles
+                    if len(full_historical_df) > max_candles:
+                        historical_df = full_historical_df.iloc[-max_candles:].copy()
+                        self.logger.info(f"  ✓ {symbol} {tf}: Seeded with {len(historical_df)} recent candles (limited from {len(full_historical_df)} total)")
+                    else:
+                        historical_df = full_historical_df.copy()
+                        self.logger.info(f"  ✓ {symbol} {tf}: Seeded with {len(historical_df)} historical candles")
+
+                    if len(historical_df) > 0:
+                        self.candle_builders[symbol].seed_historical_candles(tf, historical_df)
+
+            self.logger.info(f"  ✓ {symbol}: Candle builder initialized for {len(timeframes)} timeframes")
+
+        # Set initial time (we'll get it from first tick during execution)
+        self.current_time = None
+        self.current_time_snapshot = None
+
+        # Enable trading for all symbols
+        for symbol in cache_files.keys():
+            self.trading_enabled_symbols[symbol] = True
+
+        mem_after = process.memory_info().rss / 1024 / 1024  # MB
+        self.logger.info("")
+        self.logger.info(f"  Memory after initialization: {mem_after:.1f} MB")
+        self.logger.info(f"  Memory used: {mem_after - mem_before:.1f} MB")
+        self.logger.info("=" * 60)
+        self.logger.info("")
+
+    def load_ticks_from_cache_files(self, cache_files: dict, progress_callback=None, live_display=None, table_creator=None):
         """
         Load ticks directly from cached parquet files and merge into global timeline.
 
@@ -450,6 +540,9 @@ class SimulatedBroker:
 
         Args:
             cache_files: Dict mapping symbol -> parquet file path
+            progress_callback: Optional callback(symbol, status, ticks, message, total_ticks) for progress updates
+            live_display: Optional Rich Live display object to update
+            table_creator: Optional function to create updated table for live display
         """
         import psutil
         import os
@@ -469,14 +562,30 @@ class SimulatedBroker:
             cache_path = Path(cache_file)
             if not cache_path.exists():
                 self.logger.warning(f"  Cache file not found: {cache_file}")
+                if progress_callback:
+                    progress_callback(symbol, 'error', 0, 'Cache file not found')
+                    if live_display and table_creator:
+                        live_display.update(table_creator())
                 continue
 
             self.logger.info(f"  Loading {symbol} from {cache_path.name}...")
+
+            # Update progress: loading
+            if progress_callback:
+                progress_callback(symbol, 'loading', 0, '')
+                if live_display and table_creator:
+                    live_display.update(table_creator())
 
             # Read parquet file
             df = pd.read_parquet(cache_path)
 
             self.logger.info(f"    {len(df):,} ticks loaded")
+
+            # Update progress: loaded, now converting
+            if progress_callback:
+                progress_callback(symbol, 'converting', len(df), '', total_ticks=len(df))
+                if live_display and table_creator:
+                    live_display.update(table_creator())
 
             # PERFORMANCE OPTIMIZATION: Vectorized conversion (50-100x faster than iterrows)
             # Convert DataFrame to GlobalTick objects using vectorized operations
@@ -489,6 +598,12 @@ class SimulatedBroker:
             conversion_time = time.time() - start_time
             ticks_per_sec = len(df) / conversion_time if conversion_time > 0 else 0
             self.logger.info(f"    Converted in {conversion_time:.2f}s ({ticks_per_sec:,.0f} ticks/sec)")
+
+            # Update progress: complete
+            if progress_callback:
+                progress_callback(symbol, 'complete', len(df), f'Converted in {conversion_time:.2f}s ({ticks_per_sec:,.0f} ticks/sec)', total_ticks=len(df))
+                if live_display and table_creator:
+                    live_display.update(table_creator())
 
             # Clear DataFrame to free memory immediately
             del df
@@ -505,23 +620,41 @@ class SimulatedBroker:
         # Initialize candle builders for each symbol and pre-seed with historical data
         self.logger.info("  Initializing real-time candle builders...")
         timeframes = ['M1', 'M5', 'M15', 'H1', 'H4']
+
+        # Define maximum lookback candles for seeding (to avoid loading entire history)
+        # This provides enough history for indicators while keeping memory usage low
+        max_lookback_candles = {
+            'M1': 500,   # ~8 hours of M1 candles
+            'M5': 500,   # ~42 hours of M5 candles
+            'M15': 500,  # ~5 days of M15 candles
+            'H1': 500,   # ~21 days of H1 candles
+            'H4': 200    # ~33 days of H4 candles
+        }
+
         for symbol in cache_files.keys():
             self.candle_builders[symbol] = MultiTimeframeCandleBuilder(symbol, timeframes)
 
-            # Pre-seed with historical OHLC data from cache
-            # This gives strategies enough candle history from the start
+            # Pre-seed with LIMITED historical OHLC data from cache
+            # This gives strategies enough candle history from the start without loading entire dataset
             first_tick_time = all_ticks[0].time if len(all_ticks) > 0 else None
             if first_tick_time:
                 for tf in timeframes:
                     data_key = (symbol, tf)
                     if data_key in self.symbol_data:
-                        # Get all candles before the first tick
-                        historical_df = self.symbol_data[data_key]
-                        historical_df = historical_df[historical_df['time'] < first_tick_time].copy()
+                        # Get candles before the first tick
+                        full_historical_df = self.symbol_data[data_key]
+                        historical_df = full_historical_df[full_historical_df['time'] < first_tick_time].copy()
+
+                        # Limit to last N candles only (not entire history)
+                        max_candles = max_lookback_candles.get(tf, 200)
+                        if len(historical_df) > max_candles:
+                            historical_df = historical_df.iloc[-max_candles:].copy()
+                            self.logger.info(f"    ✓ {symbol} {tf}: Seeded with {len(historical_df)} recent candles (limited from {len(full_historical_df[full_historical_df['time'] < first_tick_time])} total)")
+                        elif len(historical_df) > 0:
+                            self.logger.info(f"    ✓ {symbol} {tf}: Seeded with {len(historical_df)} historical candles")
 
                         if len(historical_df) > 0:
                             self.candle_builders[symbol].seed_historical_candles(tf, historical_df)
-                            self.logger.info(f"    ✓ {symbol} {tf}: Seeded with {len(historical_df)} historical candles")
 
             self.logger.info(f"    ✓ {symbol}: Candle builder initialized for {len(timeframes)} timeframes")
 
