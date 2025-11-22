@@ -271,11 +271,10 @@ class SimulatedBroker:
         self.symbols_with_data_next: Set[str] = set()     # Written during barrier
         self.bitmap_swap_lock = threading.Lock()          # Only for atomic swap
 
-        # TICK-LEVEL BACKTESTING: Global tick timeline
+        # TICK-LEVEL BACKTESTING: Global tick timeline (always enabled)
         # All ticks from all symbols merged into single chronologically-sorted timeline
         self.global_tick_timeline: List[GlobalTick] = []  # Merged tick timeline
         self.global_tick_index: int = 0                   # Current position in timeline
-        self.use_tick_data: bool = False                  # Flag to enable tick-level mode
         self.current_tick_symbol: Optional[str] = None    # Symbol that owns current tick
 
         # TICK-LEVEL BACKTESTING: Per-symbol tick data
@@ -453,7 +452,8 @@ class SimulatedBroker:
 
     def load_ticks_streaming(self, cache_files: dict, chunk_size: int = 100000, required_timeframes: Optional[List[str]] = None,
                             start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
-                            cache_dir: Optional[str] = None, tick_type_name: str = "INFO"):
+                            cache_dir: Optional[str] = None, tick_type_name: str = "INFO",
+                            symbols: Optional[List[str]] = None, simulation_start_date: Optional[datetime] = None):
         """
         Initialize streaming tick mode - ticks are read from disk on-demand.
 
@@ -465,10 +465,14 @@ class SimulatedBroker:
             chunk_size: Number of ticks to read per chunk (default: 100,000)
             required_timeframes: List of timeframes to build (default: all timeframes)
                                 PERFORMANCE OPTIMIZATION: Only build timeframes that strategies use
-            start_date: Optional start date filter (only stream ticks >= this date)
+            start_date: Optional start date for loading data (includes historical buffer for indicators)
             end_date: Optional end date filter (only stream ticks <= this date)
             cache_dir: Root cache directory (NEW - for date hierarchy support)
             tick_type_name: Tick type name (e.g., 'INFO', 'ALL', 'TRADE')
+            symbols: Optional list of symbols to load (filters the cache directory scan)
+            simulation_start_date: Optional start date for actual simulation (trades only execute >= this date)
+                                  If None, uses start_date. This allows loading historical buffer data
+                                  for indicator warmup without simulating trades during that period.
         """
         from src.backtesting.engine.streaming_tick_loader import StreamingTickTimeline
         import psutil
@@ -481,14 +485,23 @@ class SimulatedBroker:
         self.logger.info("Initializing STREAMING tick mode (memory-efficient)...")
         self.logger.info(f"  Memory before initialization: {mem_before:.1f} MB")
         self.logger.info(f"  Chunk size: {chunk_size:,} ticks")
+
+        # Determine actual simulation start date
+        actual_simulation_start = simulation_start_date if simulation_start_date else start_date
+
         if start_date or end_date:
-            self.logger.info(f"  Date range filter: {start_date.date() if start_date else 'any'} to {end_date.date() if end_date else 'any'}")
+            self.logger.info(f"  Data loading range: {start_date.date() if start_date else 'any'} to {end_date.date() if end_date else 'any'}")
+        if simulation_start_date and simulation_start_date != start_date:
+            buffer_days = (simulation_start_date - start_date).days if start_date else 0
+            self.logger.info(f"  Simulation range: {simulation_start_date.date()} to {end_date.date() if end_date else 'any'}")
+            self.logger.info(f"  Historical buffer: {buffer_days} days (for indicator warmup)")
         self.logger.info("")
 
         # Create streaming timeline with date filtering
+        # Use simulation_start_date for the timeline (actual trades), not start_date (data loading)
         self.logger.info("Counting ticks in cache files...")
-        streaming_timeline = StreamingTickTimeline(cache_files, chunk_size, start_date, end_date,
-                                                   cache_dir, tick_type_name)
+        streaming_timeline = StreamingTickTimeline(cache_files, chunk_size, actual_simulation_start, end_date,
+                                                   cache_dir, tick_type_name, symbols)
 
         total_ticks = len(streaming_timeline)
         self.logger.info(f"  Total ticks to stream: {total_ticks:,}")
@@ -497,7 +510,6 @@ class SimulatedBroker:
         # Set as global timeline (it's iterable like a list)
         self.global_tick_timeline = streaming_timeline
         self.global_tick_index = 0
-        self.use_tick_data = True
 
         # Initialize candle builders
         self.logger.info("Initializing real-time candle builders...")
@@ -522,7 +534,9 @@ class SimulatedBroker:
             'H4': 200    # ~33 days of H4 candles
         }
 
-        for symbol in cache_files.keys():
+        # BUGFIX: Use streaming_timeline.loader.symbols instead of cache_files.keys()
+        # because cache_files is empty when using cache_dir mode
+        for symbol in streaming_timeline.loader.symbols:
             self.candle_builders[symbol] = MultiTimeframeCandleBuilder(symbol, timeframes)
 
             # Pre-seed with LIMITED historical OHLC data (only recent lookback period)
@@ -648,7 +662,6 @@ class SimulatedBroker:
 
         self.global_tick_timeline = all_ticks
         self.global_tick_index = 0
-        self.use_tick_data = True
 
         # Initialize candle builders for each symbol and pre-seed with historical data
         self.logger.info("  Initializing real-time candle builders...")
@@ -811,7 +824,6 @@ class SimulatedBroker:
 
         self.global_tick_timeline = all_ticks
         self.global_tick_index = 0
-        self.use_tick_data = True
 
         # Initialize candle builders for each symbol and pre-seed with historical data
         self.logger.info("  Initializing real-time candle builders...")
@@ -968,8 +980,8 @@ class SimulatedBroker:
         """
         Get historical candles for a symbol and timeframe.
 
-        TICK MODE: Returns dynamically-built candles from tick data (real-time candle building)
-        CANDLE MODE: Returns pre-loaded data for the requested timeframe up to current simulation time
+        Returns dynamically-built candles from tick data (real-time candle building).
+        Candles are built from ticks using MultiTimeframeCandleBuilder.
 
         Args:
             symbol: Symbol name
@@ -979,12 +991,11 @@ class SimulatedBroker:
         Returns:
             DataFrame with OHLC data or None
         """
-        # TICK MODE: Use real-time candle builders
-        if self.use_tick_data and symbol in self.candle_builders:
+        # Use real-time candle builders (built from ticks)
+        if symbol in self.candle_builders:
             return self.candle_builders[symbol].get_candles(timeframe, count)
 
-        # CANDLE MODE: Use pre-loaded data
-        # Check if we have data for this symbol and timeframe
+        # Fallback: Use pre-loaded data (for currency conversion pairs, etc.)
         data_key = (symbol, timeframe)
         if data_key not in self.symbol_data:
             return None
@@ -1031,8 +1042,8 @@ class SimulatedBroker:
         """
         Get the latest closed candle for a symbol and timeframe.
 
-        TICK MODE: Returns latest closed candle from real-time candle builder
-        CANDLE MODE: Returns latest candle from pre-loaded data
+        Returns latest closed candle from real-time candle builder (built from ticks).
+        Falls back to pre-loaded data for currency conversion pairs if needed.
 
         Args:
             symbol: Symbol name
@@ -1041,42 +1052,51 @@ class SimulatedBroker:
         Returns:
             CandleData or None
         """
-        # TICK MODE: Use real-time candle builders
-        if self.use_tick_data and symbol in self.candle_builders:
-            # Default to M1 if timeframe is empty
-            tf = timeframe if timeframe else 'M1'
-            return self.candle_builders[symbol].get_latest_candle(tf)
+        try:
+            # Use real-time candle builders (built from ticks)
+            if symbol in self.candle_builders:
+                # Default to M1 if timeframe is empty
+                tf = timeframe if timeframe else 'M1'
+                return self.candle_builders[symbol].get_latest_candle(tf)
 
-        # CANDLE MODE: Use pre-loaded data
-        # Default to M1 if timeframe is empty or not specified
-        if not timeframe or timeframe == 'M1':
-            data_key = (symbol, 'M1')
-            if data_key not in self.symbol_data:
-                return None
+            # Fallback: Use pre-loaded data (for currency conversion pairs, etc.)
+            # Default to M1 if timeframe is empty or not specified
+            if not timeframe or timeframe == 'M1':
+                data_key = (symbol, 'M1')
+                if data_key not in self.symbol_data:
+                    return None
 
-            current_idx = self.current_indices.get(symbol, 0)
-            m1_data = self.symbol_data[data_key]
+                current_idx = self.current_indices.get(symbol, 0)
+                m1_data = self.symbol_data[data_key]
 
-            if current_idx >= len(m1_data):
-                return None
+                # current_idx points to the next bar (after current time)
+                # We want the latest CLOSED bar, which is at current_idx - 1
+                latest_closed_idx = current_idx - 1
 
-            row = m1_data.iloc[current_idx]
-        else:
-            # For higher timeframes, get the latest candle up to current time
-            candles = self.get_candles(symbol, timeframe, count=1)
-            if candles is None or len(candles) == 0:
-                return None
+                if latest_closed_idx < 0 or latest_closed_idx >= len(m1_data):
+                    return None
 
-            row = candles.iloc[-1]
+                row = m1_data.iloc[latest_closed_idx]
+            else:
+                # For higher timeframes, get the latest candle up to current time
+                candles = self.get_candles(symbol, timeframe, count=1)
+                if candles is None or len(candles) == 0:
+                    return None
 
-        return CandleData(
-            time=row['time'] if isinstance(row['time'], datetime) else pd.to_datetime(row['time']).to_pydatetime(),
-            open=float(row['open']),
-            high=float(row['high']),
-            low=float(row['low']),
-            close=float(row['close']),
-            volume=int(row.get('volume', row.get('tick_volume', 0)))
-        )
+                row = candles.iloc[-1]
+
+            return CandleData(
+                time=row['time'] if isinstance(row['time'], datetime) else pd.to_datetime(row['time']).to_pydatetime(),
+                open=float(row['open']),
+                high=float(row['high']),
+                low=float(row['low']),
+                close=float(row['close']),
+                volume=int(row.get('volume', row.get('tick_volume', 0)))
+            )
+        except (IndexError, KeyError) as e:
+            # Handle edge case where data structures are not yet initialized
+            self.logger.warning(f"Could not get latest candle for {symbol} {timeframe}: {e}")
+            return None
 
     # ========================================================================
     # Symbol Info Methods (MT5Connector interface)
@@ -1168,7 +1188,7 @@ class SimulatedBroker:
 
                 info = self.symbol_info[pos.symbol]
                 # Notional value = volume * contract_size * current_price
-                notional = pos.volume * info.contract_size * pos.price_open
+                notional = pos.volume * info.contract_size * pos.open_price
                 # Assume 100:1 leverage
                 used_margin += notional / 100.0
 
@@ -1339,44 +1359,50 @@ class SimulatedBroker:
         Returns:
             Current price or None
         """
-        # TICK-LEVEL MODE: Return price from current tick
-        if self.use_tick_data and symbol in self.current_ticks:
-            tick = self.current_ticks[symbol]
-            if price_type == 'bid':
-                return tick.bid
-            elif price_type == 'ask':
-                return tick.ask
-            elif price_type == 'mid':
-                return tick.mid
-            else:
-                return tick.bid  # Default to bid
+        try:
+            # Return price from current tick (always available in tick mode)
+            if symbol in self.current_ticks:
+                tick = self.current_ticks[symbol]
+                if price_type == 'bid':
+                    return tick.bid
+                elif price_type == 'ask':
+                    return tick.ask
+                elif price_type == 'mid':
+                    return tick.mid
+                else:
+                    return tick.bid  # Default to bid
 
-        # CANDLE MODE: Return price from latest candle
-        candle = self.get_latest_candle(symbol, "")
-        if not candle:
-            # Try to get price from inverse pair for currency conversion
-            # This is useful for pairs like JPYUSD (inverse of USDJPY)
-            inverse_price = self._try_inverse_pair_price(symbol, price_type)
-            if inverse_price is not None:
-                return inverse_price
+            # Fallback: Return price from latest candle (for currency conversion pairs, etc.)
+            candle = self.get_latest_candle(symbol, "")
+            if not candle:
+                # Try to get price from inverse pair for currency conversion
+                # This is useful for pairs like JPYUSD (inverse of USDJPY)
+                inverse_price = self._try_inverse_pair_price(symbol, price_type)
+                if inverse_price is not None:
+                    return inverse_price
+                return None
+
+            # Use close price as base
+            base_price = candle.close
+
+            # Apply spread
+            if symbol in self.symbol_info:
+                point = self.symbol_info[symbol].point
+                # Use actual spread for this symbol
+                spread_points = self.symbol_spreads.get(symbol, self.default_spread_points)
+                spread = spread_points * point
+
+                if price_type == 'bid':
+                    return base_price
+                else:  # ask
+                    return base_price + spread
+
+            return base_price
+        except (IndexError, KeyError) as e:
+            # Handle edge case where data structures are not yet initialized
+            # This can happen during strategy initialization before tick data is loaded
+            self.logger.warning(f"Could not get current price for {symbol}: {e}")
             return None
-
-        # Use close price as base
-        base_price = candle.close
-
-        # Apply spread
-        if symbol in self.symbol_info:
-            point = self.symbol_info[symbol].point
-            # Use actual spread for this symbol
-            spread_points = self.symbol_spreads.get(symbol, self.default_spread_points)
-            spread = spread_points * point
-
-            if price_type == 'bid':
-                return base_price
-            else:  # ask
-                return base_price + spread
-
-        return base_price
 
     def get_spread(self, symbol: str) -> Optional[float]:
         """Get spread in points for the specified symbol."""
@@ -1496,7 +1522,8 @@ class SimulatedBroker:
             OrderResult with execution details
         """
         try:
-            return self._place_market_order_impl(symbol, order_type, volume, sl, tp, magic_number, comment)
+            result = self._place_market_order_impl(symbol, order_type, volume, sl, tp, magic_number, comment)
+            return result
         except Exception as e:
             self.logger.error(
                 f"[BACKTEST] EXCEPTION in place_market_order for {symbol}: {type(e).__name__}: {e}"
@@ -1923,9 +1950,7 @@ class SimulatedBroker:
         """
         Check if position hit SL or TP using intra-bar accuracy.
 
-        TICK MODE: Uses the current (incomplete) M1 candle for real-time high/low
-        CANDLE MODE: Uses the latest closed M1 bar to detect SL/TP hits
-
+        Uses the current (incomplete) M1 candle for real-time high/low detection.
         This is more realistic than only checking the close price, as it
         accounts for price wicks that touch SL/TP levels.
 
@@ -1933,8 +1958,8 @@ class SimulatedBroker:
             True if SL or TP was hit
         """
         # Get the current M1 candle for intra-bar high/low
-        # In tick mode, use current (incomplete) candle for real-time accuracy
-        if self.use_tick_data and position.symbol in self.candle_builders:
+        # Use current (incomplete) candle for real-time accuracy
+        if position.symbol in self.candle_builders:
             candle = self.candle_builders[position.symbol].get_current_candle('M1')
         else:
             candle = self.get_latest_candle(position.symbol, "M1")
@@ -2020,8 +2045,9 @@ class SimulatedBroker:
         """
         Check if a symbol has data at the current global time.
 
-        TICK MODE: Returns True only if this symbol owns the current tick
-        CANDLE MODE: Returns True if symbol has a bar at current_time
+        Returns True only if this symbol owns the current tick.
+        In tick-based backtesting, only one symbol processes at a time (the symbol
+        that owns the current tick in the global timeline).
 
         OPTIMIZATIONS APPLIED:
         - #1: Uses pre-computed timestamps (no Pandas access, no timestamp conversion)
@@ -2039,24 +2065,16 @@ class SimulatedBroker:
         Returns:
             True if symbol has data at current_time, False otherwise
         """
-        # TICK MODE: Check if this symbol owns the current tick
-        if self.use_tick_data:
-            # In tick mode, only the symbol that owns the current tick should process it
-            # All other symbols wait at the barrier without processing
-            return symbol == self.current_tick_symbol
-
-        # CANDLE MODE: Check bitmap for bar at current time
-        # OPTIMIZATION #3b: Lock-free read from stable buffer
-        # No lock needed - we read from the 'current' buffer which is stable
-        # The swap happens atomically, so we always see a consistent state
-        return symbol in self.symbols_with_data_current
+        # Check if this symbol owns the current tick
+        # Only the symbol that owns the current tick should process it
+        # All other symbols wait at the barrier without processing
+        return symbol == self.current_tick_symbol
 
     def has_more_data(self, symbol: str) -> bool:
         """
         Check if a symbol has any more data available.
 
-        TICK MODE: Checks if there are more ticks in the global timeline
-        CANDLE MODE: Uses cached data length for fast check
+        Checks if there are more ticks in the global timeline.
 
         Args:
             symbol: Symbol to check
@@ -2067,27 +2085,17 @@ class SimulatedBroker:
         import threading
         tid = threading.current_thread().name
         with self.time_lock:
-            # TICK MODE: Check global tick timeline
-            if self.use_tick_data:
-                # In tick mode, all symbols share the same global timeline
-                # Check if there are more ticks to process
-                result = self.global_tick_index < len(self.global_tick_timeline)
-                return result
-
-            # CANDLE MODE: Check per-symbol data
-            if symbol not in self.current_indices:
-                return False
-
-            # Fast bounds check using cached length
-            current_idx = self.current_indices[symbol]
-            data_length = self.symbol_data_lengths.get(symbol, 0)
-
-            # Check if there's more data after current index
-            result = current_idx < data_length - 1
+            # Check global tick timeline
+            # All symbols share the same global timeline
+            # Check if there are more ticks to process
+            result = self.global_tick_index < len(self.global_tick_timeline)
             return result
 
     def advance_global_time(self) -> bool:
         """
+        DEPRECATED: This method was used for candle-based backtesting (minute-by-minute).
+        Candle mode has been removed. Use advance_global_time_tick_by_tick() instead.
+
         Advance global time by one minute.
 
         This is called once per barrier cycle (not per symbol).
@@ -2223,6 +2231,35 @@ class SimulatedBroker:
                 # Use 'last' price if available, otherwise use 'bid'
                 price = next_tick.last if next_tick.last > 0 else next_tick.bid
                 self.candle_builders[next_tick.symbol].add_tick(price, next_tick.volume, next_tick.time)
+
+            # IMPORTANT: Advance current_indices for symbols that only have M1 candle data (e.g., conversion pairs)
+            # These symbols don't have tick data, so their indices need to be advanced based on time
+            # This ensures get_latest_candle() returns current data for currency conversion
+            # OPTIMIZATION: Only check when minute changes (M1 bar boundary)
+            current_minute = self.current_time.replace(second=0, microsecond=0)
+            if not hasattr(self, '_last_minute_check') or self._last_minute_check != current_minute:
+                self._last_minute_check = current_minute
+
+                for symbol in self.current_indices.keys():
+                    # Skip symbols with tick data (they're handled by candle builders)
+                    if symbol in self.candle_builders:
+                        continue
+
+                    # For symbols with only M1 candle data, advance index if bar time matches current time
+                    current_idx = self.current_indices[symbol]
+                    data_length = self.symbol_data_lengths.get(symbol, 0)
+
+                    if current_idx < data_length:
+                        bar_time = self.symbol_timestamps[symbol][current_idx]
+                        # Advance if bar time is at or before current time
+                        # This keeps conversion pairs synchronized with the backtest time
+                        while current_idx < data_length and bar_time <= self.current_time:
+                            current_idx += 1
+                            if current_idx < data_length:
+                                bar_time = self.symbol_timestamps[symbol][current_idx]
+
+                        # Update the index (now pointing to the next bar after current time)
+                        self.current_indices[symbol] = current_idx
 
             # PERFORMANCE OPTIMIZATION: LAZY P&L UPDATES
             # Don't update P&L on every tick - only when queried or checking SL/TP
@@ -2520,25 +2557,11 @@ class SimulatedBroker:
         """
         Check if more data is available for a symbol.
 
-        TICK MODE: Checks if there are more ticks in the global timeline
-        CANDLE MODE: Checks if symbol has more M1 candles
+        Checks if there are more ticks in the global timeline.
         """
-        # TICK MODE: Check global tick timeline
-        if self.use_tick_data:
-            # In tick mode, all symbols share the same global timeline
-            return self.global_tick_index < len(self.global_tick_timeline)
-
-        # CANDLE MODE: Check per-symbol M1 data
-        if symbol not in self.current_indices:
-            return False
-
-        # Get M1 data for this symbol
-        m1_data_key = (symbol, 'M1')
-        if m1_data_key not in self.symbol_data:
-            return False
-
-        m1_data = self.symbol_data[m1_data_key]
-        return self.current_indices[symbol] < len(m1_data) - 1
+        # Check global tick timeline
+        # All symbols share the same global timeline
+        return self.global_tick_index < len(self.global_tick_timeline)
 
     # ========================================================================
     # Statistics Methods

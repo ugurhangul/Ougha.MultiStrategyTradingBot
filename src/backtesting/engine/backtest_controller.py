@@ -98,7 +98,7 @@ class BacktestController:
         # Track length of last printed progress line to overwrite cleanly
         self._last_progress_len: int = 0
 
-        # ETA CALCULATION: Moving average window for candle mode
+        # ETA CALCULATION: Moving average window for progress tracking
         from collections import deque
         import time
         self.eta_window_size = 100  # Track last 100 progress updates for moving average
@@ -342,6 +342,7 @@ class BacktestController:
                 # PERFORMANCE OPTIMIZATION #13: Single dictionary lookup instead of two
                 # Get both strategy and required timeframes in one lookup
                 info = strategy_info.get(tick.symbol)
+
                 if info:
                     strategy, required_timeframes = info
 
@@ -361,6 +362,8 @@ class BacktestController:
                             signal = strategy.on_tick()
                         except Exception as e:
                             self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+                            import traceback
+                            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
                 # Check for early termination (stop loss threshold)
                 if self.stop_loss_threshold > 0:
@@ -465,9 +468,17 @@ class BacktestController:
 
                 if should_call:
                     try:
+                        # DEBUG: Log that we're calling on_tick
+                        if tick_idx < 100 or tick_idx % 10000 == 0:
+                            self.logger.warning(f"[DEBUG] Calling on_tick() for {tick.symbol} at tick {tick_idx}")
                         signal = strategy.on_tick()
+                        # DEBUG: Log if signal was returned (though orchestrator doesn't return signals)
+                        if signal is not None and (tick_idx < 100 or tick_idx % 10000 == 0):
+                            self.logger.warning(f"[DEBUG] on_tick() returned signal: {signal}")
                     except Exception as e:
                         self.logger.error(f"Error in strategy.on_tick() for {tick.symbol}: {e}")
+                        import traceback
+                        self.logger.error(f"Traceback: {traceback.format_exc()}")
 
             # Check for early termination (stop loss threshold)
             if self.stop_loss_threshold > 0:
@@ -594,16 +605,11 @@ class BacktestController:
             TimeRemainingColumn(),
         )
 
-        # Determine total for progress bar
-        if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
-            # Tick mode: use total ticks
-            if hasattr(self.broker, 'global_tick_timeline'):
-                total = len(self.broker.global_tick_timeline)
-            else:
-                total = 100  # Fallback to percentage
+        # Determine total for progress bar (use total ticks)
+        if hasattr(self.broker, 'global_tick_timeline'):
+            total = len(self.broker.global_tick_timeline)
         else:
-            # Candle mode: use time-based progress (0-100)
-            total = 100
+            total = 100  # Fallback to percentage
 
         task = progress.add_task("Backtesting", total=total)
         console = Console()
@@ -652,12 +658,8 @@ class BacktestController:
                 # Update progress bar
                 current_progress = self._get_current_progress()
                 if current_progress is not None:
-                    if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
-                        # Tick mode: update with tick count
-                        progress.update(task, completed=current_progress)
-                    else:
-                        # Candle mode: update with percentage
-                        progress.update(task, completed=current_progress)
+                    # Update with tick count
+                    progress.update(task, completed=current_progress)
 
                 # Update task description with live stats
                 stats_text = self._get_progress_stats_text()
@@ -745,20 +747,9 @@ class BacktestController:
             time.sleep(1)  # Check every second
 
     def _get_current_progress(self):
-        """Get current progress value for progress bar."""
-        if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
-            # Tick mode: return current tick index
-            if hasattr(self.broker, 'global_tick_index'):
-                return self.broker.global_tick_index
-        else:
-            # Candle mode: return percentage (0-100)
-            current_time = self.broker.get_current_time()
-            if self.start_time and self.end_time and current_time:
-                total_duration = (self.end_time - self.start_time).total_seconds()
-                elapsed_duration = (current_time - self.start_time).total_seconds()
-                if total_duration > 0:
-                    progress_pct = (elapsed_duration / total_duration * 100)
-                    return max(0, min(100, progress_pct))
+        """Get current progress value for progress bar (tick index)."""
+        if hasattr(self.broker, 'global_tick_index'):
+            return self.broker.global_tick_index
         return None
 
     def _get_progress_stats_text(self):
@@ -982,30 +973,17 @@ class BacktestController:
             closed_trades = self.broker.closed_trades
             total_trades = len(closed_trades)
 
-            # Get progress percentage
-            # For tick mode: use tick index, for candle mode: use time
+            # Get progress percentage (tick-based)
             progress_pct = 0
             tick_info = ""
 
-            if hasattr(self.broker, 'use_tick_data') and self.broker.use_tick_data:
-                # Tick mode: show tick progress
-                if hasattr(self.broker, 'global_tick_index') and hasattr(self.broker, 'global_tick_timeline'):
-                    total_ticks = len(self.broker.global_tick_timeline)
-                    current_tick = self.broker.global_tick_index
-                    if total_ticks > 0:
-                        progress_pct = (current_tick / total_ticks * 100)
-                        tick_info = f" | Tick: {current_tick:,}/{total_ticks:,}"
-            else:
-                # Candle mode: use time-based progress
-                if self.start_time and self.end_time and current_time:
-                    # Calculate progress as percentage of time elapsed
-                    total_duration = (self.end_time - self.start_time).total_seconds()
-                    elapsed_duration = (current_time - self.start_time).total_seconds()
-
-                    if total_duration > 0:
-                        progress_pct = (elapsed_duration / total_duration * 100)
-                        # Clamp to 0-100 range
-                        progress_pct = max(0, min(100, progress_pct))
+            # Show tick progress
+            if hasattr(self.broker, 'global_tick_index') and hasattr(self.broker, 'global_tick_timeline'):
+                total_ticks = len(self.broker.global_tick_timeline)
+                current_tick = self.broker.global_tick_index
+                if total_ticks > 0:
+                    progress_pct = (current_tick / total_ticks * 100)
+                    tick_info = f" | Tick: {current_tick:,}/{total_ticks:,}"
 
             # Calculate ETA (Estimated Time to Finish) using moving average
             eta_display = ""

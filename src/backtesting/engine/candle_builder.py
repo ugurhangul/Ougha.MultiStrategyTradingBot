@@ -161,11 +161,10 @@ class MultiTimeframeCandleBuilder:
             Set of timeframe strings that had new candles formed on this tick
             (e.g., {'M1', 'M5'} if both M1 and M5 candles closed)
         """
-        # PERFORMANCE OPTIMIZATION #11: Skip timezone check in hot path
-        # All ticks in backtesting are pre-validated to be timezone-aware UTC
-        # If needed for safety, this check can be enabled in debug mode only
-        # if tick_time.tzinfo is None:
-        #     tick_time = tick_time.replace(tzinfo=timezone.utc)
+        # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+        # This check is necessary because tick data might come from various sources
+        if tick_time.tzinfo is None:
+            tick_time = tick_time.replace(tzinfo=timezone.utc)
 
         # PERFORMANCE OPTIMIZATION #16: Reuse set object instead of creating new one
         # Clear the reusable set for this tick
@@ -354,8 +353,15 @@ class MultiTimeframeCandleBuilder:
 
         # Convert DataFrame rows to CandleData objects
         for _, row in candles_df.iterrows():
+            # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+            candle_time = row['time']
+            if isinstance(candle_time, pd.Timestamp):
+                candle_time = candle_time.to_pydatetime()
+            if candle_time.tzinfo is None:
+                candle_time = candle_time.replace(tzinfo=timezone.utc)
+
             candle = CandleData(
-                time=row['time'],
+                time=candle_time,
                 open=row['open'],
                 high=row['high'],
                 low=row['low'],
@@ -398,7 +404,7 @@ class MultiTimeframeCandleBuilder:
             timeframe: Timeframe string
 
         Returns:
-            Aligned datetime
+            Aligned datetime (timezone-aware UTC)
         """
         duration_minutes = TimeframeConverter.get_duration_minutes(timeframe)
         if duration_minutes is None:
@@ -414,5 +420,10 @@ class MultiTimeframeCandleBuilder:
         aligned_hour = aligned_minutes // 60
         aligned_minute = aligned_minutes % 60
 
-        return dt.replace(hour=aligned_hour, minute=aligned_minute, second=0, microsecond=0)
+        # BUGFIX: Ensure timezone-aware datetime (UTC) to avoid comparison errors
+        aligned_dt = dt.replace(hour=aligned_hour, minute=aligned_minute, second=0, microsecond=0)
+        if aligned_dt.tzinfo is None:
+            aligned_dt = aligned_dt.replace(tzinfo=timezone.utc)
+
+        return aligned_dt
 

@@ -236,6 +236,52 @@ class BaseStrategy(ABC):
         """
         return self.is_initialized
 
+    def _ensure_position_sizer_initialized(self) -> bool:
+        """
+        Ensure position sizer is initialized (lazy initialization).
+
+        This allows strategies to initialize early (before tick data is loaded)
+        to report required timeframes, while deferring position sizer initialization
+        until price data is available.
+
+        Returns:
+            True if position sizer is initialized or successfully initialized now
+        """
+        if self.position_sizer is None:
+            return False
+
+        if self.position_sizer.is_initialized:
+            return True
+
+        # Try to initialize now
+        current_price = self.connector.get_current_price(self.symbol)
+        if current_price is None:
+            return False
+
+        symbol_info = self.connector.get_symbol_info(self.symbol)
+        if symbol_info is None:
+            return False
+
+        # Calculate a default stop loss for initialization (100 points)
+        point = symbol_info['point']
+        default_sl = current_price - (100 * point)  # Assume BUY for initialization
+
+        initial_lot = self.risk_manager.calculate_lot_size(
+            symbol=self.symbol,
+            entry_price=current_price,
+            stop_loss=default_sl
+        )
+
+        if self.position_sizer.initialize(initial_lot):
+            self.logger.info(
+                f"Position sizer lazily initialized: {self.position_sizer.get_name()} with {initial_lot:.2f} lots",
+                self.symbol,
+                strategy_key=self.key
+            )
+            return True
+
+        return False
+
     def get_lot_size(self) -> float:
         """
         Get the lot size for the next trade from the position sizer.
@@ -243,8 +289,25 @@ class BaseStrategy(ABC):
         Returns:
             Lot size to use for next trade
         """
-        if self.position_sizer is not None and self.position_sizer.is_enabled():
-            return self.position_sizer.calculate_lot_size()
+        if self.position_sizer is not None:
+            # Ensure position sizer is initialized (lazy initialization)
+            if not self._ensure_position_sizer_initialized():
+                self.logger.warning(
+                    f"Position sizer not initialized yet (price data not available)",
+                    self.symbol,
+                    strategy_key=self.key
+                )
+                return 0.0
+
+            if self.position_sizer.is_enabled():
+                return self.position_sizer.calculate_lot_size()
+            else:
+                self.logger.warning(
+                    f"Position sizer is disabled",
+                    self.symbol,
+                    strategy_key=self.key
+                )
+                return 0.0
         else:
             # Fallback to risk manager if no position sizer
             self.logger.warning(

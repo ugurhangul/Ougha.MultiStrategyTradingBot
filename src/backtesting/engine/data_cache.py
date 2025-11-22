@@ -129,8 +129,18 @@ class DataCache:
 
         now = datetime.now(timezone.utc)
 
+        # OPTIMIZATION: For sparse timeframes (H4, D1) with many days, use sampling validation
+        # Instead of checking ALL 325+ days, check first/last/sample to save time
+        if timeframe in ['H4', 'D1'] and len(days) > 30:
+            # Sample-based validation: check first, last, and a few in between
+            sample_indices = [0, len(days)//4, len(days)//2, 3*len(days)//4, len(days)-1]
+            days_to_check = [days[i] for i in sample_indices if i < len(days)]
+            self.logger.debug(f"  Using fast validation: checking {len(days_to_check)}/{len(days)} days (sparse timeframe optimization)")
+        else:
+            days_to_check = days
+
         # Check each day for existence and metadata
-        for i, day in enumerate(days):
+        for i, day in enumerate(days_to_check):
             cache_path = self._get_day_cache_path(day, symbol, timeframe)
 
             if not cache_path.exists():

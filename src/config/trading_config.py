@@ -219,11 +219,12 @@ class TradingConfig:
         # Symbol-specific optimization enabled
         self.use_symbol_specific_settings: bool = os.getenv('USE_SYMBOL_SPECIFIC_SETTINGS', 'true').lower() == 'true'
 
-        # Tick archive configuration (for backtesting)
+        # Tick archive configuration (for backtesting) - SIMPLIFIED: Day-based only
         self.tick_archive = TickArchiveConfig(
             enabled=os.getenv('TICK_ARCHIVE_ENABLED', 'false').lower() == 'true',
-            archive_url_pattern=os.getenv('TICK_ARCHIVE_URL_PATTERN',
-                'https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{BROKER}_{SYMBOL}_{YEAR}.zip'),
+            archive_url_pattern_day=os.getenv('TICK_ARCHIVE_URL_PATTERN_DAY',
+                'https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{MONTH}/{DAY}/{BROKER}_{SYMBOL}_{YEAR}_{MONTH}_{DAY}.zip'),
+            use_granular_downloads=os.getenv('TICK_ARCHIVE_USE_GRANULAR', 'true').lower() == 'true',
             download_timeout_seconds=int(os.getenv('TICK_ARCHIVE_TIMEOUT', '300')),
             max_retries=int(os.getenv('TICK_ARCHIVE_MAX_RETRIES', '3')),
             save_downloaded_archives=os.getenv('TICK_ARCHIVE_SAVE', 'true').lower() == 'true',

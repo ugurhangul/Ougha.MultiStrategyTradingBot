@@ -226,8 +226,8 @@ class MultiStrategyOrchestrator:
 
                 # If strategy generated a signal, execute it
                 if signal is not None:
-                    self.logger.info(
-                        f"Signal received from {strategy_key}: {signal.signal_type.value} @ {signal.entry_price:.5f}",
+                    self.logger.warning(
+                        f"🎯 Signal received from {strategy_key}: {signal.signal_type.value} @ {signal.entry_price:.5f}",
                         self.symbol,
                         strategy_key=strategy_key
                     )
@@ -236,7 +236,7 @@ class MultiStrategyOrchestrator:
                     ticket = self.order_manager.execute_signal(signal)
 
                     if ticket:
-                        self.logger.info(
+                        self.logger.warning(
                             f"✓ Signal executed successfully by {strategy_key} - Ticket: {ticket}",
                             self.symbol,
                             strategy_key=strategy_key

@@ -19,7 +19,7 @@ import re
 import threading
 from pathlib import Path
 from typing import Optional, Tuple, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import pandas as pd
 import MetaTrader5 as mt5
@@ -150,24 +150,39 @@ class BrokerArchiveDownloader:
             self.logger.warning(f"  Error validating archive source: {e}")
             return False
     
-    def construct_archive_url(self, symbol: str, year: int, broker: str) -> str:
+    def construct_archive_url(self, symbol: str, year: int, broker: str,
+                              month: int = None, day: int = None) -> str:
         """
-        Construct archive download URL from template.
-        
+        Construct day-based archive download URL from template.
+
+        SIMPLIFIED: Only supports day-based archives.
+
         Args:
             symbol: Normalized symbol name
             year: Year for tick data
             broker: Broker name
-            
+            month: Month for tick data (required for day-based archives)
+            day: Day for tick data (required for day-based archives)
+
         Returns:
-            Complete archive download URL
+            Complete archive download URL for the specified day
         """
-        url = self.config.archive_url_pattern.format(
-            SYMBOL=symbol,
-            YEAR=year,
-            BROKER=broker
-        )
-        return url
+        # Only day-based archives are supported
+        if day is not None and month is not None:
+            url = self.config.archive_url_pattern_day.format(
+                SYMBOL=symbol,
+                YEAR=year,
+                MONTH=f"{month:02d}",
+                DAY=f"{day:02d}",
+                BROKER=broker
+            )
+            return url
+        else:
+            # Month/year-based archives are no longer supported
+            raise ValueError(
+                f"Day-based archives only: month and day parameters are required. "
+                f"Got month={month}, day={day}"
+            )
     
     def download_archive(self, url: str, symbol: str, year: int) -> Optional[bytes]:
         """
@@ -224,100 +239,39 @@ class BrokerArchiveDownloader:
         self.logger.warning(f"  Failed to download archive after {self.config.max_retries} attempts")
         return None
     
-    def _get_parquet_cache_path(self, broker: str, symbol: str, year: int) -> Path:
-        """Get the path for a pre-converted Parquet file."""
-        return self._parquet_cache_dir / f"{broker}_{symbol}_{year}.parquet"
 
-    def _load_from_parquet_cache(self, broker: str, symbol: str, year: int) -> Optional[pd.DataFrame]:
-        """
-        Load pre-converted Parquet file if available.
-
-        Returns:
-            DataFrame if Parquet cache exists, None otherwise
-        """
-        parquet_path = self._get_parquet_cache_path(broker, symbol, year)
-
-        if not parquet_path.exists():
-            return None
-
-        try:
-            self.logger.info(f"  ✓ Found Parquet cache: {parquet_path.name}")
-            start = time.time()
-            df = pd.read_parquet(parquet_path, engine='pyarrow')
-            load_time = time.time() - start
-            self.logger.info(f"  ✓ Loaded {len(df):,} ticks from Parquet in {load_time:.2f}s (10-50x faster than CSV!)")
-            return df
-        except Exception as e:
-            self.logger.warning(f"  Error loading Parquet cache: {e}")
-            # Delete corrupted cache file
-            try:
-                parquet_path.unlink()
-            except:
-                pass
-            return None
-
-    def _save_to_parquet_cache(self, df: pd.DataFrame, broker: str, symbol: str, year: int):
-        """
-        Save parsed DataFrame to Parquet for fast subsequent loads.
-
-        Args:
-            df: Parsed tick DataFrame
-            broker: Broker name
-            symbol: Symbol name
-            year: Year
-        """
-        if not self.config.save_downloaded_archives:
-            return
-
-        try:
-            parquet_path = self._get_parquet_cache_path(broker, symbol, year)
-            start = time.time()
-            df.to_parquet(parquet_path, engine='pyarrow', compression='snappy', index=False)
-            save_time = time.time() - start
-            file_size_mb = parquet_path.stat().st_size / (1024 * 1024)
-            self.logger.info(f"  💾 Saved Parquet cache: {parquet_path.name} ({file_size_mb:.1f} MB, {save_time:.2f}s)")
-            self.logger.info(f"     Next load will be 10-50x faster!")
-        except Exception as e:
-            self.logger.warning(f"  Error saving Parquet cache: {e}")
 
     def parse_archive(self, archive_content: bytes, symbol: str, year: int,
                      broker: str = None) -> Optional[pd.DataFrame]:
         """
-        Parse tick data from downloaded archive.
+        Parse tick data from downloaded day-based archive.
 
-        PERFORMANCE OPTIMIZATION:
-        1. Check for pre-converted Parquet file first (10-50x faster)
-        2. If not found, parse CSV and save to Parquet for next time
-        3. Use Polars for CSV parsing if available (2-3x faster than pandas)
+        Simplified for day-only archives - no intermediate Parquet caching needed
+        since day archives are small and already cached at the day level.
+
+        Uses Polars for CSV parsing if available (2-3x faster than pandas).
 
         Supports common tick data formats:
         - CSV files with columns: time, bid, ask, volume
         - Binary formats (to be implemented)
 
         Args:
-            archive_content: Archive file content
+            archive_content: Archive file content (ZIP)
             symbol: Symbol name
-            year: Year
-            broker: Broker name (for Parquet caching)
+            year: Year (for logging only)
+            broker: Broker name (unused in simplified version)
 
         Returns:
             DataFrame with tick data in MT5 format, or None if parsing failed
         """
-        # Try to load from Parquet cache first (10-50x faster)
-        if broker and self.config.save_downloaded_archives:
-            df_cached = self._load_from_parquet_cache(broker, symbol, year)
-            if df_cached is not None:
-                return df_cached
-
-        # Parquet cache miss - parse CSV
-        self.logger.info(f"  Parsing tick archive for {symbol} {year}")
+        self.logger.debug(f"  Parsing day archive for {symbol}...")
 
         try:
             # Extract ZIP archive
             with zipfile.ZipFile(io.BytesIO(archive_content)) as zf:
                 # List files in archive
                 file_list = zf.namelist()
-                self.logger.info(f"    Archive contains {len(file_list)} file(s)")
+                self.logger.debug(f"    Archive contains {len(file_list)} file(s)")
 
                 # Find CSV or data files
                 data_files = [f for f in file_list if f.endswith('.csv') or f.endswith('.txt')]
@@ -332,7 +286,7 @@ class BrokerArchiveDownloader:
                     # Find largest file
                     data_file = max(data_files, key=lambda f: zf.getinfo(f).file_size)
 
-                self.logger.info(f"    Parsing file: {data_file}")
+                self.logger.debug(f"    Parsing file: {data_file}")
 
                 # Read and parse CSV
                 with zf.open(data_file) as f:
@@ -340,12 +294,7 @@ class BrokerArchiveDownloader:
                     df = self._parse_tick_csv(f, symbol)
 
                     if df is not None and len(df) > 0:
-                        self.logger.info(f"  ✓ Parsed {len(df):,} ticks from archive")
-
-                        # Save to Parquet cache for next time
-                        if broker:
-                            self._save_to_parquet_cache(df, broker, symbol, year)
-
+                        self.logger.debug(f"  ✓ Parsed {len(df):,} ticks from archive")
                         return df
                     else:
                         self.logger.warning(f"  Failed to parse tick data from archive")
@@ -661,6 +610,11 @@ class BrokerArchiveDownloader:
 
             cache_path = self._get_tick_cache_path(symbol, date, tick_type, cache_dir)
 
+            # Check if already cached - skip if exists to avoid unnecessary overwrites
+            if cache_path.exists():
+                self.logger.debug(f"  ⏭️  Day cache already exists, skipping: {cache_path.name}")
+                return True
+
             # Create directory if it doesn't exist
             cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -691,254 +645,126 @@ class BrokerArchiveDownloader:
             self.logger.warning(f"  Error saving day cache for {date.date()}: {e}")
             return False
 
-    def _split_and_cache_by_day(self, df: pd.DataFrame, symbol: str, year: int,
-                                tick_type: int, cache_dir: Optional[str],
-                                progress_callback: Optional[callable] = None) -> None:
+
+
+    def fetch_tick_data_for_day(self, symbol: str, date: datetime, server_name: str,
+                                tick_type: int = mt5.COPY_TICKS_INFO,
+                                cache_dir: Optional[str] = None,
+                                progress_callback: Optional[callable] = None) -> Optional[pd.DataFrame]:
         """
-        Split parsed archive data by day and save each day to Parquet cache.
+        Fetch tick data for a single day from day-based archive.
 
-        This creates day-level cache files for fast subsequent access, avoiding
-        the need to re-parse the full archive.
-
-        Args:
-            df: Full parsed archive DataFrame
-            symbol: Symbol name
-            year: Year of the data
-            tick_type: MT5 tick type constant
-            cache_dir: Base cache directory (if None, skip caching)
-            progress_callback: Optional callback for progress updates
-        """
-        if cache_dir is None:
-            return
-
-        try:
-            # Group by date
-            df['date'] = df['time'].dt.date
-            grouped = df.groupby('date')
-            total_days = len(grouped)
-
-            self.logger.info(f"  💾 Caching {total_days} days to disk...")
-
-            cached_count = 0
-            skipped_count = 0
-
-            for day_idx, (date, day_df) in enumerate(grouped, 1):
-                # Convert date to datetime for cache path
-                date_dt = datetime.combine(date, datetime.min.time())
-
-                # Check if already cached
-                cache_path = self._get_tick_cache_path(symbol, date_dt, tick_type, cache_dir)
-                if cache_path.exists():
-                    skipped_count += 1
-                    continue
-
-                # Remove the temporary 'date' column before saving
-                day_df_clean = day_df.drop(columns=['date']).copy()
-
-                # Save to cache
-                if self._save_day_to_cache(day_df_clean, symbol, date_dt, tick_type, cache_dir):
-                    cached_count += 1
-
-                # Report progress every 50 days
-                if progress_callback and day_idx % 50 == 0:
-                    progress_callback(
-                        day_idx, total_days, date_dt, 'caching', len(day_df_clean),
-                        f'Caching day {day_idx}/{total_days}...',
-                        {'stage': 'caching', 'percent': (day_idx / total_days) * 100}
-                    )
-
-            # Remove temporary column from original DataFrame
-            df.drop(columns=['date'], inplace=True)
-
-            self.logger.info(f"  ✓ Cached {cached_count} days, skipped {skipped_count} existing")
-
-        except Exception as e:
-            self.logger.warning(f"  Error splitting and caching by day: {e}")
-
-    def fetch_tick_data(self, symbol: str, start_date: datetime, end_date: datetime,
-                       server_name: str, tick_type: int = mt5.COPY_TICKS_INFO,
-                       cache_dir: Optional[str] = None,
-                       progress_callback: Optional[callable] = None) -> Optional[pd.DataFrame]:
-        """
-        Fetch tick data from external broker archive with intelligent caching.
-
-        PERFORMANCE OPTIMIZATION:
-        - Checks in-memory cache first (avoids re-parsing same archive)
-        - Automatically splits parsed archives into daily Parquet files
-        - Thread-safe for parallel day loading
-
-        Main entry point for downloading historical tick data.
+        Simplified strategy: Only downloads day-based archives (single day).
+        No fallback to month or year archives for predictable behavior.
 
         Args:
             symbol: MT5 symbol name
-            start_date: Start date for tick data
-            end_date: End date for tick data
+            date: Date to fetch (single day)
             server_name: MT5 server name (for broker detection)
-            tick_type: MT5 tick type constant (for cache path)
+            tick_type: MT5 tick type constant
             cache_dir: Base cache directory for day-level Parquet files
-            progress_callback: Optional callback for progress updates
+            progress_callback: Optional callback for progress updates (unused in day-only mode)
 
         Returns:
-            DataFrame with tick data, or None if fetch failed
+            DataFrame with tick data for the requested day, or None if fetch failed
         """
         if not self.config.enabled:
-            self.logger.info(f"  ⚠️  External archive downloads are DISABLED in config")
-            self.logger.info(f"     Set TICK_ARCHIVE_ENABLED=true in .env to enable")
             return None
 
         # Get broker name
         broker = self.get_broker_name(server_name)
         if not broker:
-            self.logger.warning(f"  ⚠️  Could not determine broker name from server: {server_name}")
-            self.logger.warning(f"     Add mapping in tick_archive_config.py: '{server_name}': 'BrokerName'")
+            self.logger.debug(f"    Could not determine broker name from server: {server_name}")
             return None
 
         # Normalize symbol name
         normalized_symbol = self.normalize_symbol_name(symbol)
 
-        self.logger.info(f"  📥 Attempting to fetch tick data from external archive")
-        self.logger.info(f"     Symbol: {symbol} -> {normalized_symbol}")
-        self.logger.info(f"     Broker: {broker} (from server: {server_name})")
-        self.logger.info(f"     Date range: {start_date.date()} to {end_date.date()}")
+        year = date.year
+        month = date.month
+        day = date.day
 
-        # Determine years to download
-        years = list(range(start_date.year, end_date.year + 1))
+        # Define day boundaries
+        day_start = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
+        day_end = datetime(year, month, day, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
-        all_ticks = []
+        # Try day-based archive only
+        if self.config.use_granular_downloads:
+            self.logger.debug(f"    Trying day-based archive for {date.date()}...")
 
-        for year in years:
-            self.logger.info(f"  Fetching data for year {year}...")
+            url = self.construct_archive_url(normalized_symbol, year, broker, month, day)
 
-            # Get or create a lock for this specific archive
-            # This prevents multiple threads from parsing the same archive simultaneously
-            cache_key = (broker, normalized_symbol, year)
+            if self.validate_archive_source(url):
+                # Try to download day archive
+                archive_content = self._try_download_archive(url, normalized_symbol, year, month, day, 'day')
 
-            with self._parsing_locks_lock:
-                if cache_key not in self._parsing_locks:
-                    self._parsing_locks[cache_key] = threading.Lock()
-                archive_lock = self._parsing_locks[cache_key]
+                if archive_content:
+                    # Parse and extract the day
+                    df = self.parse_archive(archive_content, normalized_symbol, year, broker)
+                    if df is not None and len(df) > 0:
+                        # Filter to exact day
+                        df = df[(df['time'] >= day_start) & (df['time'] <= day_end)].copy()
+                        if len(df) > 0:
+                            self.logger.info(f"    ✓ Fetched {len(df):,} ticks from day-based archive")
 
-            # Acquire the archive-specific lock
-            # Only one thread will parse this archive, others will wait
-            with archive_lock:
-                # Check in-memory cache if enabled (disabled by default to save RAM)
-                if self._use_memory_cache and cache_key in self._parsed_archive_cache:
-                    cached_df = self._parsed_archive_cache[cache_key]
-                    self._cache_stats['hits'] += 1
-                    self.logger.info(f"  ✓ Using cached archive data (in-memory) - {len(cached_df):,} ticks")
+                            # Cache this day
+                            if cache_dir:
+                                self._save_day_to_cache(df, symbol, date, tick_type, cache_dir)
 
-                    # Filter cached data to requested range
-                    start_tz = pd.Timestamp(start_date).tz_localize('UTC') if pd.Timestamp(start_date).tz is None else pd.Timestamp(start_date)
-                    end_tz = pd.Timestamp(end_date).tz_localize('UTC') if pd.Timestamp(end_date).tz is None else pd.Timestamp(end_date)
-                    df = cached_df[(cached_df['time'] >= start_tz) & (cached_df['time'] <= end_tz)].copy()
+                            return df
 
-                    if len(df) > 0:
-                        all_ticks.append(df)
-                        self.logger.info(f"  ✓ Got {len(df):,} ticks for {year} (from in-memory cache)")
+        # No data available - day archive doesn't exist or download failed
+        self.logger.debug(f"    No day-based archive available for {date.date()}")
+        return None
 
-                    continue  # Skip to next year
+    def _try_download_archive(self, url: str, symbol: str, year: int,
+                              month: Optional[int], day: Optional[int],
+                              granularity: str) -> Optional[bytes]:
+        """
+        Try to download an archive with caching support.
 
-            # Construct archive URL
-            url = self.construct_archive_url(normalized_symbol, year, broker)
+        Args:
+            url: Archive URL
+            symbol: Symbol name
+            year: Year
+            month: Month (optional)
+            day: Day (optional)
+            granularity: 'day', 'month', or 'year'
 
-            # Validate source
-            if not self.validate_archive_source(url):
-                self.logger.warning(f"  Untrusted archive source: {url}")
-                continue
+        Returns:
+            Archive content as bytes, or None if download failed
+        """
+        # Construct cache filename
+        if day is not None and month is not None:
+            cache_filename = f"{symbol}_{year}_{month:02d}_{day:02d}.zip"
+        elif month is not None:
+            cache_filename = f"{symbol}_{year}_{month:02d}.zip"
+        else:
+            cache_filename = f"{symbol}_{year}.zip"
 
-            # Check local ZIP cache first
-            cached_archive = None
-            if self.config.save_downloaded_archives:
-                cache_file = self.archive_cache_path / f"{broker}_{normalized_symbol}_{year}.zip"
-                self.logger.info(f"     Checking cache: {cache_file}")
-                if cache_file.exists():
-                    self.logger.info(f"  ✓ Found cached archive: {cache_file.name} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
-                    try:
-                        cached_archive = cache_file.read_bytes()
-                        self.logger.info(f"     Successfully loaded {len(cached_archive) / 1024 / 1024:.1f} MB from cache")
-                    except Exception as e:
-                        self.logger.warning(f"  ⚠️  Error reading cached archive: {e}")
-                else:
-                    self.logger.info(f"     Cache file not found, will attempt download")
+        # Check local ZIP cache first
+        if self.config.save_downloaded_archives:
+            cache_file = self.archive_cache_path / cache_filename
+            if cache_file.exists():
+                self.logger.debug(f"    Found cached {granularity} archive: {cache_file.name}")
+                try:
+                    return cache_file.read_bytes()
+                except Exception as e:
+                    self.logger.debug(f"    Error reading cached archive: {e}")
 
-            # Download if not cached
-            archive_content = cached_archive
-            if archive_content is None:
-                archive_content = self.download_archive(url, normalized_symbol, year)
+        # Download from URL
+        archive_content = self.download_archive(url, symbol, year)
 
-                # Save to cache if successful
-                if archive_content and self.config.save_downloaded_archives:
-                    try:
-                        cache_file = self.archive_cache_path / f"{broker}_{normalized_symbol}_{year}.zip"
-                        cache_file.write_bytes(archive_content)
-                        self.logger.info(f"  Saved archive to cache: {cache_file.name}")
-                    except Exception as e:
-                        self.logger.warning(f"  Error saving archive to cache: {e}")
+        # Save to cache if successful
+        if archive_content and self.config.save_downloaded_archives:
+            try:
+                cache_file = self.archive_cache_path / cache_filename
+                cache_file.write_bytes(archive_content)
+                self.logger.debug(f"    Saved {granularity} archive to cache: {cache_file.name}")
+            except Exception as e:
+                self.logger.debug(f"    Error saving archive to cache: {e}")
 
-            if archive_content is None:
-                self.logger.info(f"  No archive available for {year}")
-                continue
+        return archive_content
 
-            # Parse archive (this is the expensive operation we want to do only once)
-            self.logger.info(f"  ⚙️  Parsing full archive (365 days)...")
-            if progress_callback:
-                progress_callback(
-                    1, 1, start_date, 'parsing_archive', 0,
-                    f'Parsing full archive ({year})...',
-                    {'stage': 'parsing_archive', 'percent': 0}
-                )
 
-            df = self.parse_archive(archive_content, normalized_symbol, year, broker)
-
-            if df is not None and len(df) > 0:
-                self.logger.info(f"     Parsed {len(df):,} total ticks from archive")
-                self.logger.info(f"     Date range in archive: {df['time'].min()} to {df['time'].max()}")
-
-                # Store in in-memory cache ONLY if enabled (disabled by default to save RAM)
-                if self._use_memory_cache:
-                    with self._cache_lock:
-                        self._parsed_archive_cache[cache_key] = df.copy()
-                        # Update memory stats
-                        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-                        self._cache_stats['memory_mb'] += memory_mb
-                        self.logger.info(f"  💾 Cached parsed archive in memory ({memory_mb:.1f} MB)")
-                        self.logger.info(f"     Cache stats: {self._cache_stats['hits']} hits, "
-                                       f"{self._cache_stats['misses']} misses, "
-                                       f"{self._cache_stats['memory_mb']:.1f} MB total")
-
-                # Split and cache by day for fast subsequent backtest runs
-                if cache_dir:
-                    self._split_and_cache_by_day(df, symbol, year, tick_type, cache_dir, progress_callback)
-
-                # Filter to requested date range
-                # Ensure timezone-aware comparison
-                start_tz = pd.Timestamp(start_date).tz_localize('UTC') if pd.Timestamp(start_date).tz is None else pd.Timestamp(start_date)
-                end_tz = pd.Timestamp(end_date).tz_localize('UTC') if pd.Timestamp(end_date).tz is None else pd.Timestamp(end_date)
-                df = df[(df['time'] >= start_tz) & (df['time'] <= end_tz)].copy()
-
-                if len(df) > 0:
-                    all_ticks.append(df)
-                    self.logger.info(f"  ✓ Got {len(df):,} ticks for {year} (after filtering to requested range)")
-                else:
-                    self.logger.warning(f"  ⚠️  No ticks in requested date range after filtering")
-            else:
-                self.logger.warning(f"  ⚠️  Failed to parse archive or archive is empty")
-
-        # Combine all years
-        if not all_ticks:
-            self.logger.info(f"  No tick data found in external archives")
-            return None
-
-        combined_df = pd.concat(all_ticks, ignore_index=True)
-        combined_df = combined_df.sort_values('time').reset_index(drop=True)
-
-        # Validate combined data
-        if self.config.validate_tick_format:
-            if not self.validate_tick_data(combined_df, symbol, start_date, end_date):
-                self.logger.warning(f"  Downloaded data failed validation")
-                return None
-
-        self.logger.info(f"  ✓ Successfully fetched {len(combined_df):,} ticks from external archive")
-
-        return combined_df
 

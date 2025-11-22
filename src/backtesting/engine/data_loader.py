@@ -226,7 +226,7 @@ class BacktestDataLoader:
 
                 # Report fetching stage
                 if progress_callback:
-                    progress_callback('fetching')
+                    progress_callback('fetching_archive')
 
                 # Get MT5 server name for broker detection
                 account_info = mt5.account_info()
@@ -236,12 +236,10 @@ class BacktestDataLoader:
 
                 server_name = account_info.server
 
-                # Download from archive for this single day
-                # Pass cache_dir and progress callback to enable intelligent caching
-                archive_df = self.archive_downloader.fetch_tick_data(
+                # Use day-based download method (simplified - day archives only)
+                archive_df = self.archive_downloader.fetch_tick_data_for_day(
                     symbol=symbol,
-                    start_date=day_start,
-                    end_date=day_end,
+                    date=day_start,
                     server_name=server_name,
                     tick_type=tick_type,
                     cache_dir=cache_dir,
@@ -249,9 +247,8 @@ class BacktestDataLoader:
                 )
 
                 if archive_df is not None and len(archive_df) > 0:
-                    # Archive has data - cache it and return
-                    # Note: Archive downloader already cached it via _split_and_cache_by_day
-                    # but we still save to cache_path for consistency
+                    # Archive has data - it's already cached by fetch_tick_data_for_day
+                    # but we still save to cache_path for consistency with the day-level cache structure
                     if cache_path:
                         if progress_callback:
                             progress_callback('caching')
@@ -534,7 +531,7 @@ class BacktestDataLoader:
                 )
 
                 # FALLBACK: Try to build candles from ticks for any timeframe
-                self.logger.info(f"  ⚡ Attempting to build {timeframe} candles from tick data for {symbol}...")
+                self.logger.debug(f"  ⚡ Attempting to build {timeframe} candles from tick data for {symbol}...")
                 df = self._build_candles_from_ticks(symbol, timeframe, start_date, end_date, preloaded_ticks)
 
                 if df is not None and len(df) > 0:
@@ -548,18 +545,17 @@ class BacktestDataLoader:
 
                     # IMPORTANT: Save to cache so we don't rebuild next time
                     if self.use_cache:
-                        self.logger.info(f"  💾 Saving built {timeframe} candles to cache...")
+                        self.logger.debug(f"  💾 Saving built {timeframe} candles to cache...")
                         self.cache.save_to_cache(symbol, timeframe, start_date, end_date, df, symbol_info)
 
                     return df, symbol_info
                 else:
-                    self.logger.error(f"  ✗ Failed to build {timeframe} candles from ticks")
-
-                self.logger.error(
-                    f"Date range: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to {end_date.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                self.logger.error(f"Timeframe: {timeframe} (MT5 constant: {mt5_timeframe})")
-                return None
+                    # No data available - this is normal for holidays/weekends
+                    self.logger.debug(f"  ✗ No {timeframe} data available for {symbol}")
+                    self.logger.debug(
+                        f"    Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    )
+                    return None
             
             # Convert to DataFrame
             df = pd.DataFrame(rates)
@@ -606,8 +602,8 @@ class BacktestDataLoader:
                 'M5': '5min',
                 'M15': '15min',
                 'M30': '30min',
-                'H1': '1H',
-                'H4': '4H',
+                'H1': '1h',
+                'H4': '4h',
                 'D1': '1D'
             }
 
@@ -625,17 +621,32 @@ class BacktestDataLoader:
                 # Ensure time column is datetime
                 if 'time' in df_ticks.columns and not pd.api.types.is_datetime64_any_dtype(df_ticks['time']):
                     df_ticks['time'] = pd.to_datetime(df_ticks['time'], unit='s', utc=True)
+
+                # Filter to requested date range
+                df_ticks = df_ticks[(df_ticks['time'] >= start_date) & (df_ticks['time'] <= end_date)]
+
+                if len(df_ticks) == 0:
+                    self.logger.warning(
+                        f"  No ticks in preloaded data for date range "
+                        f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    )
+                    return None
+
+                self.logger.info(f"  Filtered to {len(df_ticks):,} ticks in date range")
             else:
                 # Load tick data from MT5
-                self.logger.info(f"  Loading tick data from MT5 for {symbol}...")
+                self.logger.debug(f"  Loading tick data from MT5 for {symbol}...")
                 ticks = mt5.copy_ticks_range(symbol, start_date, end_date, mt5.COPY_TICKS_INFO)
 
                 if ticks is None or len(ticks) == 0:
-                    error_code, error_msg = mt5.last_error()
-                    self.logger.error(f"  No tick data available for {symbol}: ({error_code}) {error_msg}")
+                    # No tick data - this is normal for holidays/weekends
+                    self.logger.debug(
+                        f"  No tick data available for {symbol} "
+                        f"({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})"
+                    )
                     return None
 
-                self.logger.info(f"  Loaded {len(ticks):,} ticks from MT5...")
+                self.logger.debug(f"  Loaded {len(ticks):,} ticks from MT5...")
 
                 # Convert to DataFrame
                 df_ticks = pd.DataFrame(ticks)

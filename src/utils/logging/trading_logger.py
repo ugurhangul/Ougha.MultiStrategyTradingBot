@@ -464,8 +464,8 @@ class TradingLogger:
             message = f"[{strategy_key}] {message}"
         self.logger.warning(message)
 
-    def error(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
-        """Log error message"""
+    def error(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None, exc_info: bool = False):
+        """Log error message with optional exception info"""
         self._check_date_change()
         if symbol:
             # Log to symbol-specific file
@@ -478,7 +478,7 @@ class TradingLogger:
         elif strategy_key:
             # Add strategy key prefix even without symbol
             message = f"[{strategy_key}] {message}"
-        self.logger.error(message)
+        self.logger.error(message, exc_info=exc_info)
 
     def critical(self, message: str, symbol: Optional[str] = None, strategy_key: Optional[str] = None):
         """Log critical message"""

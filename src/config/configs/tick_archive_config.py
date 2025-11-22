@@ -17,10 +17,15 @@ class TickArchiveConfig:
     enabled: bool = False  # Disabled by default for safety
     
     # === Archive Source URLs ===
-    # URL pattern template for tick data archives
-    # Supported placeholders: {SYMBOL}, {YEAR}, {BROKER}
-    # Example: "https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{BROKER}_{SYMBOL}_{YEAR}.zip"
-    archive_url_pattern: str = "https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{BROKER}_{SYMBOL}_{YEAR}.zip"
+    # URL pattern template for day-based tick data archives
+    # Supported placeholders: {SYMBOL}, {YEAR}, {MONTH}, {DAY}, {BROKER}
+
+    # Day-based archive (single day) - SIMPLIFIED: Only day-based downloads
+    # Example: "https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{MONTH}/{DAY}/{BROKER}_{SYMBOL}_{YEAR}_{MONTH}_{DAY}.zip"
+    archive_url_pattern_day: str = "https://ticks.ex2archive.com/ticks/{SYMBOL}/{YEAR}/{MONTH}/{DAY}/{BROKER}_{SYMBOL}_{YEAR}_{MONTH}_{DAY}.zip"
+
+    # Enable/disable day-based downloads (set to False to disable external archives entirely)
+    use_granular_downloads: bool = True
     
     # List of trusted archive sources (for validation)
     trusted_sources: List[str] = field(default_factory=lambda: [

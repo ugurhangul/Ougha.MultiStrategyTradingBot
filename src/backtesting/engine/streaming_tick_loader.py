@@ -49,7 +49,8 @@ class StreamingTickLoader:
 
     def __init__(self, cache_files: Dict[str, str], chunk_size: int = 100000,
                  start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
-                 cache_dir: Optional[str] = None, tick_type_name: str = "INFO"):
+                 cache_dir: Optional[str] = None, tick_type_name: str = "INFO",
+                 symbols: Optional[List[str]] = None):
         """
         Initialize streaming tick loader.
 
@@ -61,12 +62,14 @@ class StreamingTickLoader:
             end_date: Optional end date filter (only stream ticks <= this date)
             cache_dir: Root cache directory (NEW - for date hierarchy support)
             tick_type_name: Tick type name (e.g., 'INFO', 'ALL', 'TRADE')
+            symbols: Optional list of symbols to load (filters the cache directory scan)
         """
         self.chunk_size = chunk_size
         self.start_date = start_date
         self.end_date = end_date
         self.cache_dir = cache_dir
         self.tick_type_name = tick_type_name
+        self.filter_symbols = symbols  # Store the filter list
         self.logger = get_logger()
 
         # Build cache file list
@@ -117,6 +120,11 @@ class StreamingTickLoader:
                 # Find all symbol files in this directory
                 for file_path in ticks_dir.glob(f"*_{self.tick_type_name}.parquet"):
                     symbol = file_path.stem.replace(f"_{self.tick_type_name}", "")
+
+                    # BUGFIX: Filter by requested symbols if provided
+                    if self.filter_symbols and symbol not in self.filter_symbols:
+                        continue
+
                     cache_files[symbol] = []
 
         # Build file list for each symbol across all days
@@ -322,7 +330,8 @@ class StreamingTickTimeline:
 
     def __init__(self, cache_files: Dict[str, str], chunk_size: int = 100000,
                  start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
-                 cache_dir: Optional[str] = None, tick_type_name: str = "INFO"):
+                 cache_dir: Optional[str] = None, tick_type_name: str = "INFO",
+                 symbols: Optional[List[str]] = None):
         """
         Initialize streaming timeline.
 
@@ -333,9 +342,10 @@ class StreamingTickTimeline:
             end_date: Optional end date filter (only stream ticks <= this date)
             cache_dir: Root cache directory (NEW - for date hierarchy support)
             tick_type_name: Tick type name (e.g., 'INFO', 'ALL', 'TRADE')
+            symbols: Optional list of symbols to load (filters the cache directory scan)
         """
         self.loader = StreamingTickLoader(cache_files, chunk_size, start_date, end_date,
-                                          cache_dir, tick_type_name)
+                                          cache_dir, tick_type_name, symbols)
         self.start_date = start_date
         self.end_date = end_date
         self.logger = get_logger()

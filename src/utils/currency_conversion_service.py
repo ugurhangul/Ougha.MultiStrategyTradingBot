@@ -256,7 +256,106 @@ class CurrencyConversionService:
                     return 1.0 / tick.ask
         
         return None
-    
+
+    def _try_cross_rate(self, from_currency: str, to_currency: str) -> Optional[float]:
+        """
+        Try to find conversion rate via cross-rate through common currencies.
+
+        For example, to convert CHF->THB, we might use:
+        - CHF->USD (via USDCHF inverse) * USD->THB (via USDTHB)
+
+        Common bridge currencies: USD, EUR, GBP, JPY
+
+        Args:
+            from_currency: Source currency
+            to_currency: Target currency
+
+        Returns:
+            Conversion rate or None
+        """
+        # Common bridge currencies to try
+        bridge_currencies = ['USD', 'EUR', 'GBP', 'JPY']
+
+        for bridge in bridge_currencies:
+            # Skip if bridge is same as source or target
+            if bridge == from_currency or bridge == to_currency:
+                continue
+
+            # Try: from_currency -> bridge -> to_currency
+            # Step 1: Get rate from_currency -> bridge
+            rate1 = None
+
+            # Try direct pair
+            direct_pair = f"{from_currency}{bridge}"
+            if self.connector is not None:
+                price = self.connector.get_current_price(direct_pair)
+                if price is not None and price > 0:
+                    rate1 = price
+
+            if rate1 is None:
+                tick = mt5.symbol_info_tick(direct_pair)
+                if tick is not None:
+                    rate1 = tick.bid
+
+            # Try inverse pair
+            if rate1 is None:
+                inverse_pair = f"{bridge}{from_currency}"
+                if self.connector is not None:
+                    price = self.connector.get_current_price(inverse_pair)
+                    if price is not None and price > 0:
+                        rate1 = 1.0 / price
+
+                if rate1 is None:
+                    tick = mt5.symbol_info_tick(inverse_pair)
+                    if tick is not None and tick.ask > 0:
+                        rate1 = 1.0 / tick.ask
+
+            # If we couldn't get first leg, try next bridge
+            if rate1 is None:
+                continue
+
+            # Step 2: Get rate bridge -> to_currency
+            rate2 = None
+
+            # Try direct pair
+            direct_pair2 = f"{bridge}{to_currency}"
+            if self.connector is not None:
+                price = self.connector.get_current_price(direct_pair2)
+                if price is not None and price > 0:
+                    rate2 = price
+
+            if rate2 is None:
+                tick = mt5.symbol_info_tick(direct_pair2)
+                if tick is not None:
+                    rate2 = tick.bid
+
+            # Try inverse pair
+            if rate2 is None:
+                inverse_pair2 = f"{to_currency}{bridge}"
+                if self.connector is not None:
+                    price = self.connector.get_current_price(inverse_pair2)
+                    if price is not None and price > 0:
+                        rate2 = 1.0 / price
+
+                if rate2 is None:
+                    tick = mt5.symbol_info_tick(inverse_pair2)
+                    if tick is not None and tick.ask > 0:
+                        rate2 = 1.0 / tick.ask
+
+            # If we got both legs, calculate cross rate
+            if rate2 is not None:
+                cross_rate = rate1 * rate2
+                self.logger.debug(
+                    f"Found cross-rate {from_currency}->{to_currency} via {bridge}: "
+                    f"{from_currency}->{bridge}={rate1:.5f} * {bridge}->{to_currency}={rate2:.5f} "
+                    f"= {cross_rate:.5f}"
+                )
+                return cross_rate
+
+        # No cross-rate found
+        self.logger.debug(f"No cross-rate found for {from_currency}->{to_currency}")
+        return None
+
     def format_conversion_log(
         self,
         from_currency: str,

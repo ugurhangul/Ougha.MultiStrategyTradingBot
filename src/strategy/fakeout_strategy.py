@@ -252,45 +252,47 @@ class FakeoutStrategy(BaseStrategy):
             )
 
             # Initialize position sizer with base lot size from risk manager
+            # NOTE: Position sizer initialization is now LAZY - it will be initialized
+            # on first use when price data is available. This allows strategies to
+            # initialize early (before tick data is loaded) to report required timeframes.
             if self.position_sizer is not None:
-                # Calculate initial lot size based on risk
-                # Get current price for initial calculation
+                # Try to initialize position sizer if price data is available
                 current_price = self.connector.get_current_price(self.symbol)
-                if current_price is None:
-                    self.logger.error(
-                        f"Failed to get current price for {self.symbol} - cannot initialize position sizer",
+                if current_price is not None:
+                    # Calculate a default stop loss for initialization
+                    symbol_info = self.connector.get_symbol_info(self.symbol)
+                    if symbol_info is not None:
+                        point = symbol_info['point']
+                        default_sl = current_price - (DEFAULT_INIT_SL_POINTS * point)  # Assume BUY for initialization
+
+                        initial_lot = self.risk_manager.calculate_lot_size(
+                            symbol=self.symbol,
+                            entry_price=current_price,
+                            stop_loss=default_sl
+                        )
+                        self.position_sizer.initialize(initial_lot)
+                        self.logger.info(
+                            f"Position sizer initialized: {self.position_sizer.get_name()} with {initial_lot:.2f} lots",
+                            self.symbol, strategy_key=self.key
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Symbol info not available - position sizer will be initialized on first use",
+                            self.symbol, strategy_key=self.key
+                        )
+                else:
+                    self.logger.warning(
+                        f"Price data not available - position sizer will be initialized on first use",
                         self.symbol, strategy_key=self.key
                     )
-                    return False
-
-                # Calculate a default stop loss for initialization
-                symbol_info = self.connector.get_symbol_info(self.symbol)
-                if symbol_info is None:
-                    self.logger.error(
-                        f"Failed to get symbol info for {self.symbol} - cannot initialize position sizer",
-                        self.symbol, strategy_key=self.key
-                    )
-                    return False
-
-                point = symbol_info['point']
-                default_sl = current_price - (DEFAULT_INIT_SL_POINTS * point)  # Assume BUY for initialization
-
-                initial_lot = self.risk_manager.calculate_lot_size(
-                    symbol=self.symbol,
-                    entry_price=current_price,
-                    stop_loss=default_sl
-                )
-                self.position_sizer.initialize(initial_lot)
-                self.logger.info(
-                    f"Position sizer initialized: {self.position_sizer.get_name()} with {initial_lot:.2f} lots",
-                    self.symbol, strategy_key=self.key
-                )
 
             self.is_initialized = True
             return True
 
         except Exception as e:
+            import traceback
             self.logger.error(f"Error initializing Fakeout strategy: {e}", self.symbol, strategy_key=self.key)
+            self.logger.error(f"Traceback: {traceback.format_exc()}", self.symbol, strategy_key=self.key)
             return False
 
     def on_tick(self) -> Optional[TradeSignal]:
@@ -365,6 +367,9 @@ class FakeoutStrategy(BaseStrategy):
             # Get last closed candle
             last_candle = df.iloc[-2]
             candle_time = pd.Timestamp(last_candle['time']).to_pydatetime()
+            # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+            if candle_time.tzinfo is None:
+                candle_time = candle_time.replace(tzinfo=timezone.utc)
 
             # Check if this is a new candle
             if self.last_reference_candle_time is None or candle_time > self.last_reference_candle_time:
@@ -426,6 +431,9 @@ class FakeoutStrategy(BaseStrategy):
                 for i in range(1, min(lookback_count, len(df))):
                     candle = df.iloc[-(i+1)]  # Get candle from end, skipping current
                     candle_time = pd.Timestamp(candle['time']).to_pydatetime()
+                    # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+                    if candle_time.tzinfo is None:
+                        candle_time = candle_time.replace(tzinfo=timezone.utc)
 
                     # Check if this matches the primary reference time
                     if (candle_time.hour == self.config.range_config.reference_time.hour and
@@ -464,6 +472,9 @@ class FakeoutStrategy(BaseStrategy):
                     for i in range(1, min(lookback_count, len(df))):
                         candle = df.iloc[-(i+1)]  # Get candle from end, skipping current
                         candle_time = pd.Timestamp(candle['time']).to_pydatetime()
+                        # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+                        if candle_time.tzinfo is None:
+                            candle_time = candle_time.replace(tzinfo=timezone.utc)
 
                         # Check if this matches the fallback reference time
                         if (candle_time.hour == self.config.range_config.fallback_reference_time.hour and
@@ -509,6 +520,9 @@ class FakeoutStrategy(BaseStrategy):
                 # use_specific_time=False: Use the most recent closed candle
                 candle = df.iloc[-2]  # Get second-to-last candle (most recent closed)
                 candle_time = pd.Timestamp(candle['time']).to_pydatetime()
+                # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+                if candle_time.tzinfo is None:
+                    candle_time = candle_time.replace(tzinfo=timezone.utc)
 
                 self.current_reference_candle = ReferenceCandle(
                     time=candle_time,
@@ -628,6 +642,9 @@ class FakeoutStrategy(BaseStrategy):
 
             last_candle = df.iloc[-2]
             candle_time = pd.Timestamp(last_candle['time']).to_pydatetime()
+            # BUGFIX: Ensure timezone-aware datetime to avoid comparison errors
+            if candle_time.tzinfo is None:
+                candle_time = candle_time.replace(tzinfo=timezone.utc)
 
             if self.last_confirmation_candle_time is None or candle_time > self.last_confirmation_candle_time:
                 self.last_confirmation_candle_time = candle_time

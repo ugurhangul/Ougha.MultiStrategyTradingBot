@@ -22,8 +22,7 @@ class TimeMode(Enum):
 
 class TimeGranularity(Enum):
     """Time granularity for backtesting."""
-    TICK = "tick"      # Advance tick-by-tick (highest fidelity)
-    MINUTE = "minute"  # Advance minute-by-minute (candle-based)
+    TICK = "tick"      # Advance tick-by-tick (only mode supported)
 
 
 class TimeController:
@@ -40,7 +39,6 @@ class TimeController:
     """
 
     def __init__(self, symbols: List[str], mode: TimeMode = TimeMode.MAX_SPEED,
-                 granularity: TimeGranularity = TimeGranularity.MINUTE,
                  include_position_monitor: bool = True, broker=None,
                  coordinator_id: str = "position_monitor"):
         """
@@ -49,7 +47,6 @@ class TimeController:
         Args:
             symbols: List of symbols to synchronize
             mode: Time advancement mode (REALTIME, FAST, MAX_SPEED)
-            granularity: Time granularity (TICK or MINUTE)
             include_position_monitor: Whether to include position monitor in barrier (default: True)
             broker: SimulatedBroker instance for global time advancement (backtest only)
             coordinator_id: ID of the coordinator thread that advances time (default: "position_monitor")
@@ -57,7 +54,7 @@ class TimeController:
         self.logger = get_logger()
         self.symbols = symbols
         self.mode = mode
-        self.granularity = granularity
+        self.granularity = TimeGranularity.TICK  # Always tick mode now
         self.include_position_monitor = include_position_monitor
         self.broker = broker  # For global time advancement
         self.coordinator_id = coordinator_id  # Only this thread advances time
@@ -105,21 +102,20 @@ class TimeController:
 
     def start(self):
         """Start time controller."""
-        # Validate tick timeline if in tick mode
-        if self.granularity == TimeGranularity.TICK:
-            if self.broker is None:
-                self.logger.error("TICK mode requires broker to be set!")
-                return
-            if not hasattr(self.broker, 'global_tick_timeline'):
-                self.logger.error("TICK mode enabled but broker has no global_tick_timeline!")
-                self.logger.error("Make sure tick data is loaded before starting TimeController")
-                return
-            if len(self.broker.global_tick_timeline) == 0:
-                self.logger.error("TICK mode enabled but global_tick_timeline is EMPTY!")
-                self.logger.error("Check that tick data was loaded in STEP 2 and STEP 4.5")
-                return
+        # Validate tick timeline (always required now)
+        if self.broker is None:
+            self.logger.error("Broker must be set for tick-level backtesting!")
+            return
+        if not hasattr(self.broker, 'global_tick_timeline'):
+            self.logger.error("Broker has no global_tick_timeline!")
+            self.logger.error("Make sure tick data is loaded before starting TimeController")
+            return
+        if len(self.broker.global_tick_timeline) == 0:
+            self.logger.error("Global tick timeline is EMPTY!")
+            self.logger.error("Check that tick data was loaded in STEP 2 and STEP 4.5")
+            return
 
-            self.logger.info(f"TICK mode validated: {len(self.broker.global_tick_timeline):,} ticks in timeline")
+        self.logger.info(f"Tick timeline validated: {len(self.broker.global_tick_timeline):,} ticks")
 
         self.running = True
         self.paused = False
@@ -247,19 +243,14 @@ class TimeController:
                 # Apply time delay
                 self._apply_time_delay()
 
-                # Advance global time
+                # Advance global time (tick-by-tick)
                 if self.broker is not None:
-                    if self.granularity == TimeGranularity.TICK:
-                        if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
-                            self.logger.error("TICK mode enabled but no tick timeline loaded!")
-                            self.running = False
-                        else:
-                            if not self.broker.advance_global_time_tick_by_tick():
-                                # All ticks processed
-                                self.running = False
-                    else:  # MINUTE
-                        if not self.broker.advance_global_time():
-                            # All symbols exhausted
+                    if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
+                        self.logger.error("No tick timeline loaded!")
+                        self.running = False
+                    else:
+                        if not self.broker.advance_global_time_tick_by_tick():
+                            # All ticks processed
                             self.running = False
 
                 # Increment generation and notify all waiting threads
@@ -320,19 +311,14 @@ class TimeController:
             # Apply time delay per mode
             self._apply_time_delay()
 
-            # Advance global time
+            # Advance global time (tick-by-tick)
             if self.broker is not None:
-                if self.granularity == TimeGranularity.TICK:
-                    if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
-                        self.logger.error("TICK mode enabled but no tick timeline loaded!")
-                        self.running = False
-                    else:
-                        if not self.broker.advance_global_time_tick_by_tick():
-                            # All ticks processed
-                            self.running = False
-                else:  # MINUTE
-                    if not self.broker.advance_global_time():
-                        # All symbols exhausted
+                if not hasattr(self.broker, 'global_tick_timeline') or len(self.broker.global_tick_timeline) == 0:
+                    self.logger.error("No tick timeline loaded!")
+                    self.running = False
+                else:
+                    if not self.broker.advance_global_time_tick_by_tick():
+                        # All ticks processed
                         self.running = False
 
             # Increment generation and notify waiting threads

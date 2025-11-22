@@ -86,7 +86,7 @@ except ImportError:
     console = None
 
 START_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
-END_DATE = datetime(2025, 11, 21, tzinfo=timezone.utc)
+END_DATE = datetime(2025, 1, 2, tzinfo=timezone.utc)  # DEBUG: Test with 1 day only
 
 STREAM_TICKS_FROM_DISK = True
 
@@ -96,13 +96,13 @@ INITIAL_BALANCE = 1000.0
 
 STOP_LOSS_THRESHOLD = 1.0
 
-SYMBOLS: Optional[List[str]] = ['EURUSD', 'GBPUSD', 'USDJPY', 'GBPJPY']
+SYMBOLS: Optional[List[str]] = None
 
 TIMEFRAMES = ["M1", "M5", "M15", "H1", "H4"]
 
 TIME_MODE = TimeMode.MAX_SPEED
 
-USE_TICK_DATA = True
+# Tick data is now the only execution mode (candle mode removed)
 TICK_TYPE = "INFO"
 
 USE_SEQUENTIAL_MODE = True
@@ -116,7 +116,7 @@ FORCE_REFRESH = False
 
 USE_INCREMENTAL_LOADING = True
 
-DEBUG_DATA_LOADING = True
+DEBUG_DATA_LOADING = False
 
 ENABLE_SLIPPAGE = False
 SLIPPAGE_POINTS = 0.5
@@ -233,6 +233,7 @@ def print_configuration_panel(config_data: dict, logger=None):
         logger.info(f"  Slippage:         {config_data['slippage']}")
         logger.info(f"  Leverage:         {config_data['leverage']}")
         logger.info("")
+        
 def print_results_table(metrics: dict, initial_balance: float, logger=None):
     """
     Print backtest results in a formatted table (rich if available, plain text otherwise).
@@ -449,7 +450,6 @@ def main():
     days = (END_DATE - START_DATE).days
     stop_threshold_amount = INITIAL_BALANCE * (STOP_LOSS_THRESHOLD / 100.0)
     stop_threshold_status = f"${stop_threshold_amount:,.2f} ({STOP_LOSS_THRESHOLD}%)" if STOP_LOSS_THRESHOLD > 0 else "DISABLED"
-    tick_mode_status = f"ENABLED ({TICK_TYPE})" if USE_TICK_DATA else "DISABLED (candle mode)"
     slippage_status = f"ENABLED ({SLIPPAGE_POINTS} points base)" if ENABLE_SLIPPAGE else "DISABLED"
 
     config_data = {
@@ -459,15 +459,15 @@ def main():
         'stop_threshold': stop_threshold_status,
         'timeframes': ', '.join(TIMEFRAMES),
         'time_mode': TIME_MODE.value,
-        'tick_data': tick_mode_status,
+        'tick_data': f"Tick-level execution ({TICK_TYPE})",
         'spreads': "Read from MT5 (per-symbol actual spreads)",
         'slippage': slippage_status,
         'leverage': f"{LEVERAGE:.0f}:1"
     }
 
-    if USE_TICK_DATA and days > 3:
+    if days > 3:
         config_data['tick_warning'] = f"{days} days with tick data may use significant memory!"
-        config_data['tick_warning_detail'] = "Consider reducing to 1-3 days for tick mode"
+        config_data['tick_warning_detail'] = "Consider reducing to 1-3 days for optimal performance"
 
     print_configuration_panel(config_data, logger)
 
@@ -515,25 +515,22 @@ def main():
         logger.info(f"  Force refresh: {'YES' if FORCE_REFRESH else 'NO'}")
     logger.info("")
 
-    if USE_TICK_DATA:
-        import MetaTrader5 as mt5
-        tick_cache_dir = Path(CACHE_DIR)
-        tick_cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Tick data mode: ENABLED ({TICK_TYPE})")
-        logger.info(f"  Tick cache directory: {tick_cache_dir.absolute()}")
-        logger.info(f"  (Ticks organized by date: YYYY/MM/DD/ticks/SYMBOL_TICKTYPE.parquet)")
-        logger.info("")
+    # Tick-level backtesting (only execution mode)
+    import MetaTrader5 as mt5
+    tick_cache_dir = Path(CACHE_DIR)
+    tick_cache_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Tick-level execution mode ({TICK_TYPE})")
+    logger.info(f"  Tick cache directory: {tick_cache_dir.absolute()}")
+    logger.info(f"  (Ticks organized by date: YYYY/MM/DD/ticks/SYMBOL_TICKTYPE.parquet)")
+    logger.info("")
 
-        tick_type_map = {
-            "INFO": mt5.COPY_TICKS_INFO,
-            "ALL": mt5.COPY_TICKS_ALL,
-            "TRADE": mt5.COPY_TICKS_TRADE
-        }
-        tick_type_flag = tick_type_map.get(TICK_TYPE.upper(), mt5.COPY_TICKS_INFO)
-        tick_cache_files = {}
-    else:
-        logger.info("Tick data mode: DISABLED (candle-based backtesting)")
-        logger.info("")
+    tick_type_map = {
+        "INFO": mt5.COPY_TICKS_INFO,
+        "ALL": mt5.COPY_TICKS_ALL,
+        "TRADE": mt5.COPY_TICKS_TRADE
+    }
+    tick_type_flag = tick_type_map.get(TICK_TYPE.upper(), mt5.COPY_TICKS_INFO)
+    tick_cache_files = {}
 
     data_loader = BacktestDataLoader(
         use_cache=USE_CACHE,
@@ -566,7 +563,7 @@ def main():
         active_symbols = []
 
         for sym in symbols:
-            items_for_symbol = len(TIMEFRAMES) + (1 if USE_TICK_DATA else 0)
+            items_for_symbol = len(TIMEFRAMES) + 1  # Timeframes + ticks
             total_items += items_for_symbol
 
             completed_for_symbol = 0
@@ -583,15 +580,15 @@ def main():
                 elif status in ['loading', 'building']:
                     has_loading = True
 
-            if USE_TICK_DATA:
-                tick_status = symbol_status.get((sym, 'TICKS'), {}).get('status', 'pending')
-                if tick_status == 'success':
-                    completed_for_symbol += 1
-                    completed_items += 1
-                elif tick_status == 'error':
-                    failed_for_symbol += 1
-                elif tick_status in ['loading', 'building']:
-                    has_loading = True
+            # Check tick data status
+            tick_status = symbol_status.get((sym, 'TICKS'), {}).get('status', 'pending')
+            if tick_status == 'success':
+                completed_for_symbol += 1
+                completed_items += 1
+            elif tick_status == 'error':
+                failed_for_symbol += 1
+            elif tick_status in ['loading', 'building']:
+                has_loading = True
 
             if completed_for_symbol == items_for_symbol:
                 completed_symbols += 1
@@ -615,17 +612,16 @@ def main():
             summary.append("  |  Active: ", style="bold")
             summary.append(f"{len(active_symbols)}", style="cyan")
 
-            if USE_TICK_DATA:
-                loading_ticks = 0
-                for sym in active_symbols:
-                    tick_key = (sym, 'TICKS')
-                    tick_info = symbol_status.get(tick_key, {})
-                    if tick_info.get('status') == 'loading':
-                        loading_ticks += 1
+            loading_ticks = 0
+            for sym in active_symbols:
+                tick_key = (sym, 'TICKS')
+                tick_info = symbol_status.get(tick_key, {})
+                if tick_info.get('status') == 'loading':
+                    loading_ticks += 1
 
-                if loading_ticks > 0:
-                    summary.append("  |  Parallel: ", style="bold")
-                    summary.append(f"{PARALLEL_TICK_DAYS} days/symbol", style="magenta")
+            if loading_ticks > 0:
+                summary.append("  |  Parallel: ", style="bold")
+                summary.append(f"{PARALLEL_TICK_DAYS} days/symbol", style="magenta")
 
         table = Table(show_header=True, header_style="bold cyan",
                      box=None, padding=(0, 1), expand=False)
@@ -655,28 +651,22 @@ def main():
                     current_item = tf
                     status_message = status_info.get('message', '')
 
-            tick_status = 'pending'
-            tick_count = 0
-            tick_day_progress = ''
-            tick_current_day = ''
-            tick_substatus = ''
-            tick_metadata = {}
-            if USE_TICK_DATA:
-                tick_key = (sym, 'TICKS')
-                tick_info = symbol_status.get(tick_key, {})
-                tick_status = tick_info.get('status', 'pending')
-                tick_count = tick_info.get('bars', 0)
-                tick_day_progress = tick_info.get('day_progress', '')
-                tick_current_day = tick_info.get('current_day', '')
-                tick_substatus = tick_info.get('tick_status', '')
-                tick_metadata = tick_info.get('metadata', {})
+            # Get tick data status
+            tick_key = (sym, 'TICKS')
+            tick_info = symbol_status.get(tick_key, {})
+            tick_status = tick_info.get('status', 'pending')
+            tick_count = tick_info.get('bars', 0)
+            tick_day_progress = tick_info.get('day_progress', '')
+            tick_current_day = tick_info.get('current_day', '')
+            tick_substatus = tick_info.get('tick_status', '')
+            tick_metadata = tick_info.get('metadata', {})
 
-                if tick_status in ['loading', 'building']:
-                    current_status = tick_status
-                    current_item = 'TICKS'
-                    status_message = tick_info.get('message', '')
+            if tick_status in ['loading', 'building']:
+                current_status = tick_status
+                current_item = 'TICKS'
+                status_message = tick_info.get('message', '')
 
-            total_items = len(TIMEFRAMES) + (1 if USE_TICK_DATA else 0)
+            total_items = len(TIMEFRAMES) + 1  # Timeframes + ticks
             completed_items = len(completed_tfs) + (1 if tick_status == 'success' else 0)
 
             if current_item:
@@ -749,10 +739,7 @@ def main():
             elif completed_items == total_items:
                 status_icon = "✓"
                 status_color = "green"
-                if USE_TICK_DATA:
-                    status_text = f"All data loaded ({len(TIMEFRAMES)} TFs + {tick_count:,} ticks)"
-                else:
-                    status_text = f"All {len(TIMEFRAMES)} timeframes loaded"
+                status_text = f"All data loaded ({len(TIMEFRAMES)} TFs + {tick_count:,} ticks)"
             elif completed_tfs:
                 status_icon = "⏳"
                 status_color = "yellow"
@@ -837,20 +824,20 @@ def main():
             logger.error(f"{symbol} {timeframe}: Load error: {e}")
             return timeframe, None, time.time() - load_start
 
-    async def load_ticks_async(executor, symbol, START_DATE, END_DATE, tick_type_flag, tick_cache_dir, progress_callback=None):
+    async def load_ticks_async(executor, symbol, data_load_start, END_DATE, tick_type_flag, tick_cache_dir, progress_callback=None):
         """Load tick data asynchronously."""
         loop = asyncio.get_event_loop()
 
         ticks_df = await loop.run_in_executor(
             executor,
-            partial(data_loader.load_ticks_from_mt5, symbol, START_DATE, END_DATE, tick_type_flag,
+            partial(data_loader.load_ticks_from_mt5, symbol, data_load_start, END_DATE, tick_type_flag,
                    str(tick_cache_dir), progress_callback, PARALLEL_TICK_DAYS)
         )
 
         return ticks_df
 
     async def load_symbol_data_async(executor, symbol, TIMEFRAMES, data_load_start, END_DATE, FORCE_REFRESH,
-                                     USE_TICK_DATA, START_DATE, tick_type_flag, tick_cache_dir, live, symbol_status):
+                                     START_DATE, tick_type_flag, tick_cache_dir, live, symbol_status):
         """Load all data for a single symbol asynchronously."""
         loaded_timeframes = []
         has_insufficient_data = False
@@ -859,171 +846,169 @@ def main():
         tick_cache_file = None
         ticks_df = None
 
-        if USE_TICK_DATA:
-            symbol_status[(symbol, 'TICKS')] = {'status': 'loading', 'bars': 0, 'message': 'Loading ticks...',
-                                               'day_progress': '0/0', 'current_day': ''}
+        # Load tick data (always required for tick-level execution)
+        # NOTE: Load from data_load_start (includes HISTORICAL_BUFFER_DAYS) for indicator calculation
+        symbol_status[(symbol, 'TICKS')] = {'status': 'loading', 'bars': 0, 'message': 'Loading ticks...',
+                                           'day_progress': '0/0', 'current_day': ''}
+        live.update(create_loading_table(symbol, 'TICKS', symbol_status))
+
+        logger.info(f"[STEP 1] Loading tick data for {symbol}...")
+
+        def tick_progress_callback(day_idx, total_days, day_date, status, ticks_count, message, metadata=None):
+            """Update tick loading progress in the live table."""
+            symbol_status[(symbol, 'TICKS')] = {
+                'status': 'loading',
+                'bars': ticks_count,
+                'message': message,
+                'day_progress': f'{day_idx}/{total_days}',
+                'current_day': str(day_date),
+                'tick_status': status,
+                'metadata': metadata or {}
+            }
             live.update(create_loading_table(symbol, 'TICKS', symbol_status))
 
-            logger.info(f"[STEP 1] Loading tick data for {symbol}...")
+        ticks_df = await load_ticks_async(executor, symbol, data_load_start, END_DATE, tick_type_flag,
+                                         tick_cache_dir, tick_progress_callback)
 
-            def tick_progress_callback(day_idx, total_days, day_date, status, ticks_count, message, metadata=None):
-                """Update tick loading progress in the live table."""
-                symbol_status[(symbol, 'TICKS')] = {
-                    'status': 'loading',
-                    'bars': ticks_count,
-                    'message': message,
-                    'day_progress': f'{day_idx}/{total_days}',
-                    'current_day': str(day_date),
-                    'tick_status': status,
-                    'metadata': metadata or {}
-                }
-                live.update(create_loading_table(symbol, 'TICKS', symbol_status))
-
-            ticks_df = await load_ticks_async(executor, symbol, START_DATE, END_DATE, tick_type_flag,
-                                             tick_cache_dir, tick_progress_callback)
-
-            if ticks_df is not None and len(ticks_df) > 0:
-                logger.info(f"{symbol}: {len(ticks_df):,} ticks loaded")
-                symbol_status[(symbol, 'TICKS')] = {
-                    'status': 'success',
-                    'bars': len(ticks_df),
-                    'message': f'{len(ticks_df):,} ticks',
-                    'day_progress': '',
-                    'current_day': ''
-                }
-                live.update(create_loading_table(symbol, 'TICKS', symbol_status))
-            else:
-                logger.warning(f"{symbol}: No tick data available")
-                symbol_status[(symbol, 'TICKS')] = {
-                    'status': 'error',
-                    'bars': 0,
-                    'message': 'No tick data',
-                    'day_progress': '',
-                    'current_day': ''
-                }
-                live.update(create_loading_table(symbol, 'TICKS', symbol_status))
-                has_insufficient_data = True
-
-        logger.info(f"[STEP 2] Loading candles for {symbol}...")
-        tasks = [
-            load_timeframe_async(executor, symbol, tf, data_load_start, END_DATE, FORCE_REFRESH, ticks_df)
-            for tf in TIMEFRAMES
-        ]
-
-        for tf in TIMEFRAMES:
-            symbol_status[(symbol, tf)] = {'status': 'loading', 'bars': 0, 'message': ''}
-        live.update(create_loading_table(symbol, TIMEFRAMES[0], symbol_status))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                if isinstance(result, asyncio.CancelledError):
-                    raise result
-                logger.error(f"{symbol}: Error loading data: {result}")
-                has_insufficient_data = True
-                continue
-
-            timeframe, data_result, load_time = result
-            load_times[(symbol, timeframe)] = load_time
-            logger.info(f"{symbol} {timeframe}: Load time = {load_time:.2f}s")
-
-            if data_result is None:
-                logger.error(f"Failed to load {timeframe} data for {symbol}")
-                symbol_status[(symbol, timeframe)] = {
-                    'status': 'error',
-                    'bars': 0,
-                    'message': 'Failed to load'
-                }
-                live.update(create_loading_table(symbol, timeframe, symbol_status))
-                has_insufficient_data = True
-                continue
-
-            df, info = data_result
-
-            min_bars_expected = {
-                'M1': duration.days * 1000,
-                'M5': duration.days * 200,
-                'M15': duration.days * 60,
-                'H4': duration.days * 5,
+        if ticks_df is not None and len(ticks_df) > 0:
+            logger.info(f"{symbol}: {len(ticks_df):,} ticks loaded")
+            symbol_status[(symbol, 'TICKS')] = {
+                'status': 'success',
+                'bars': len(ticks_df),
+                'message': f'{len(ticks_df):,} ticks',
+                'day_progress': '',
+                'current_day': ''
             }
+            live.update(create_loading_table(symbol, 'TICKS', symbol_status))
+        else:
+            logger.warning(f"{symbol}: No tick data available")
+            symbol_status[(symbol, 'TICKS')] = {
+                'status': 'error',
+                'bars': 0,
+                'message': 'No tick data',
+                'day_progress': '',
+                'current_day': ''
+            }
+            live.update(create_loading_table(symbol, 'TICKS', symbol_status))
+            has_insufficient_data = True
 
-            min_required = min_bars_expected.get(timeframe, 10)
-            if len(df) < min_required:
-                logger.warning(
-                    f"{symbol} {timeframe}: Only {len(df)} bars loaded "
-                    f"(expected at least {min_required} for {duration.days} days)"
+        logger.info(f"[STEP 2] Loading candles for {symbol} (sequential: M1 → M5 → M15 → H1 → H4 → D1)...")
+
+        # Load timeframes sequentially (not in parallel)
+        for timeframe in TIMEFRAMES:
+            symbol_status[(symbol, timeframe)] = {'status': 'loading', 'bars': 0, 'message': ''}
+            live.update(create_loading_table(symbol, timeframe, symbol_status))
+
+            try:
+                # Load this timeframe (pass ticks_df so candles can be built from ticks if needed)
+                timeframe, data_result, load_time = await load_timeframe_async(
+                    executor, symbol, timeframe, data_load_start, END_DATE, FORCE_REFRESH, ticks_df
                 )
-                if len(df) < 10:
-                    logger.error(f"{symbol} {timeframe}: Insufficient data (< 10 bars)")
+
+                load_times[(symbol, timeframe)] = load_time
+                logger.info(f"{symbol} {timeframe}: Load time = {load_time:.2f}s")
+
+                if data_result is None:
+                    logger.error(f"Failed to load {timeframe} data for {symbol}")
                     symbol_status[(symbol, timeframe)] = {
                         'status': 'error',
-                        'bars': len(df),
-                        'message': 'Insufficient data'
+                        'bars': 0,
+                        'message': 'Failed to load'
                     }
                     live.update(create_loading_table(symbol, timeframe, symbol_status))
                     has_insufficient_data = True
                     continue
 
-            symbol_data_local[(symbol, timeframe)] = df
-            loaded_timeframes.append(timeframe)
+                df, info = data_result
 
-            if symbol_info_local is None:
-                symbol_info_local = info
+                # Store the loaded data (no minimum bars validation - candles built from ticks if needed)
+                symbol_data_local[(symbol, timeframe)] = df
+                loaded_timeframes.append(timeframe)
 
-            logger.info(f"{symbol} {timeframe}: {len(df):,} bars loaded")
-            symbol_status[(symbol, timeframe)] = {
-                'status': 'success',
-                'bars': len(df),
-                'message': 'Loaded'
-            }
-            live.update(create_loading_table(symbol, timeframe, symbol_status))
+                if symbol_info_local is None:
+                    symbol_info_local = info
 
-        if USE_TICK_DATA and ticks_df is not None and len(ticks_df) > 0:
+                logger.info(f"{symbol} {timeframe}: {len(df):,} bars loaded")
+                symbol_status[(symbol, timeframe)] = {
+                    'status': 'success',
+                    'bars': len(df),
+                    'message': 'Loaded'
+                }
+                live.update(create_loading_table(symbol, timeframe, symbol_status))
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"{symbol} {timeframe}: Error loading data: {e}")
+                symbol_status[(symbol, timeframe)] = {
+                    'status': 'error',
+                    'bars': 0,
+                    'message': f'Error: {str(e)}'
+                }
+                live.update(create_loading_table(symbol, timeframe, symbol_status))
+                has_insufficient_data = True
+                continue
+
+        if ticks_df is not None and len(ticks_df) > 0:
             tick_cache_files[symbol] = True
-
+            # Free memory after loading
             del ticks_df
 
         return symbol, loaded_timeframes, has_insufficient_data, symbol_data_local, symbol_info_local, tick_cache_file
 
     async def load_all_data_async():
-        """Load all symbol data asynchronously."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        """Load all symbol data in parallel (multiple symbols at once)."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             with Live(create_loading_table(None, None, symbol_status), console=console, refresh_per_second=1) as live:
-                tasks = [
-                    load_symbol_data_async(
-                        executor, symbol, TIMEFRAMES, data_load_start, END_DATE, FORCE_REFRESH,
-                        USE_TICK_DATA, START_DATE, tick_type_flag if USE_TICK_DATA else None,
-                        tick_cache_dir if USE_TICK_DATA else None, live, symbol_status
-                    )
-                    for symbol in symbols
-                ]
+                # Process symbols in parallel
+                logger.info(f"")
+                logger.info(f"{'=' * 80}")
+                logger.info(f"Loading data for {len(symbols)} symbols in parallel...")
+                logger.info(f"{'=' * 80}")
 
+                # Create tasks for all symbols
+                tasks = []
+                for symbol in symbols:
+                    task = load_symbol_data_async(
+                        executor, symbol, TIMEFRAMES, data_load_start, END_DATE, FORCE_REFRESH,
+                        START_DATE, tick_type_flag, tick_cache_dir, live, symbol_status
+                    )
+                    tasks.append(task)
+
+                # Wait for all symbols to complete
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                # Process results
                 for result in results:
                     if isinstance(result, Exception):
-                        if isinstance(result, asyncio.CancelledError):
-                            raise result
                         logger.error(f"Error loading symbol data: {result}")
+                        import traceback
+                        logger.error(traceback.format_exc())
                         continue
 
-                    symbol, loaded_timeframes, has_insufficient_data, symbol_data_local, symbol_info_local, tick_cache_file = result
+                    try:
+                        symbol, loaded_timeframes, has_insufficient_data, symbol_data_local, symbol_info_local, tick_cache_file = result
 
-                    if has_insufficient_data or len(loaded_timeframes) != len(TIMEFRAMES):
-                        if has_insufficient_data:
-                            logger.warning(f"Skipping {symbol} - insufficient historical data")
+                        if has_insufficient_data or len(loaded_timeframes) != len(TIMEFRAMES):
+                            if has_insufficient_data:
+                                logger.warning(f"Skipping {symbol} - insufficient historical data")
+                            else:
+                                missing = set(TIMEFRAMES) - set(loaded_timeframes)
+                                logger.warning(f"Skipping {symbol} - missing timeframes: {', '.join(missing)}")
                         else:
-                            missing = set(TIMEFRAMES) - set(loaded_timeframes)
-                            logger.warning(f"Skipping {symbol} - missing timeframes: {', '.join(missing)}")
-                    else:
-                        symbol_data.update(symbol_data_local)
-                        if symbol_info_local:
-                            symbol_info[symbol] = symbol_info_local
-                        if tick_cache_file:
-                            tick_cache_files[symbol] = tick_cache_file
-                        symbols_with_all_timeframes.append(symbol)
-                        logger.info(f"{symbol}: All {len(TIMEFRAMES)} timeframes loaded successfully")
+                            symbol_data.update(symbol_data_local)
+                            if symbol_info_local:
+                                symbol_info[symbol] = symbol_info_local
+                            if tick_cache_file:
+                                tick_cache_files[symbol] = tick_cache_file
+                            symbols_with_all_timeframes.append(symbol)
+                            logger.info(f"{symbol}: All {len(TIMEFRAMES)} timeframes loaded successfully")
+
+                    except Exception as e:
+                        logger.error(f"Error processing symbol result: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        continue
 
     try:
         asyncio.run(load_all_data_async())
@@ -1050,15 +1035,14 @@ def main():
     if symbols:
         logger.info(f"Symbols to backtest: {', '.join(symbols)}")
 
-    if USE_TICK_DATA:
-        logger.info("")
-        logger.info(f"Tick data loaded for {len(tick_cache_files)}/{len(symbols)} symbols")
+    logger.info("")
+    logger.info(f"Tick data loaded for {len(tick_cache_files)}/{len(symbols)} symbols")
 
-        if tick_cache_files:
-            logger.info(f"  Tick data ready for {len(tick_cache_files)} symbols")
-            logger.info(f"  Cache organized by date: {tick_cache_dir}/YYYY/MM/DD/ticks/")
+    if tick_cache_files:
+        logger.info(f"  Tick data ready for {len(tick_cache_files)} symbols")
+        logger.info(f"  Cache organized by date: {tick_cache_dir}/YYYY/MM/DD/ticks/")
 
-        log_memory(logger, "after tick data loading")
+    log_memory(logger, "after tick data loading")
 
     logger.info("")
     logger.info("=" * 60)
@@ -1076,6 +1060,9 @@ def main():
     console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
     console.print("[bold cyan]STEP 2.5: Loading Currency Conversion Pairs[/bold cyan]")
     console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
+    logger.info("=" * 80)
+    logger.info("STEP 2.5: Loading Currency Conversion Pairs")
+    logger.info("=" * 80)
 
     needed_conversions = set()
     for symbol in symbols:
@@ -1088,10 +1075,13 @@ def main():
 
     if len(needed_conversions) == 0:
         console.print("[green]✓ All symbols use USD - no conversion pairs needed[/green]\n")
+        logger.info("✓ All symbols use USD - no conversion pairs needed")
     else:
         console.print(f"[yellow]Detected {len(needed_conversions)} currencies needing conversion to USD:[/yellow]")
+        logger.info(f"Detected {len(needed_conversions)} currencies needing conversion to USD:")
         for currency, direct, inverse in sorted(needed_conversions):
             console.print(f"  [dim]• {currency} → USD (will try {direct} or {inverse})[/dim]")
+            logger.info(f"  • {currency} → USD (will try {direct} or {inverse})")
         console.print("")
 
         conversion_pairs_loaded = 0
@@ -1108,12 +1098,34 @@ def main():
             task = progress.add_task("[cyan]Loading conversion pairs...", total=len(needed_conversions))
 
             for currency, direct_pair, inverse_pair in needed_conversions:
-                if direct_pair in symbols or inverse_pair in symbols:
-                    loaded_pair = direct_pair if direct_pair in symbols else inverse_pair
-                    progress.update(task, advance=1, description=f"[green]✓ {currency}USD (already loaded)[/green]")
-                    logger.info(f"{currency}USD: Already loaded as trading symbol ({loaded_pair})")
-                    conversion_pairs_loaded += 1
-                    continue
+                # Check if already loaded as trading symbol AND has valid M1 data at START_DATE
+                if direct_pair in symbols:
+                    if (direct_pair, 'M1') in symbol_data:
+                        df = symbol_data[(direct_pair, 'M1')]
+                        df_at_start = df[df['time'] >= START_DATE]
+                        if len(df_at_start) > 0:
+                            progress.update(task, advance=1, description=f"[green]✓ {currency}USD (already loaded as trading symbol)[/green]")
+                            logger.info(f"{currency}USD: Already loaded as trading symbol ({direct_pair}), {len(df_at_start)} bars at/after START_DATE")
+                            conversion_pairs_loaded += 1
+                            continue
+                        else:
+                            logger.warning(f"{currency}USD: {direct_pair} loaded as trading symbol but has 0 bars at/after START_DATE, will try to fetch live rate")
+                    else:
+                        logger.warning(f"{currency}USD: {direct_pair} in symbols list but no M1 data in symbol_data, will try to fetch live rate")
+
+                if inverse_pair in symbols:
+                    if (inverse_pair, 'M1') in symbol_data:
+                        df = symbol_data[(inverse_pair, 'M1')]
+                        df_at_start = df[df['time'] >= START_DATE]
+                        if len(df_at_start) > 0:
+                            progress.update(task, advance=1, description=f"[green]✓ {currency}USD (already loaded as trading symbol, inverted)[/green]")
+                            logger.info(f"{currency}USD: Already loaded as trading symbol ({inverse_pair}, will invert), {len(df_at_start)} bars at/after START_DATE")
+                            conversion_pairs_loaded += 1
+                            continue
+                        else:
+                            logger.warning(f"{currency}USD: {inverse_pair} loaded as trading symbol but has 0 bars at/after START_DATE, will try to fetch live rate")
+                    else:
+                        logger.warning(f"{currency}USD: {inverse_pair} in symbols list but no M1 data in symbol_data, will try to fetch live rate")
 
                 progress.update(task, description=f"[cyan]Loading {direct_pair}...[/cyan]")
                 result = data_loader.load_from_mt5(
@@ -1123,13 +1135,17 @@ def main():
 
                 if result is not None:
                     df, info = result
-                    if len(df) >= 10:
+                    # Validate: Must have >= 10 bars AND at least 1 bar at or after START_DATE
+                    df_at_start = df[df['time'] >= START_DATE]
+                    if len(df) >= 10 and len(df_at_start) > 0:
                         symbol_data[(direct_pair, 'M1')] = df
                         symbol_info[direct_pair] = info
                         progress.update(task, advance=1, description=f"[green]✓ {currency}USD ({direct_pair})[/green]")
-                        logger.info(f"{currency}USD: {len(df):,} bars loaded ({direct_pair})")
+                        logger.info(f"{currency}USD: {len(df):,} bars loaded ({direct_pair}), {len(df_at_start)} bars at/after START_DATE")
                         conversion_pairs_loaded += 1
                         continue
+                    elif len(df) >= 10:
+                        logger.warning(f"{currency}USD: {direct_pair} has {len(df)} bars but 0 at/after START_DATE (last bar: {df.iloc[-1]['time']})")
 
                 progress.update(task, description=f"[cyan]Loading {inverse_pair}...[/cyan]")
                 result = data_loader.load_from_mt5(
@@ -1139,12 +1155,17 @@ def main():
 
                 if result is not None:
                     df, info = result
-                    if len(df) >= 10:
+                    # Validate: Must have >= 10 bars AND at least 1 bar at or after START_DATE
+                    df_at_start = df[df['time'] >= START_DATE]
+                    if len(df) >= 10 and len(df_at_start) > 0:
                         symbol_data[(inverse_pair, 'M1')] = df
                         symbol_info[inverse_pair] = info
                         progress.update(task, advance=1, description=f"[green]✓ {currency}USD ({inverse_pair}, inverted)[/green]")
-                        logger.info(f"{currency}USD: {len(df):,} bars loaded ({inverse_pair}, will invert)")
+                        logger.info(f"{currency}USD: {len(df):,} bars loaded ({inverse_pair}, will invert), {len(df_at_start)} bars at/after START_DATE")
                         conversion_pairs_loaded += 1
+                    elif len(df) >= 10:
+                        progress.update(task, advance=1, description=f"[red]✗ {currency}USD (no data at START_DATE)[/red]")
+                        logger.warning(f"{currency}USD: {inverse_pair} has {len(df)} bars but 0 at/after START_DATE (last bar: {df.iloc[-1]['time']})")
                     else:
                         progress.update(task, advance=1, description=f"[red]✗ {currency}USD (insufficient data)[/red]")
                         logger.warning(f"{currency}USD: Insufficient data for {inverse_pair} ({len(df)} bars)")
@@ -1153,9 +1174,13 @@ def main():
                     logger.warning(f"{currency}USD: Neither {direct_pair} nor {inverse_pair} available in MT5")
 
         console.print(f"\n[green]✓ Loaded {conversion_pairs_loaded}/{len(needed_conversions)} conversion pairs[/green]")
+        logger.info(f"✓ Loaded {conversion_pairs_loaded}/{len(needed_conversions)} conversion pairs")
         if conversion_pairs_loaded < len(needed_conversions):
-            console.print("[yellow]⚠ Some conversion pairs missing - profit calculations may be inaccurate[/yellow]")
+            console.print("[yellow]⚠ Some conversion pairs missing - will fetch live rates from MT5 during pre-conversion[/yellow]")
+            logger.warning("⚠ Some conversion pairs missing - will fetch live rates from MT5 during pre-conversion")
         console.print("[dim]Note: Inverse pairs will be automatically inverted during backtest (e.g., JPY rate = 1/USDJPY)[/dim]\n")
+        logger.info("Note: Inverse pairs will be automatically inverted during backtest (e.g., JPY rate = 1/USDJPY)")
+        logger.info("")
 
     if USE_CACHE:
         cache_stats = data_loader.get_cache_stats()
@@ -1192,27 +1217,80 @@ def main():
     logger.info("Converting tick_value to USD for all symbols...")
 
     def get_conversion_rate_from_data(from_currency: str, to_currency: str) -> Optional[float]:
-        """Get conversion rate from loaded symbol_data."""
+        """
+        Get conversion rate from loaded symbol_data or live MT5.
+
+        Priority:
+        1. Use historical data at START_DATE from symbol_data (if available)
+        2. Fetch current live rate from MT5 using symbol_info_tick()
+        3. Return None if both fail
+
+        This mimics MT5 Strategy Tester behavior.
+        """
         if from_currency == to_currency:
             return 1.0
 
         direct_pair = f"{from_currency}{to_currency}"
+        inverse_pair = f"{to_currency}{from_currency}"
+
+        # Try direct pair (e.g., AUDUSD)
         if (direct_pair, 'M1') in symbol_data:
             df = symbol_data[(direct_pair, 'M1')]
             if len(df) > 0:
-                return float(df.iloc[0]['close'])
+                # Find the first bar at or after START_DATE (not from historical buffer)
+                df_filtered = df[df['time'] >= START_DATE]
+                if len(df_filtered) > 0:
+                    rate = float(df_filtered.iloc[0]['close'])
+                    return rate
 
-        inverse_pair = f"{to_currency}{from_currency}"
+        # Try inverse pair (e.g., USDAUD)
         if (inverse_pair, 'M1') in symbol_data:
             df = symbol_data[(inverse_pair, 'M1')]
             if len(df) > 0:
-                price = float(df.iloc[0]['close'])
-                if price > 0:
-                    return 1.0 / price
+                # Find the first bar at or after START_DATE (not from historical buffer)
+                df_filtered = df[df['time'] >= START_DATE]
+                if len(df_filtered) > 0:
+                    price = float(df_filtered.iloc[0]['close'])
+                    if price > 0:
+                        rate = 1.0 / price
+                        return rate
 
+        # Conversion pair not found in historical data at START_DATE
+        # Fallback: Fetch current live rate from MT5 (mimics MT5 Strategy Tester behavior)
+        logger.info(f"  ⚙ {from_currency}→{to_currency}: No historical data at START_DATE, fetching live rate from MT5...")
+
+        # Ensure MT5 is initialized and connected
+        if not mt5.terminal_info():
+            logger.warning(f"  ⚠ {from_currency}→{to_currency}: MT5 not initialized, cannot fetch live rate")
+            return None
+
+        # Try direct pair from live MT5
+        # First, try to select the symbol in Market Watch
+        if mt5.symbol_select(direct_pair, True):
+            tick = mt5.symbol_info_tick(direct_pair)
+            if tick is not None and tick.bid > 0:
+                rate = tick.bid
+                logger.info(f"  ✓ {from_currency}→{to_currency}: Using live MT5 rate from {direct_pair}: {rate:.5f}")
+                return rate
+
+        # Try inverse pair from live MT5
+        if mt5.symbol_select(inverse_pair, True):
+            tick = mt5.symbol_info_tick(inverse_pair)
+            if tick is not None and tick.ask > 0:
+                rate = 1.0 / tick.ask
+                logger.info(f"  ✓ {from_currency}→{to_currency}: Using live MT5 inverse rate from {inverse_pair}: {rate:.5f}")
+                return rate
+
+        # No conversion available (neither historical nor live)
+        usd_pairs = [k[0] for k in symbol_data.keys() if 'USD' in k[0] and k[1] == 'M1']
+        logger.warning(f"  ⚠ {from_currency}→{to_currency}: Neither {direct_pair} nor {inverse_pair} found in symbol_data or live MT5")
+        logger.warning(f"    Available USD pairs in symbol_data: {', '.join(sorted(usd_pairs)[:10])}{'...' if len(usd_pairs) > 10 else ''}")
         return None
 
     converted_symbol_info = {}
+    conversion_success_count = 0
+    conversion_failure_count = 0
+
     for symbol, info in symbol_info.items():
         converted_info = info.copy()
 
@@ -1224,18 +1302,29 @@ def main():
             if conversion_rate is not None:
                 tick_value_usd = tick_value_raw * conversion_rate
                 converted_info['tick_value'] = tick_value_usd
-                converted_info['currency_profit'] = 'USD'
+                converted_info['currency_profit'] = 'USD'  # IMPORTANT: Mark as converted to USD
                 logger.info(
                     f"  ✓ {symbol}: tick_value converted {currency_profit}→USD: "
                     f"{tick_value_raw:.5f} × {conversion_rate:.5f} = {tick_value_usd:.5f}"
                 )
+                conversion_success_count += 1
             else:
                 logger.warning(
                     f"  ⚠ {symbol}: Failed to convert tick_value from {currency_profit} to USD, "
-                    f"using raw value {tick_value_raw:.5f}"
+                    f"using raw value {tick_value_raw:.5f} (currency_profit will remain {currency_profit})"
                 )
+                conversion_failure_count += 1
 
         converted_symbol_info[symbol] = converted_info
+
+    logger.info("")
+    logger.info(f"Tick value conversion summary:")
+    logger.info(f"  ✓ Successfully converted: {conversion_success_count} symbols")
+    if conversion_failure_count > 0:
+        logger.warning(f"  ⚠ Failed to convert: {conversion_failure_count} symbols")
+        logger.warning(f"     These symbols will use raw tick values - risk calculations may be incorrect!")
+        logger.warning(f"     This mimics MT5 Strategy Tester behavior when conversion pairs are unavailable.")
+    logger.info("")
 
     loaded_count = 0
     conversion_count = 0
@@ -1261,333 +1350,253 @@ def main():
     broker.set_start_time(START_DATE)
     logger.info("")
 
-    if USE_TICK_DATA:
-        console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
-        console.print("[bold cyan]STEP 4.5: Early Strategy Initialization (for timeframe collection)[/bold cyan]")
-        console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
+    console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
+    console.print("[bold cyan]STEP 4.5: Early Strategy Initialization (for timeframe collection)[/bold cyan]")
+    console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
 
-        logger.info("=" * 80)
-        logger.info("STEP 4.5: Early Strategy Initialization (for timeframe collection)")
-        logger.info("=" * 80)
-        logger.info("  PERFORMANCE OPTIMIZATION: Initializing strategies early to collect required timeframes")
-        logger.info("  This allows us to only build candles for timeframes that strategies actually use")
-        logger.info("")
+    logger.info("=" * 80)
+    logger.info("STEP 4.5: Early Strategy Initialization (for timeframe collection)")
+    logger.info("=" * 80)
+    logger.info("  PERFORMANCE OPTIMIZATION: Initializing strategies early to collect required timeframes")
+    logger.info("  This allows us to only build candles for timeframes that strategies actually use")
+    logger.info("")
 
-        time_granularity = TimeGranularity.TICK
-        time_controller = TimeController(
-            symbols,
-            mode=TIME_MODE,
-            granularity=time_granularity,
-            include_position_monitor=True,
-            broker=broker
-        )
-        logger.info(f"  ✓ TimeController initialized (early)")
+    time_controller = TimeController(
+        symbols,
+        mode=TIME_MODE,
+        include_position_monitor=True,
+        broker=broker
+    )
+    logger.info(f"  ✓ TimeController initialized (early)")
 
-        risk_manager = RiskManager(
-            connector=broker,
-            risk_config=config.risk,
-            persistence=backtest_persistence
-        )
-        logger.info("  ✓ RiskManager initialized (early)")
+    risk_manager = RiskManager(
+        connector=broker,
+        risk_config=config.risk,
+        persistence=backtest_persistence
+    )
+    logger.info("  ✓ RiskManager initialized (early)")
 
-        order_manager = OrderManager(
-            connector=broker,
-            magic_number=config.advanced.magic_number,
-            trade_comment=config.advanced.trade_comment,
-            persistence=backtest_persistence,
-            risk_manager=risk_manager
-        )
-        logger.info("  ✓ OrderManager initialized (early)")
+    order_manager = OrderManager(
+        connector=broker,
+        magic_number=config.advanced.magic_number,
+        trade_comment=config.advanced.trade_comment,
+        persistence=backtest_persistence,
+        risk_manager=risk_manager
+    )
+    logger.info("  ✓ OrderManager initialized (early)")
 
-        indicators = TechnicalIndicators()
-        logger.info("  ✓ TechnicalIndicators initialized (early)")
+    indicators = TechnicalIndicators()
+    logger.info("  ✓ TechnicalIndicators initialized (early)")
 
-        trade_manager = TradeManager(
-            connector=broker,
-            order_manager=order_manager,
-            trailing_config=config.trailing_stop,
-            use_breakeven=config.advanced.use_breakeven,
-            breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
-            indicators=indicators,
-            range_configs=config.range_config.ranges
-        )
-        logger.info("  ✓ TradeManager initialized (early)")
+    trade_manager = TradeManager(
+        connector=broker,
+        order_manager=order_manager,
+        trailing_config=config.trailing_stop,
+        use_breakeven=config.advanced.use_breakeven,
+        breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
+        indicators=indicators,
+        range_configs=config.range_config.ranges
+    )
+    logger.info("  ✓ TradeManager initialized (early)")
 
-        backtest_controller = BacktestController(
-            simulated_broker=broker,
-            time_controller=time_controller,
-            order_manager=order_manager,
-            risk_manager=risk_manager,
-            trade_manager=trade_manager,
-            indicators=indicators,
-            stop_loss_threshold=STOP_LOSS_THRESHOLD
-        )
+    backtest_controller = BacktestController(
+        simulated_broker=broker,
+        time_controller=time_controller,
+        order_manager=order_manager,
+        risk_manager=risk_manager,
+        trade_manager=trade_manager,
+        indicators=indicators,
+        stop_loss_threshold=STOP_LOSS_THRESHOLD
+    )
 
-        if not backtest_controller.initialize(symbols):
-            logger.error("Failed to initialize BacktestController")
-            logger.error("Check your .env configuration and strategy settings")
-            return False
+    if not backtest_controller.initialize(symbols):
+        logger.error("Failed to initialize BacktestController")
+        logger.error("Check your .env configuration and strategy settings")
+        return False
 
-        logger.info("  ✓ Strategies initialized (early)")
-        logger.info("")
+    logger.info("  ✓ Strategies initialized (early)")
+    logger.info("")
 
-        logger.info("  Collecting required timeframes from strategies...")
-        required_timeframes_set = set()
-        for symbol, strategy in backtest_controller.trading_controller.strategies.items():
-            if hasattr(strategy, 'strategies') and isinstance(strategy.strategies, dict):
-                for strategy_key, sub_strategy in strategy.strategies.items():
-                    timeframes = sub_strategy.get_required_timeframes()
-                    if timeframes:
-                        required_timeframes_set.update(timeframes)
-                        logger.info(f"    {symbol} - {strategy_key}: {timeframes}")
-                    else:
-                        logger.info(f"    {symbol} - {strategy_key}: [] (tick-only)")
-            else:
-                timeframes = strategy.get_required_timeframes()
+    logger.info("  Collecting required timeframes from strategies...")
+    required_timeframes_set = set()
+    for symbol, strategy in backtest_controller.trading_controller.strategies.items():
+        if hasattr(strategy, 'strategies') and isinstance(strategy.strategies, dict):
+            for strategy_key, sub_strategy in strategy.strategies.items():
+                timeframes = sub_strategy.get_required_timeframes()
                 if timeframes:
                     required_timeframes_set.update(timeframes)
-                    strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
-                    logger.info(f"    {symbol} - {strategy_name}: {timeframes}")
+                    logger.info(f"    {symbol} - {strategy_key}: {timeframes}")
                 else:
-                    strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
-                    logger.info(f"    {symbol} - {strategy_name}: [] (tick-only)")
-
-        required_timeframes = sorted(list(required_timeframes_set))
-        if required_timeframes:
-            logger.info("")
-            logger.info(f"  ⚡ OPTIMIZATION: Will build only {len(required_timeframes)} timeframes: {required_timeframes}")
-            logger.info(f"  ⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes")
-            console.print(f"\n[green]⚡ OPTIMIZATION: Building only {len(required_timeframes)} timeframes: {required_timeframes}[/green]")
-            console.print(f"[green]⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes[/green]\n")
+                    logger.info(f"    {symbol} - {strategy_key}: [] (tick-only)")
         else:
-            logger.info("")
-            logger.info(f"  ⚡ OPTIMIZATION: No candles required (all strategies are tick-only)")
-            logger.info(f"  ⚡ SPEEDUP: Skipping ALL candle building (maximum performance)")
-            console.print(f"\n[green]⚡ OPTIMIZATION: No candles required (all strategies are tick-only)[/green]")
-            console.print(f"[green]⚡ SPEEDUP: Skipping ALL candle building (maximum performance)[/green]\n")
-        logger.info("=" * 80)
+            timeframes = strategy.get_required_timeframes()
+            if timeframes:
+                required_timeframes_set.update(timeframes)
+                strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
+                logger.info(f"    {symbol} - {strategy_name}: {timeframes}")
+            else:
+                strategy_name = strategy.get_strategy_name() if hasattr(strategy, 'get_strategy_name') else type(strategy).__name__
+                logger.info(f"    {symbol} - {strategy_name}: [] (tick-only)")
+
+    required_timeframes = sorted(list(required_timeframes_set))
+    if required_timeframes:
         logger.info("")
+        logger.info(f"  ⚡ OPTIMIZATION: Will build only {len(required_timeframes)} timeframes: {required_timeframes}")
+        logger.info(f"  ⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes")
+        console.print(f"\n[green]⚡ OPTIMIZATION: Building only {len(required_timeframes)} timeframes: {required_timeframes}[/green]")
+        console.print(f"[green]⚡ SPEEDUP: Skipping {5 - len(required_timeframes)} unused timeframes[/green]\n")
     else:
-        required_timeframes = None
+        logger.info("")
+        logger.info(f"  ⚡ OPTIMIZATION: No candles required (all strategies are tick-only)")
+        logger.info(f"  ⚡ SPEEDUP: Skipping ALL candle building (maximum performance)")
+        console.print(f"\n[green]⚡ OPTIMIZATION: No candles required (all strategies are tick-only)[/green]")
+        console.print(f"[green]⚡ SPEEDUP: Skipping ALL candle building (maximum performance)[/green]\n")
+    logger.info("=" * 80)
+    logger.info("")
 
-    if USE_TICK_DATA:
-        console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
-        console.print("[bold cyan]STEP 4.5: Loading Tick Timeline[/bold cyan]")
-        console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
+    console.print("\n[bold cyan]" + "=" * 80 + "[/bold cyan]")
+    console.print("[bold cyan]STEP 4.5: Loading Tick Timeline[/bold cyan]")
+    console.print("[bold cyan]" + "=" * 80 + "[/bold cyan]\n")
 
-        logger.info("=" * 80)
-        logger.info("STEP 4.5: Loading Tick Timeline")
-        logger.info("=" * 80)
-        logger.info(f"  Symbols with tick data: {len(tick_cache_files)}/{len(symbols)}")
-        log_memory(logger, "before timeline loading")
+    logger.info("=" * 80)
+    logger.info("STEP 4.5: Loading Tick Timeline")
+    logger.info("=" * 80)
+    logger.info(f"  Symbols with tick data: {len(tick_cache_files)}/{len(symbols)}")
+    log_memory(logger, "before timeline loading")
+    logger.info("")
+
+    if STREAM_TICKS_FROM_DISK:
+        console.print("[yellow]Using STREAMING mode (ticks read from disk on-demand)[/yellow]")
+        console.print("[dim]  Memory usage: ~2-3 GB (vs ~20-30 GB for loading all ticks)[/dim]\n")
+
+        logger.info("Using STREAMING mode (ticks read from disk on-demand)")
+        logger.info("  Memory usage: ~2-3 GB (vs ~20-30 GB for loading all ticks)")
         logger.info("")
 
-        if STREAM_TICKS_FROM_DISK:
-            console.print("[yellow]Using STREAMING mode (ticks read from disk on-demand)[/yellow]")
-            console.print("[dim]  Memory usage: ~2-3 GB (vs ~20-30 GB for loading all ticks)[/dim]\n")
+        tick_type_name = {
+            mt5.COPY_TICKS_INFO: "INFO",
+            mt5.COPY_TICKS_ALL: "ALL",
+            mt5.COPY_TICKS_TRADE: "TRADE"
+        }.get(tick_type_flag, "INFO")
 
-            logger.info("Using STREAMING mode (ticks read from disk on-demand)")
-            logger.info("  Memory usage: ~2-3 GB (vs ~20-30 GB for loading all ticks)")
-            logger.info("")
+        # Load tick data from data_load_start (includes HISTORICAL_BUFFER_DAYS) for candle building
+        # But filter timeline to only simulate ticks >= START_DATE
+        # This ensures indicators have historical context while trades only execute from START_DATE
+        broker.load_ticks_streaming(
+            cache_files={},
+            chunk_size=100000,
+            required_timeframes=required_timeframes,
+            start_date=data_load_start,  # Load from buffer start for candle building
+            end_date=END_DATE,
+            cache_dir=str(tick_cache_dir),
+            tick_type_name=tick_type_name,
+            symbols=symbols,
+            simulation_start_date=START_DATE  # But only simulate from this date
+        )
+    else:
+        console.print("[yellow]Using TRADITIONAL mode (all ticks loaded into memory)[/yellow]")
+        console.print("[dim]  Memory usage: ~20-30 GB for full year backtest[/dim]\n")
 
-            tick_type_name = {
-                mt5.COPY_TICKS_INFO: "INFO",
-                mt5.COPY_TICKS_ALL: "ALL",
-                mt5.COPY_TICKS_TRADE: "TRADE"
-            }.get(tick_type_flag, "INFO")
+        logger.info("Using TRADITIONAL mode (all ticks loaded into memory)")
+        logger.info("  Memory usage: ~20-30 GB for full year backtest")
+        logger.info("")
 
-            broker.load_ticks_streaming(
-                cache_files={},
-                chunk_size=100000,
-                required_timeframes=required_timeframes,
-                start_date=START_DATE,
-                end_date=END_DATE,
-                cache_dir=str(tick_cache_dir),
-                tick_type_name=tick_type_name
+        from rich.table import Table
+        from rich.live import Live
+        from rich.panel import Panel
+        from rich.text import Text
+
+        tick_load_status = {}
+
+        def create_tick_loading_table():
+            """Create a table showing tick loading progress."""
+            total_symbols = len(tick_cache_files)
+            completed_symbols = 0
+            total_ticks = 0
+            loaded_ticks = 0
+
+            for symbol in tick_cache_files.keys():
+                status = tick_load_status.get(symbol, {})
+                if status.get('status') == 'complete':
+                    completed_symbols += 1
+                tick_count = status.get('ticks', 0)
+                loaded_ticks += tick_count
+                if status.get('total_ticks'):
+                    total_ticks += status['total_ticks']
+
+            summary = Text()
+            summary.append("Symbols: ", style="bold")
+            summary.append(f"{completed_symbols}/{total_symbols}", style="green")
+            summary.append("  |  Ticks: ", style="bold")
+            if total_ticks > 0:
+                summary.append(f"{loaded_ticks:,}/{total_ticks:,}", style="yellow")
+            else:
+                summary.append(f"{loaded_ticks:,}", style="yellow")
+
+            table = Table(show_header=True, header_style="bold cyan",
+                         box=None, padding=(0, 1), expand=False)
+            table.add_column("Symbol", style="cyan", width=12)
+            table.add_column("Status", width=50)
+            table.add_column("Ticks", justify="right", width=15)
+
+            for symbol in tick_cache_files.keys():
+                status = tick_load_status.get(symbol, {})
+                state = status.get('status', 'pending')
+                tick_count = status.get('ticks', 0)
+                message = status.get('message', '')
+
+                if state == 'loading':
+                    status_text = f"[yellow]⏳ Loading from cache...[/yellow]"
+                elif state == 'converting':
+                    status_text = f"[magenta]⚡ Converting to timeline... {message}[/magenta]"
+                elif state == 'complete':
+                    status_text = f"[green]✓ {message}[/green]"
+                elif state == 'error':
+                    status_text = f"[red]✗ {message}[/red]"
+                else:
+                    status_text = "[dim]○ Waiting...[/dim]"
+
+                tick_display = f"[cyan]{tick_count:,}[/cyan]" if tick_count > 0 else "[dim]0[/dim]"
+
+                table.add_row(symbol, status_text, tick_display)
+
+            from rich.console import Group
+            layout = Group(
+                Panel(summary, title="📊 Tick Timeline Loading", border_style="cyan"),
+                table
             )
-        else:
-            console.print("[yellow]Using TRADITIONAL mode (all ticks loaded into memory)[/yellow]")
-            console.print("[dim]  Memory usage: ~20-30 GB for full year backtest[/dim]\n")
 
-            logger.info("Using TRADITIONAL mode (all ticks loaded into memory)")
-            logger.info("  Memory usage: ~20-30 GB for full year backtest")
-            logger.info("")
+            return layout
 
-            from rich.table import Table
-            from rich.live import Live
-            from rich.panel import Panel
-            from rich.text import Text
+        def progress_callback(symbol, status, ticks=0, message='', total_ticks=None):
+            """Callback to update progress display."""
+            tick_load_status[symbol] = {
+                'status': status,
+                'ticks': ticks,
+                'message': message,
+                'total_ticks': total_ticks
+            }
 
-            tick_load_status = {}
+        with Live(create_tick_loading_table(), console=console, refresh_per_second=4) as live:
+            broker.load_ticks_from_cache_files(tick_cache_files, progress_callback=progress_callback, live_display=live, table_creator=create_tick_loading_table, required_timeframes=required_timeframes)
 
-            def create_tick_loading_table():
-                """Create a table showing tick loading progress."""
-                total_symbols = len(tick_cache_files)
-                completed_symbols = 0
-                total_ticks = 0
-                loaded_ticks = 0
+    console.print("[green]✓ Global tick timeline initialized[/green]\n")
+    logger.info("  ✓ Global tick timeline initialized")
+    log_memory(logger, "after timeline loading")
+    logger.info("")
 
-                for symbol in tick_cache_files.keys():
-                    status = tick_load_status.get(symbol, {})
-                    if status.get('status') == 'complete':
-                        completed_symbols += 1
-                    tick_count = status.get('ticks', 0)
-                    loaded_ticks += tick_count
-                    if status.get('total_ticks'):
-                        total_ticks += status['total_ticks']
+    # Candle mode initialization removed - tick-only mode now
+    logger.info("=" * 80)
+    logger.info("STEP 5-6: Components Already Initialized (in Step 4.5)")
+    logger.info("=" * 80)
+    logger.info("  ✓ TimeController, trading components, and strategies already initialized")
+    logger.info("  ✓ Skipping duplicate initialization")
 
-                summary = Text()
-                summary.append("Symbols: ", style="bold")
-                summary.append(f"{completed_symbols}/{total_symbols}", style="green")
-                summary.append("  |  Ticks: ", style="bold")
-                if total_ticks > 0:
-                    summary.append(f"{loaded_ticks:,}/{total_ticks:,}", style="yellow")
-                else:
-                    summary.append(f"{loaded_ticks:,}", style="yellow")
-
-                table = Table(show_header=True, header_style="bold cyan",
-                             box=None, padding=(0, 1), expand=False)
-                table.add_column("Symbol", style="cyan", width=12)
-                table.add_column("Status", width=50)
-                table.add_column("Ticks", justify="right", width=15)
-
-                for symbol in tick_cache_files.keys():
-                    status = tick_load_status.get(symbol, {})
-                    state = status.get('status', 'pending')
-                    tick_count = status.get('ticks', 0)
-                    message = status.get('message', '')
-
-                    if state == 'loading':
-                        status_text = f"[yellow]⏳ Loading from cache...[/yellow]"
-                    elif state == 'converting':
-                        status_text = f"[magenta]⚡ Converting to timeline... {message}[/magenta]"
-                    elif state == 'complete':
-                        status_text = f"[green]✓ {message}[/green]"
-                    elif state == 'error':
-                        status_text = f"[red]✗ {message}[/red]"
-                    else:
-                        status_text = "[dim]○ Waiting...[/dim]"
-
-                    tick_display = f"[cyan]{tick_count:,}[/cyan]" if tick_count > 0 else "[dim]0[/dim]"
-
-                    table.add_row(symbol, status_text, tick_display)
-
-                from rich.console import Group
-                layout = Group(
-                    Panel(summary, title="📊 Tick Timeline Loading", border_style="cyan"),
-                    table
-                )
-
-                return layout
-
-            def progress_callback(symbol, status, ticks=0, message='', total_ticks=None):
-                """Callback to update progress display."""
-                tick_load_status[symbol] = {
-                    'status': status,
-                    'ticks': ticks,
-                    'message': message,
-                    'total_ticks': total_ticks
-                }
-
-            with Live(create_tick_loading_table(), console=console, refresh_per_second=4) as live:
-                broker.load_ticks_from_cache_files(tick_cache_files, progress_callback=progress_callback, live_display=live, table_creator=create_tick_loading_table, required_timeframes=required_timeframes)
-
-        console.print("[green]✓ Global tick timeline initialized[/green]\n")
-        logger.info("  ✓ Global tick timeline initialized")
-        log_memory(logger, "after timeline loading")
-        logger.info("")
-
-    if not USE_TICK_DATA:
-        logger.info("=" * 80)
-        logger.info("STEP 5: Initializing Time Controller")
-        logger.info("=" * 80)
-
-        time_granularity = TimeGranularity.MINUTE
-
-        time_controller = TimeController(
-            symbols,
-            mode=TIME_MODE,
-            granularity=time_granularity,
-            include_position_monitor=True,
-            broker=broker
-        )
-        logger.info(f"  ✓ TimeController initialized")
-        logger.info(f"  ✓ Time mode: {TIME_MODE.value}")
-        logger.info(f"  ✓ Time granularity: {time_granularity.value}")
-        logger.info(f"  ✓ Barrier participants: {len(symbols)} symbols + 1 position monitor")
-        logger.info(f"  ✓ Global time advancement: minute-by-minute")
-        logger.info("")
-
-        logger.info("=" * 80)
-        logger.info("STEP 6: Initializing Trading Components")
-        logger.info("=" * 80)
-
-        risk_manager = RiskManager(
-            connector=broker,
-            risk_config=config.risk,
-            persistence=backtest_persistence
-        )
-        logger.info("  ✓ RiskManager initialized")
-
-        order_manager = OrderManager(
-            connector=broker,
-            magic_number=config.advanced.magic_number,
-            trade_comment=config.advanced.trade_comment,
-            persistence=backtest_persistence,
-            risk_manager=risk_manager
-        )
-        logger.info("  ✓ OrderManager initialized (with position limit checks enabled)")
-
-        indicators = TechnicalIndicators()
-        logger.info("  ✓ TechnicalIndicators initialized")
-
-        trade_manager = TradeManager(
-            connector=broker,
-            order_manager=order_manager,
-            trailing_config=config.trailing_stop,
-            use_breakeven=config.advanced.use_breakeven,
-            breakeven_trigger_rr=config.advanced.breakeven_trigger_rr,
-            indicators=indicators,
-            range_configs=config.range_config.ranges
-        )
-        logger.info("  ✓ TradeManager initialized (with range-specific ATR timeframes)")
-        logger.info("")
-
-        logger.info("=" * 80)
-        logger.info("STEP 6: Initializing Backtest Controller")
-        logger.info("=" * 80)
-
-        backtest_controller = BacktestController(
-            simulated_broker=broker,
-            time_controller=time_controller,
-            order_manager=order_manager,
-            risk_manager=risk_manager,
-            trade_manager=trade_manager,
-            indicators=indicators,
-            stop_loss_threshold=STOP_LOSS_THRESHOLD
-        )
-
-        if not backtest_controller.initialize(symbols):
-            logger.error("Failed to initialize BacktestController")
-            logger.error("Check your .env configuration and strategy settings")
-            return False
-
-        logger.info("  ✓ BacktestController initialized")
-        logger.info("  ✓ Strategies loaded from .env configuration")
-        logger.info("")
-    else:
-        logger.info("=" * 80)
-        logger.info("STEP 5-6: Components Already Initialized (in Step 4.5)")
-        logger.info("=" * 80)
-        logger.info("  ✓ TimeController, trading components, and strategies already initialized")
-        logger.info("  ✓ Skipping duplicate initialization")
-
-        if USE_TICK_DATA:
-            total_ticks = len(broker.global_tick_timeline)
-            logger.info(f"  ✓ Global time advancement: tick-by-tick ({total_ticks:,} ticks)")
-            logger.info(f"  ⚠ Performance: ~{total_ticks:,} time steps (slower but highest fidelity)")
-        logger.info("=" * 80)
-        logger.info("")
+    total_ticks = len(broker.global_tick_timeline)
+    logger.info(f"  ✓ Global time advancement: tick-by-tick ({total_ticks:,} ticks)")
+    logger.info(f"  ⚠ Performance: ~{total_ticks:,} time steps (slower but highest fidelity)")
+    logger.info("=" * 80)
+    logger.info("")
 
     progress_print("=" * 80, logger)
     progress_print("STEP 7: Running Backtest", logger)
