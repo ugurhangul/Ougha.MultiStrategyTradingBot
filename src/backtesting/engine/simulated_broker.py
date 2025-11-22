@@ -1173,8 +1173,7 @@ class SimulatedBroker:
         In backtest mode, we use a simplified calculation:
         Free Margin = Equity - Used Margin
 
-        For simplicity, we assume 100:1 leverage and calculate used margin
-        as the sum of all open position notional values / 100.
+        Uses the configured leverage ratio (e.g., 100:1, 500:1, 2000:1).
         """
         equity = self.get_account_equity()
 
@@ -1189,8 +1188,8 @@ class SimulatedBroker:
                 info = self.symbol_info[pos.symbol]
                 # Notional value = volume * contract_size * current_price
                 notional = pos.volume * info.contract_size * pos.open_price
-                # Assume 100:1 leverage
-                used_margin += notional / 100.0
+                # Use configured leverage
+                used_margin += notional / self.leverage
 
         free_margin = equity - used_margin
         return max(0.0, free_margin)  # Can't be negative
@@ -1216,8 +1215,8 @@ class SimulatedBroker:
         info = self.symbol_info[symbol]
         # Notional value = volume * contract_size * price
         notional = volume * info.contract_size * price
-        # Assume 100:1 leverage
-        margin = notional / 100.0
+        # Use configured leverage
+        margin = notional / self.leverage
 
         return margin
 

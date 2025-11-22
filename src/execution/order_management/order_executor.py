@@ -311,7 +311,17 @@ class OrderExecutor:
 
                 # Get additional diagnostic information
                 symbol_info = self.connector.get_symbol_info(symbol)
-                account_info = mt5.account_info()
+
+                # Get account info from connector (works for both live and backtest)
+                try:
+                    account_balance = self.connector.get_account_balance()
+                    account_equity = self.connector.get_account_equity()
+                    account_margin_free = self.connector.get_account_free_margin()
+                except Exception as e:
+                    self.logger.warning(f"Failed to get account info: {e}", symbol)
+                    account_balance = None
+                    account_equity = None
+                    account_margin_free = None
 
                 # Calculate SL/TP distances for diagnostics
                 sl_distance = abs(price - sl) if sl > 0 else 0
@@ -340,10 +350,12 @@ class OrderExecutor:
                 }
 
                 # Add account info if available
-                if account_info:
-                    diagnostic_context["account_balance"] = f"${account_info.balance:.2f}"
-                    diagnostic_context["account_equity"] = f"${account_info.equity:.2f}"
-                    diagnostic_context["account_margin_free"] = f"${account_info.margin_free:.2f}"
+                if account_balance is not None:
+                    diagnostic_context["account_balance"] = f"${account_balance:.2f}"
+                if account_equity is not None:
+                    diagnostic_context["account_equity"] = f"${account_equity:.2f}"
+                if account_margin_free is not None:
+                    diagnostic_context["account_margin_free"] = f"${account_margin_free:.2f}"
 
                 self.logger.trade_error(
                     symbol=symbol,
