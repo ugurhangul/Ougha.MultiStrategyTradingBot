@@ -1130,7 +1130,8 @@ def main():
                 progress.update(task, description=f"[cyan]Loading {direct_pair}...[/cyan]")
                 result = data_loader.load_from_mt5(
                     direct_pair, 'M1', data_load_start, END_DATE,
-                    force_refresh=FORCE_REFRESH
+                    force_refresh=FORCE_REFRESH,
+                    suppress_not_found_error=True  # Suppress errors when trying conversion pairs
                 )
 
                 if result is not None:
@@ -1150,7 +1151,8 @@ def main():
                 progress.update(task, description=f"[cyan]Loading {inverse_pair}...[/cyan]")
                 result = data_loader.load_from_mt5(
                     inverse_pair, 'M1', data_load_start, END_DATE,
-                    force_refresh=FORCE_REFRESH
+                    force_refresh=FORCE_REFRESH,
+                    suppress_not_found_error=True  # Suppress errors when trying conversion pairs
                 )
 
                 if result is not None:

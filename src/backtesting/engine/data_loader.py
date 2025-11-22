@@ -302,7 +302,8 @@ class BacktestDataLoader:
                      start_date: datetime, end_date: datetime,
                      force_refresh: bool = False,
                      preloaded_ticks: Optional[pd.DataFrame] = None,
-                     use_incremental_loading: bool = True) -> Optional[Tuple[pd.DataFrame, Dict]]:
+                     use_incremental_loading: bool = True,
+                     suppress_not_found_error: bool = False) -> Optional[Tuple[pd.DataFrame, Dict]]:
         """
         Load historical data from MT5 with caching support.
 
@@ -318,6 +319,8 @@ class BacktestDataLoader:
             preloaded_ticks: Optional pre-loaded tick DataFrame to use for building candles
                            if MT5 doesn't have candle data
             use_incremental_loading: If True, use partial cache hits and only download missing days
+            suppress_not_found_error: If True, log at DEBUG level instead of ERROR when symbol not found
+                                     (useful when trying multiple symbol variations for conversion pairs)
 
         Returns:
             Tuple of (DataFrame, symbol_info dict) or None if failed
@@ -426,7 +429,10 @@ class BacktestDataLoader:
                     all_dfs.extend(missing_dfs)
 
                     if len(all_dfs) == 0:
-                        self.logger.error(f"  ✗ No data available for {symbol} {timeframe}")
+                        if suppress_not_found_error:
+                            self.logger.debug(f"  ✗ No data available for {symbol} {timeframe}")
+                        else:
+                            self.logger.error(f"  ✗ No data available for {symbol} {timeframe}")
                         return None
 
                     # Merge and sort
@@ -511,13 +517,19 @@ class BacktestDataLoader:
             # Check if symbol is available
             symbol_info_check = mt5.symbol_info(symbol)
             if symbol_info_check is None:
-                self.logger.error(f"Symbol {symbol} not found in MT5")
+                if suppress_not_found_error:
+                    self.logger.debug(f"Symbol {symbol} not found in MT5")
+                else:
+                    self.logger.error(f"Symbol {symbol} not found in MT5")
                 return None
 
             if not symbol_info_check.visible:
                 self.logger.warning(f"Symbol {symbol} not visible in Market Watch, attempting to enable...")
                 if not mt5.symbol_select(symbol, True):
-                    self.logger.error(f"Failed to enable {symbol} in Market Watch")
+                    if suppress_not_found_error:
+                        self.logger.debug(f"Failed to enable {symbol} in Market Watch")
+                    else:
+                        self.logger.error(f"Failed to enable {symbol} in Market Watch")
                     return None
 
             rates = mt5.copy_rates_range(symbol, mt5_timeframe, start_date, end_date)

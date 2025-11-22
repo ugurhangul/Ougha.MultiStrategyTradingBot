@@ -132,8 +132,14 @@ class RiskManager:
             symbol
         )
 
-        # Round to lot step
-        lot_size = round(lot_size_raw / lot_step) * lot_step
+        # Round to lot step using Decimal for precise rounding
+        from decimal import Decimal, ROUND_HALF_UP
+
+        lot_size_decimal = Decimal(str(lot_size_raw))
+        lot_step_decimal = Decimal(str(lot_step))
+        steps = (lot_size_decimal / lot_step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+        lot_size = float(steps * lot_step_decimal)
+
         self.logger.debug(f"After rounding to lot_step: {lot_size:.4f}", symbol)
 
         # CRITICAL: Cap lot size based on available margin to prevent MT5 rejection
@@ -151,8 +157,14 @@ class RiskManager:
                 if margin_required > max_safe_margin:
                     # Calculate maximum safe lot size
                     margin_ratio = max_safe_margin / margin_required
-                    max_safe_lot_size = lot_size * margin_ratio
-                    max_safe_lot_size = round(max_safe_lot_size / lot_step) * lot_step
+                    max_safe_lot_size_raw = lot_size * margin_ratio
+
+                    # Round to lot step using Decimal for precise rounding
+                    from decimal import Decimal, ROUND_HALF_UP
+                    max_safe_decimal = Decimal(str(max_safe_lot_size_raw))
+                    lot_step_decimal = Decimal(str(lot_step))
+                    steps = (max_safe_decimal / lot_step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                    max_safe_lot_size = float(steps * lot_step_decimal)
 
                     self.logger.warning(
                         f"Lot size {lot_size:.2f} requires ${margin_required:,.2f} margin "
@@ -465,10 +477,14 @@ class RiskManager:
             target_risk_amount = balance * (self.risk_config.risk_percent_per_trade / 100.0)
 
             # Recalculate lot size: lotSize = riskAmount / (stopLossPoints * tickValue)
-            adjusted_lot_size = target_risk_amount / (sl_distance_in_points * tick_value)
+            adjusted_lot_size_raw = target_risk_amount / (sl_distance_in_points * tick_value)
 
-            # Normalize to lot step
-            adjusted_lot_size = round(adjusted_lot_size / lot_step) * lot_step
+            # Normalize to lot step using Decimal for precise rounding
+            from decimal import Decimal, ROUND_HALF_UP
+            adjusted_decimal = Decimal(str(adjusted_lot_size_raw))
+            lot_step_decimal = Decimal(str(lot_step))
+            steps = (adjusted_decimal / lot_step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+            adjusted_lot_size = float(steps * lot_step_decimal)
 
             # Apply min/max constraints
             adjusted_lot_size = max(min_lot, min(max_lot, adjusted_lot_size))

@@ -260,8 +260,13 @@ class MartingalePositionSizer(BasePositionSizer):
         min_lot = symbol_info['min_lot']
         max_lot = symbol_info['max_lot']
 
-        # Round to lot step
-        normalized = round(lot_size / lot_step) * lot_step
+        # Round to lot step using Decimal for precise rounding
+        from decimal import Decimal, ROUND_HALF_UP
+
+        lot_size_decimal = Decimal(str(lot_size))
+        lot_step_decimal = Decimal(str(lot_step))
+        steps = (lot_size_decimal / lot_step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+        normalized = float(steps * lot_step_decimal)
 
         # Ensure within symbol limits
         normalized = max(min_lot, min(max_lot, normalized))

@@ -1596,6 +1596,33 @@ class SimulatedBroker:
                     comment=error_msg
                 )
 
+            # Validate lot step (volume must be a multiple of lot_step)
+            if info.lot_step > 0:
+                # Check if volume is a valid multiple of lot_step (within floating point tolerance)
+                remainder = abs(volume % info.lot_step)
+                tolerance = info.lot_step * 0.01  # 1% tolerance for floating point errors
+
+                if remainder > tolerance and abs(remainder - info.lot_step) > tolerance:
+                    # Calculate what the normalized volume should be
+                    normalized_volume = round(volume / info.lot_step) * info.lot_step
+                    error_msg = (
+                        f"Volume {volume} is not a valid multiple of lot_step {info.lot_step}. "
+                        f"Should be {normalized_volume:.2f}"
+                    )
+                    self.logger.warning(f"[BACKTEST] Order rejected for {symbol}: {error_msg}")
+                    self.logger.warning(
+                        f"[BACKTEST]   Volume: {volume}, Lot step: {info.lot_step}, "
+                        f"Remainder: {remainder:.10f}, Tolerance: {tolerance:.10f}, "
+                        f"Min lot: {info.min_lot}, Max lot: {info.max_lot}"
+                    )
+                    return OrderResult(
+                        success=False,
+                        order=None,
+                        price=None,
+                        retcode=10014,  # TRADE_RETCODE_INVALID_VOLUME
+                        comment=error_msg
+                    )
+
             # Get execution price
             price_type = 'ask' if order_type == PositionType.BUY else 'bid'
             execution_price = self.get_current_price(symbol, price_type)

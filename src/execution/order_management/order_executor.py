@@ -152,7 +152,15 @@ class OrderExecutor:
 
         # Normalize prices and volume
         sl = self.price_normalizer.normalize_price(symbol, signal.stop_loss)
+        volume_before = signal.lot_size
         volume = self.price_normalizer.normalize_volume(symbol, signal.lot_size)
+
+        # Log volume normalization if it changed significantly
+        if abs(volume - volume_before) > 0.001:
+            self.logger.debug(
+                f"Volume normalized: {volume_before:.4f} → {volume:.4f}",
+                symbol
+            )
 
         # Determine order type and get current market price
         if signal.signal_type == PositionType.BUY:

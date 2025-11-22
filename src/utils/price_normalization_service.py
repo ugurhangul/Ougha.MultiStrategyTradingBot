@@ -85,7 +85,16 @@ class PriceNormalizationService:
 
         # Round to lot step
         # Formula: round(volume / lot_step) * lot_step
-        volume = round(volume / lot_step) * lot_step
+        # Use Python's Decimal for precise rounding to avoid floating-point errors
+        from decimal import Decimal, ROUND_HALF_UP
+
+        # Convert to Decimal for precise calculation
+        volume_decimal = Decimal(str(volume))
+        lot_step_decimal = Decimal(str(lot_step))
+
+        # Round to nearest lot step
+        steps = (volume_decimal / lot_step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+        volume = float(steps * lot_step_decimal)
 
         # Clamp to min/max
         volume = max(min_lot, min(max_lot, volume))
