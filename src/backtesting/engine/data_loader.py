@@ -26,7 +26,8 @@ class BacktestDataLoader:
     """
     
     def __init__(self, connector: Optional[MT5Connector] = None,
-                 use_cache: bool = True, cache_dir: str = "data"):
+                 use_cache: bool = True, cache_dir: str = "data",
+                 cache_ttl_days: int = 7):
         """
         Initialize data loader.
 
@@ -34,6 +35,7 @@ class BacktestDataLoader:
             connector: MT5Connector instance (optional, for loading from MT5)
             use_cache: Whether to use data caching (default: True)
             cache_dir: Directory for cached data (default: "data")
+            cache_ttl_days: Cache time-to-live in days (default: 7)
         """
         self.logger = get_logger()
         self.connector = connector
@@ -47,19 +49,268 @@ class BacktestDataLoader:
 
         # Initialize cache
         self.use_cache = use_cache
-        self.cache = DataCache(cache_dir) if use_cache else None
+        self.cache = DataCache(cache_dir, cache_ttl_days) if use_cache else None
 
         # Initialize broker archive downloader
         from src.config import config
         self.archive_downloader = BrokerArchiveDownloader(config.tick_archive)
-    
+
+    def _get_tick_cache_path(self, cache_dir: str, date: datetime, symbol: str, tick_type_name: str) -> Path:
+        """
+        Get the cache file path for tick data on a specific day.
+
+        Args:
+            cache_dir: Root cache directory (e.g., 'data/cache')
+            date: Date for the cache file
+            symbol: Symbol name
+            tick_type_name: Tick type name (e.g., 'INFO', 'ALL', 'TRADE')
+
+        Returns:
+            Path to cache file (data/cache/YYYY/MM/DD/ticks/SYMBOL_TICKTYPE.parquet)
+        """
+        cache_path = Path(cache_dir)
+
+        # Create date hierarchy: YYYY/MM/DD/ticks/
+        year = date.strftime('%Y')
+        month = date.strftime('%m')
+        day = date.strftime('%d')
+
+        day_dir = cache_path / year / month / day / "ticks"
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{symbol}_{tick_type_name}.parquet"
+        return day_dir / filename
+
+    def _get_date_range_days(self, start_date: datetime, end_date: datetime) -> list:
+        """
+        Get list of dates between start_date and end_date (inclusive).
+
+        Args:
+            start_date: Start date
+            end_date: End date
+
+        Returns:
+            List of datetime objects for each day in the range
+        """
+        from datetime import timedelta
+
+        days = []
+        current = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        while current <= end:
+            days.append(current)
+            current += timedelta(days=1)
+
+        return days
+
+    def _should_skip_day(self, symbol: str, day: datetime) -> bool:
+        """
+        Check if we should skip downloading data for this day based on market schedule.
+
+        Forex and Metals markets are closed on weekends (Saturday/Sunday).
+        Crypto markets trade 24/7 including weekends.
+        Indices depend on the specific exchange.
+
+        Args:
+            symbol: Trading symbol
+            day: Date to check
+
+        Returns:
+            True if day should be skipped (no market data available), False otherwise
+        """
+        from src.config.symbols.category_detector import SymbolCategoryDetector
+        from src.models.data_models import SymbolCategory
+
+        # Get symbol category
+        # Note: We don't have mt5_category here, so we rely on pattern matching
+        category = SymbolCategoryDetector.detect_category(symbol, mt5_category=None)
+
+        # Check if it's a weekend (Saturday=5, Sunday=6)
+        weekday = day.weekday()
+        is_weekend = weekday in (5, 6)
+
+        if not is_weekend:
+            # Weekdays - data should be available for all markets
+            return False
+
+        # Weekend handling by category
+        if category in (SymbolCategory.MAJOR_FOREX, SymbolCategory.MINOR_FOREX,
+                       SymbolCategory.EXOTIC_FOREX, SymbolCategory.METALS):
+            # Forex and Metals markets close on weekends
+            return True
+        elif category == SymbolCategory.CRYPTO:
+            # Crypto trades 24/7
+            return False
+        elif category == SymbolCategory.INDICES:
+            # Most indices are closed on weekends
+            # Could be refined per-exchange in the future
+            return True
+        elif category == SymbolCategory.COMMODITIES:
+            # Most commodities (oil, gas) are closed on weekends
+            return True
+        elif category == SymbolCategory.STOCKS:
+            # Stock exchanges are closed on weekends
+            return True
+        else:
+            # Unknown category - be conservative and attempt download
+            return False
+
+    def _download_day_ticks(self, symbol: str, day_start: datetime, day_end: datetime,
+                           tick_type: int, tick_type_name: str, cache_path: Path = None,
+                           cache_dir: str = None, progress_callback: callable = None,
+                           full_progress_callback: callable = None) -> pd.DataFrame:
+        """
+        Download tick data for a single day with fallback: MT5 → Archive.
+
+        Args:
+            symbol: Trading symbol
+            day_start: Start of day (00:00:00)
+            day_end: End of day (23:59:59.999999)
+            tick_type: MT5 tick type flag
+            tick_type_name: Tick type name (INFO, ALL, TRADE)
+            cache_path: Path to save cached data (optional)
+            cache_dir: Base cache directory for day-level caching
+            progress_callback: Optional callback for reporting download stages (simple)
+            full_progress_callback: Optional callback for detailed progress (day_idx, total, date, status, count, msg, metadata)
+
+        Returns:
+            DataFrame with tick data for the day, or None if no data available
+        """
+        # Try MT5 first
+        try:
+            # Connect if needed
+            if self._owns_connector and not self.connector.is_connected:
+                if not self.connector.connect():
+                    self.logger.error("Failed to connect to MT5")
+                    return None
+
+            # Ensure symbol is selected in Market Watch
+            if not mt5.symbol_select(symbol, True):
+                self.logger.error(f"Failed to select symbol {symbol}")
+                return None
+
+            # Try to get ticks from MT5 for this single day
+            ticks = mt5.copy_ticks_range(symbol, day_start, day_end, tick_type)
+
+            if ticks is not None and len(ticks) > 0:
+                # Convert to DataFrame
+                df = pd.DataFrame(ticks)
+                df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+
+                # Check if MT5 data covers this day (starts within 1 day of requested start)
+                actual_start = df['time'].iloc[0]
+                start_diff_days = (actual_start - day_start).total_seconds() / 86400
+
+                if start_diff_days <= 1:
+                    # MT5 has data for this day - cache it and return
+                    if cache_path:
+                        if progress_callback:
+                            progress_callback('caching')
+                        self._save_tick_cache(df, cache_path)
+                    return df
+                else:
+                    # MT5 data doesn't cover this day - try archive
+                    self.logger.debug(
+                        f"    MT5 data starts at {actual_start.strftime('%Y-%m-%d %H:%M:%S')}, "
+                        f"{start_diff_days:.1f} days after {day_start.strftime('%Y-%m-%d')}"
+                    )
+
+        except Exception as e:
+            self.logger.debug(f"    MT5 download failed: {e}")
+
+        # MT5 doesn't have data - try archive downloader
+        if hasattr(self, 'archive_downloader') and self.archive_downloader:
+            try:
+                self.logger.debug(f"    Attempting to fetch from broker archives...")
+
+                # Report fetching stage
+                if progress_callback:
+                    progress_callback('fetching')
+
+                # Get MT5 server name for broker detection
+                account_info = mt5.account_info()
+                if not account_info:
+                    self.logger.debug(f"    Cannot fetch from archive: No MT5 account info")
+                    return None
+
+                server_name = account_info.server
+
+                # Download from archive for this single day
+                # Pass cache_dir and progress callback to enable intelligent caching
+                archive_df = self.archive_downloader.fetch_tick_data(
+                    symbol=symbol,
+                    start_date=day_start,
+                    end_date=day_end,
+                    server_name=server_name,
+                    tick_type=tick_type,
+                    cache_dir=cache_dir,
+                    progress_callback=full_progress_callback
+                )
+
+                if archive_df is not None and len(archive_df) > 0:
+                    # Archive has data - cache it and return
+                    # Note: Archive downloader already cached it via _split_and_cache_by_day
+                    # but we still save to cache_path for consistency
+                    if cache_path:
+                        if progress_callback:
+                            progress_callback('caching')
+                        self._save_tick_cache(archive_df, cache_path)
+                    return archive_df
+                else:
+                    self.logger.debug(f"    Archive returned no data for {day_start.date()}")
+
+            except Exception as e:
+                self.logger.warning(f"    Archive download failed: {e}")
+
+        # No data available from any source
+        return None
+
+    def _save_tick_cache(self, df: pd.DataFrame, cache_path: Path):
+        """Save tick data to cache file with metadata."""
+        try:
+            from datetime import timezone
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Create metadata
+            metadata = {
+                'cached_at': datetime.now(timezone.utc).isoformat(),
+                'source': 'mt5',
+                'first_data_time': df['time'].iloc[0].isoformat() if len(df) > 0 else '',
+                'last_data_time': df['time'].iloc[-1].isoformat() if len(df) > 0 else '',
+                'row_count': str(len(df)),
+                'cache_version': '1.0'
+            }
+
+            # Convert to bytes for parquet metadata
+            metadata_bytes = {k.encode(): v.encode() for k, v in metadata.items()}
+
+            # Convert DataFrame to Arrow Table
+            table = pa.Table.from_pandas(df, preserve_index=False)
+
+            # Add metadata to table schema
+            table = table.replace_schema_metadata(metadata_bytes)
+
+            # Write with metadata
+            pq.write_table(table, cache_path, compression='snappy')
+
+            self.logger.debug(f"    Cached to {cache_path}")
+        except Exception as e:
+            self.logger.warning(f"    Failed to save cache: {e}")
+
     def load_from_mt5(self, symbol: str, timeframe: str,
                      start_date: datetime, end_date: datetime,
-                     force_refresh: bool = False) -> Optional[Tuple[pd.DataFrame, Dict]]:
+                     force_refresh: bool = False,
+                     preloaded_ticks: Optional[pd.DataFrame] = None,
+                     use_incremental_loading: bool = True) -> Optional[Tuple[pd.DataFrame, Dict]]:
         """
         Load historical data from MT5 with caching support.
 
         First checks cache, then falls back to MT5 if needed.
+        Supports incremental loading - only downloads missing days instead of full range.
 
         Args:
             symbol: Symbol name
@@ -67,20 +318,155 @@ class BacktestDataLoader:
             start_date: Start date (UTC)
             end_date: End date (UTC)
             force_refresh: If True, bypass cache and download from MT5
+            preloaded_ticks: Optional pre-loaded tick DataFrame to use for building candles
+                           if MT5 doesn't have candle data
+            use_incremental_loading: If True, use partial cache hits and only download missing days
 
         Returns:
             Tuple of (DataFrame, symbol_info dict) or None if failed
         """
         # Try to load from cache first (unless force_refresh is True)
         if self.use_cache and not force_refresh:
-            cached_data = self.cache.load_from_cache(symbol, timeframe, start_date, end_date)
-            if cached_data is not None:
-                return cached_data
+            if use_incremental_loading:
+                # Use partial cache loading - returns cached data + missing days
+                import time
+                cache_start = time.time()
 
-            self.logger.info(f"  ⚠ Cache miss: {symbol} {timeframe} - downloading from MT5...")
+                cached_df, missing_days, symbol_info = self.cache.load_from_cache_partial(
+                    symbol, timeframe, start_date, end_date
+                )
 
-        # Load from MT5
-        result = self._download_from_mt5(symbol, timeframe, start_date, end_date)
+                cache_time = time.time() - cache_start
+
+                if len(missing_days) == 0:
+                    # Complete cache hit - return cached data
+                    self.logger.debug(
+                        f"  ✓ Complete cache hit: {symbol} {timeframe} - "
+                        f"{len(cached_df)} bars loaded in {cache_time:.2f}s"
+                    )
+                    return cached_df, symbol_info
+
+                if len(missing_days) > 0:
+                    # Partial cache hit - download only missing days
+                    cached_bars = len(cached_df) if cached_df is not None else 0
+                    self.logger.info(
+                        f"  ⚡ Incremental load: {symbol} {timeframe} - "
+                        f"{cached_bars} bars cached, {len(missing_days)} days to download "
+                        f"(cache load: {cache_time:.2f}s)"
+                    )
+
+                    # Log which specific days are missing
+                    if len(missing_days) <= 10:
+                        missing_dates_str = ', '.join([d.strftime('%Y-%m-%d') for d in missing_days])
+                        self.logger.debug(f"    Missing days: {missing_dates_str}")
+                    else:
+                        self.logger.debug(
+                            f"    Missing days: {missing_days[0].strftime('%Y-%m-%d')} to "
+                            f"{missing_days[-1].strftime('%Y-%m-%d')} ({len(missing_days)} days)"
+                        )
+
+                    # Download missing days
+                    download_start = time.time()
+                    missing_dfs = []
+                    total_downloaded_bars = 0
+
+                    for idx, missing_day in enumerate(missing_days, 1):
+                        # Check if we should skip this day (e.g., weekends for Forex/Metals)
+                        if self._should_skip_day(symbol, missing_day):
+                            day_name = missing_day.strftime('%A')
+                            self.logger.debug(
+                                f"    [{idx}/{len(missing_days)}] {missing_day.date()} ({day_name}): "
+                                f"Skipping - market closed"
+                            )
+                            continue
+
+                        # Download this day's data
+                        day_end = missing_day.replace(hour=23, minute=59, second=59)
+
+                        self.logger.debug(
+                            f"    [{idx}/{len(missing_days)}] Downloading {missing_day.date()}..."
+                        )
+
+                        day_download_start = time.time()
+                        day_result = self._download_from_mt5(
+                            symbol, timeframe, missing_day, day_end, preloaded_ticks
+                        )
+                        day_download_time = time.time() - day_download_start
+
+                        if day_result is not None:
+                            day_df, day_symbol_info = day_result
+                            missing_dfs.append(day_df)
+                            total_downloaded_bars += len(day_df)
+
+                            self.logger.debug(
+                                f"      ✓ Downloaded {len(day_df)} bars for {missing_day.date()} "
+                                f"({day_download_time:.2f}s)"
+                            )
+
+                            # Update symbol_info if we don't have it yet
+                            if not symbol_info:
+                                symbol_info = day_symbol_info
+
+                            # Cache this day immediately
+                            self.cache.save_to_cache(
+                                symbol, timeframe, missing_day, day_end, day_df, day_symbol_info
+                            )
+                        else:
+                            self.logger.warning(
+                                f"  ⚠ Failed to download {symbol} {timeframe} for {missing_day.date()}"
+                            )
+
+                    download_time = time.time() - download_start
+                    self.logger.debug(
+                        f"  Download phase complete: {total_downloaded_bars} bars in {download_time:.2f}s"
+                    )
+
+                    # Merge cached data with newly downloaded data
+                    merge_start = time.time()
+                    all_dfs = []
+                    if cached_df is not None:
+                        all_dfs.append(cached_df)
+                    all_dfs.extend(missing_dfs)
+
+                    if len(all_dfs) == 0:
+                        self.logger.error(f"  ✗ No data available for {symbol} {timeframe}")
+                        return None
+
+                    # Merge and sort
+                    if len(all_dfs) == 1:
+                        merged_df = all_dfs[0]
+                    else:
+                        merged_df = pd.concat(all_dfs, ignore_index=True)
+                        merged_df = merged_df.sort_values('time').reset_index(drop=True)
+                        merged_df = merged_df.drop_duplicates(subset=['time'], keep='first')
+
+                    # Filter to requested range
+                    merged_df = merged_df[(merged_df['time'] >= start_date) & (merged_df['time'] <= end_date)].copy()
+
+                    merge_time = time.time() - merge_start
+                    total_time = time.time() - cache_start
+
+                    self.logger.info(
+                        f"  ✓ Incremental load complete: {symbol} {timeframe} - "
+                        f"{len(merged_df)} bars total ({len(missing_dfs)} days downloaded, "
+                        f"total time: {total_time:.2f}s)"
+                    )
+                    self.logger.debug(
+                        f"    Timing breakdown: cache={cache_time:.2f}s, "
+                        f"download={download_time:.2f}s, merge={merge_time:.2f}s"
+                    )
+
+                    return merged_df, symbol_info
+            else:
+                # Use old behavior - all-or-nothing cache
+                cached_data = self.cache.load_from_cache(symbol, timeframe, start_date, end_date)
+                if cached_data is not None:
+                    return cached_data
+
+                self.logger.info(f"  ⚠ Cache miss: {symbol} {timeframe} - downloading from MT5...")
+
+        # Load from MT5 (full range)
+        result = self._download_from_mt5(symbol, timeframe, start_date, end_date, preloaded_ticks)
 
         # Save to cache if successful
         if result is not None and self.use_cache:
@@ -90,7 +476,8 @@ class BacktestDataLoader:
         return result
 
     def _download_from_mt5(self, symbol: str, timeframe: str,
-                          start_date: datetime, end_date: datetime) -> Optional[Tuple[pd.DataFrame, Dict]]:
+                          start_date: datetime, end_date: datetime,
+                          preloaded_ticks: Optional[pd.DataFrame] = None) -> Optional[Tuple[pd.DataFrame, Dict]]:
         """
         Download historical data from MT5 (internal method).
 
@@ -99,7 +486,9 @@ class BacktestDataLoader:
             timeframe: Timeframe (e.g., "M1", "M5", "H1")
             start_date: Start date
             end_date: End date
-            
+            preloaded_ticks: Optional pre-loaded tick DataFrame to use for building candles
+                           if MT5 doesn't have candle data
+
         Returns:
             Tuple of (DataFrame with OHLC data, symbol_info dict) or None
         """
@@ -146,7 +535,7 @@ class BacktestDataLoader:
 
                 # FALLBACK: Try to build candles from ticks for any timeframe
                 self.logger.info(f"  ⚡ Attempting to build {timeframe} candles from tick data for {symbol}...")
-                df = self._build_candles_from_ticks(symbol, timeframe, start_date, end_date)
+                df = self._build_candles_from_ticks(symbol, timeframe, start_date, end_date, preloaded_ticks)
 
                 if df is not None and len(df) > 0:
                     self.logger.info(f"  ✓ Successfully built {len(df)} {timeframe} candles from ticks")
@@ -191,7 +580,8 @@ class BacktestDataLoader:
             return None
 
     def _build_candles_from_ticks(self, symbol: str, timeframe: str,
-                                   start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+                                   start_date: datetime, end_date: datetime,
+                                   preloaded_ticks: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
         """
         Build candles of any timeframe from tick data.
 
@@ -203,6 +593,8 @@ class BacktestDataLoader:
             timeframe: Timeframe (e.g., 'M1', 'M5', 'H1', 'H4', 'D1')
             start_date: Start date (UTC)
             end_date: End date (UTC)
+            preloaded_ticks: Optional pre-loaded tick DataFrame. If provided, use this instead
+                           of loading from MT5 again.
 
         Returns:
             DataFrame with OHLC data (same format as copy_rates_range) or None
@@ -225,20 +617,31 @@ class BacktestDataLoader:
 
             resample_freq = timeframe_map[timeframe]
 
-            # Load tick data
-            self.logger.info(f"  Loading tick data for {symbol}...")
-            ticks = mt5.copy_ticks_range(symbol, start_date, end_date, mt5.COPY_TICKS_INFO)
+            # Use pre-loaded ticks if available, otherwise load from MT5
+            if preloaded_ticks is not None and len(preloaded_ticks) > 0:
+                self.logger.info(f"  Using pre-loaded tick data ({len(preloaded_ticks):,} ticks)...")
+                df_ticks = preloaded_ticks.copy()
 
-            if ticks is None or len(ticks) == 0:
-                error_code, error_msg = mt5.last_error()
-                self.logger.error(f"  No tick data available for {symbol}: ({error_code}) {error_msg}")
-                return None
+                # Ensure time column is datetime
+                if 'time' in df_ticks.columns and not pd.api.types.is_datetime64_any_dtype(df_ticks['time']):
+                    df_ticks['time'] = pd.to_datetime(df_ticks['time'], unit='s', utc=True)
+            else:
+                # Load tick data from MT5
+                self.logger.info(f"  Loading tick data from MT5 for {symbol}...")
+                ticks = mt5.copy_ticks_range(symbol, start_date, end_date, mt5.COPY_TICKS_INFO)
 
-            self.logger.info(f"  Loaded {len(ticks):,} ticks, building {timeframe} candles...")
+                if ticks is None or len(ticks) == 0:
+                    error_code, error_msg = mt5.last_error()
+                    self.logger.error(f"  No tick data available for {symbol}: ({error_code}) {error_msg}")
+                    return None
 
-            # Convert to DataFrame
-            df_ticks = pd.DataFrame(ticks)
-            df_ticks['time'] = pd.to_datetime(df_ticks['time'], unit='s', utc=True)
+                self.logger.info(f"  Loaded {len(ticks):,} ticks from MT5...")
+
+                # Convert to DataFrame
+                df_ticks = pd.DataFrame(ticks)
+                df_ticks['time'] = pd.to_datetime(df_ticks['time'], unit='s', utc=True)
+
+            self.logger.info(f"  Building {timeframe} candles from {len(df_ticks):,} ticks...")
 
             # Use bid price for candle building (standard for forex)
             df_ticks['price'] = df_ticks['bid']
@@ -392,13 +795,17 @@ class BacktestDataLoader:
         start_date: datetime,
         end_date: datetime,
         tick_type: int = mt5.COPY_TICKS_INFO,
-        cache_dir: Optional[str] = None
+        cache_dir: Optional[str] = None,
+        progress_callback: Optional[callable] = None,
+        parallel_days: int = 1
     ) -> Optional[pd.DataFrame]:
         """
         Load tick data from MT5 using copy_ticks_range().
 
-        Supports caching: If cache_dir is provided, saves ticks to parquet files
-        and loads from cache on subsequent runs.
+        NEW: Uses date hierarchy caching (YYYY/MM/DD/ticks/SYMBOL_TICKTYPE.parquet)
+        Each day's ticks are cached separately for better organization and management.
+
+        PARALLEL LOADING: Processes multiple days concurrently in batches for faster loading.
 
         Args:
             symbol: Symbol name
@@ -410,370 +817,209 @@ class BacktestDataLoader:
                 - mt5.COPY_TICKS_TRADE: Trade ticks only
             cache_dir: Directory to cache tick data (optional). If provided, ticks are
                 saved to/loaded from parquet files for faster subsequent runs.
+            progress_callback: Optional callback function(day_idx, total_days, day_date, status, ticks_count, message)
+                Called after each day is processed to report progress.
+            parallel_days: Number of days to process in parallel (default: 10)
+                Higher values = faster but more memory usage
 
         Returns:
             DataFrame with columns: time, bid, ask, last, volume, time_msc, flags
             or None if failed
         """
         from pathlib import Path
+        import concurrent.futures
+        import threading
 
-        # Check cache first if cache_dir provided
+        tick_type_name = {
+            mt5.COPY_TICKS_INFO: "INFO",
+            mt5.COPY_TICKS_ALL: "ALL",
+            mt5.COPY_TICKS_TRADE: "TRADE"
+        }.get(tick_type, "UNKNOWN")
+
+        self.logger.info(f"Loading {symbol} ticks for {start_date.date()} to {end_date.date()}")
+
+        # Get list of days in the requested range
+        days = self._get_date_range_days(start_date, end_date)
+        self.logger.info(f"  Date range: {len(days)} days (parallel batches of {parallel_days})")
+
+        # Process days in parallel batches
+        daily_dfs = [None] * len(days)  # Pre-allocate list to maintain order
+
         if cache_dir:
             cache_path = Path(cache_dir)
             cache_path.mkdir(parents=True, exist_ok=True)
+        else:
+            cache_path = None
 
-            # Create cache filename based on symbol, dates, and tick type
-            tick_type_name = {
-                mt5.COPY_TICKS_INFO: "INFO",
-                mt5.COPY_TICKS_ALL: "ALL",
-                mt5.COPY_TICKS_TRADE: "TRADE"
-            }.get(tick_type, "UNKNOWN")
+        # Thread-safe lock for progress callback
+        callback_lock = threading.Lock()
 
-            start_str = start_date.strftime("%Y%m%d")
-            end_str = end_date.strftime("%Y%m%d")
-            cache_file = cache_path / f"{symbol}_{start_str}_{end_str}_{tick_type_name}.parquet"
+        def process_single_day(day_idx, day):
+            """Process a single day (load from cache or download)."""
+            import time
 
-            # Try to load from cache
-            # First try the exact requested filename
-            cache_file_to_load = None
-            if cache_file.exists():
-                cache_file_to_load = cache_file
-            else:
-                # If exact match doesn't exist, look for any cache file for this symbol and tick type
-                # This handles the case where we previously cached with actual dates instead of requested dates
-                pattern = f"{symbol}_*_{tick_type_name}.parquet"
-                matching_files = list(cache_path.glob(pattern))
-                if matching_files:
-                    # Use the most recent cache file
-                    cache_file_to_load = max(matching_files, key=lambda p: p.stat().st_mtime)
-                    self.logger.info(f"Found alternative cache file: {cache_file_to_load.name}")
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-            if cache_file_to_load:
+            # Check if we should skip this day (e.g., weekends for Forex/Metals)
+            if self._should_skip_day(symbol, day):
+                day_name = day.strftime('%A')  # e.g., "Saturday"
+                self.logger.debug(
+                    f"  [{day_idx}/{len(days)}] {day.date()} ({day_name}): "
+                    f"Skipping - market closed"
+                )
+                # Report progress - skipped (thread-safe)
+                if progress_callback:
+                    with callback_lock:
+                        progress_callback(day_idx, len(days), day.date(), 'skipped', 0,
+                                        f'Skipped - market closed ({day_name})', {'reason': 'weekend'})
+                return None
+
+            # Check if this day is cached
+            day_cache_path = None
+            if cache_path:
+                day_cache_path = self._get_tick_cache_path(str(cache_path), day, symbol, tick_type_name)
+
+            # Try to load from cache first
+            if day_cache_path and day_cache_path.exists():
                 try:
-                    self.logger.info(f"Loading {symbol} ticks from cache: {cache_file_to_load.name}")
-                    df = pd.read_parquet(cache_file_to_load)
+                    load_start = time.time()
+                    file_size_mb = day_cache_path.stat().st_size / (1024 * 1024)
 
-                    # Ensure time column is datetime with UTC timezone
+                    df = pd.read_parquet(day_cache_path)
                     if 'time' in df.columns:
                         df['time'] = pd.to_datetime(df['time'], utc=True)
 
-                    self.logger.info(f"  ✓ Loaded {len(df):,} ticks from cache")
+                    # Filter to exact day range
+                    df = df[(df['time'] >= day_start) & (df['time'] <= day_end)].copy()
 
-                    # Validate that cached data covers the requested date range
                     if len(df) > 0:
-                        cached_start = df['time'].iloc[0]
-                        cached_end = df['time'].iloc[-1]
+                        load_time = time.time() - load_start
+                        self.logger.info(f"  [{day_idx}/{len(days)}] {day.date()}: ✓ Loaded {len(df):,} ticks from cache ({file_size_mb:.1f} MB, {load_time:.2f}s)")
 
-                        # Calculate date differences
-                        start_gap_days = (cached_start.to_pydatetime() - start_date).total_seconds() / 86400
-                        end_gap_days = (end_date - cached_end.to_pydatetime()).total_seconds() / 86400
-
-                        # Check if there's a significant gap at the start (cached data starts much later than requested)
-                        if start_gap_days > 1:  # More than 1 day gap at start
-                            self.logger.info(f"  Cache validation: Cached data starts {start_gap_days:.1f} days after requested start")
-                            self.logger.info(f"    Requested start: {start_date.date()}")
-                            self.logger.info(f"    Cached start:    {cached_start.date()}")
-                            self.logger.info(f"  Checking MT5 for additional historical data...")
-
-                            # Attempt to fetch missing data from MT5
-                            # This handles the case where MT5's historical data availability has improved
-                            try:
-                                # Connect if needed
-                                if self._owns_connector and not self.connector.is_connected:
-                                    if not self.connector.connect():
-                                        self.logger.warning("  Failed to connect to MT5 for cache validation")
-                                        return df  # Use cached data as-is
-
-                                # Ensure symbol is selected
-                                if not mt5.symbol_select(symbol, True):
-                                    self.logger.warning(f"  Could not select {symbol} for cache validation")
-                                    return df  # Use cached data as-is
-
-                                # Try to fetch ticks for the missing period (requested start to cached start)
-                                missing_period_end = cached_start.to_pydatetime()
-                                self.logger.info(f"  Attempting to fetch missing period: {start_date.date()} to {missing_period_end.date()}")
-
-                                missing_ticks = mt5.copy_ticks_range(symbol, start_date, missing_period_end, tick_type)
-
-                                if missing_ticks is not None and len(missing_ticks) > 0:
-                                    # Convert to DataFrame
-                                    missing_df = pd.DataFrame(missing_ticks)
-                                    missing_df['time'] = pd.to_datetime(missing_df['time'], unit='s', utc=True)
-
-                                    # Filter out invalid ticks
-                                    missing_df = missing_df[(missing_df['bid'] > 0) & (missing_df['ask'] > 0)].copy()
-
-                                    if len(missing_df) > 0:
-                                        new_start = missing_df['time'].iloc[0]
-                                        self.logger.info(f"  ✓ Found {len(missing_df):,} additional ticks from MT5!")
-                                        self.logger.info(f"    New data starts: {new_start.date()}")
-
-                                        # Merge with cached data (remove any overlap)
-                                        # Keep only missing_df ticks that are before cached_start
-                                        missing_df = missing_df[missing_df['time'] < cached_start].copy()
-
-                                        if len(missing_df) > 0:
-                                            # Concatenate and sort
-                                            df = pd.concat([missing_df, df], ignore_index=True)
-                                            df = df.sort_values('time').reset_index(drop=True)
-
-                                            self.logger.info(f"  ✓ Extended cache with {len(missing_df):,} earlier ticks")
-                                            self.logger.info(f"  Total ticks: {len(df):,}")
-
-                                            # Update the cache file with extended data
-                                            try:
-                                                new_start_str = df['time'].iloc[0].strftime("%Y%m%d")
-                                                new_end_str = df['time'].iloc[-1].strftime("%Y%m%d")
-
-                                                tick_type_name = {
-                                                    mt5.COPY_TICKS_INFO: "INFO",
-                                                    mt5.COPY_TICKS_ALL: "ALL",
-                                                    mt5.COPY_TICKS_TRADE: "TRADE"
-                                                }.get(tick_type, "UNKNOWN")
-
-                                                new_cache_file = cache_path / f"{symbol}_{new_start_str}_{new_end_str}_{tick_type_name}.parquet"
-
-                                                self.logger.info(f"  Updating cache file: {new_cache_file.name}")
-                                                df.to_parquet(new_cache_file, compression='snappy', index=False)
-
-                                                # Remove old cache file if different
-                                                if new_cache_file != cache_file_to_load:
-                                                    try:
-                                                        cache_file_to_load.unlink()
-                                                        self.logger.info(f"  Removed old cache file: {cache_file_to_load.name}")
-                                                    except Exception as e:
-                                                        self.logger.warning(f"  Could not remove old cache file: {e}")
-
-                                                file_size_mb = new_cache_file.stat().st_size / 1024 / 1024
-                                                self.logger.info(f"  ✓ Updated cache ({file_size_mb:.1f} MB)")
-                                            except Exception as e:
-                                                self.logger.warning(f"  Failed to update cache: {e}")
-
-                                            return df
-                                        else:
-                                            # No new ticks after filtering overlap
-                                            self.logger.info(f"  No additional ticks after removing overlap")
-                                            return df
-                                    else:
-                                        self.logger.info(f"  No additional valid ticks found in MT5 for missing period")
-                                        return df
-                                else:
-                                    self.logger.info(f"  MT5 still does not have data for the missing period")
-
-                                    # Tier 3: Try to fetch from external broker archives
-                                    archive_df = self._try_fetch_from_archive(
-                                        symbol, start_date, missing_period_end, tick_type
-                                    )
-
-                                    if archive_df is not None and len(archive_df) > 0:
-                                        # Successfully fetched from archive, merge with cached data
-                                        self.logger.info(f"  ✓ Found {len(archive_df):,} ticks from external archive!")
-
-                                        # Filter to avoid overlap
-                                        archive_df = archive_df[archive_df['time'] < cached_start].copy()
-
-                                        if len(archive_df) > 0:
-                                            # Concatenate and sort
-                                            df = pd.concat([archive_df, df], ignore_index=True)
-                                            df = df.sort_values('time').reset_index(drop=True)
-
-                                            self.logger.info(f"  ✓ Extended cache with {len(archive_df):,} ticks from archive")
-                                            self.logger.info(f"  Total ticks: {len(df):,}")
-
-                                            # Update the cache file with extended data
-                                            try:
-                                                new_start_str = df['time'].iloc[0].strftime("%Y%m%d")
-                                                new_end_str = df['time'].iloc[-1].strftime("%Y%m%d")
-
-                                                tick_type_name = {
-                                                    mt5.COPY_TICKS_INFO: "INFO",
-                                                    mt5.COPY_TICKS_ALL: "ALL",
-                                                    mt5.COPY_TICKS_TRADE: "TRADE"
-                                                }.get(tick_type, "UNKNOWN")
-
-                                                new_cache_file = cache_path / f"{symbol}_{new_start_str}_{new_end_str}_{tick_type_name}.parquet"
-
-                                                self.logger.info(f"  Updating cache file: {new_cache_file.name}")
-                                                df.to_parquet(new_cache_file, compression='snappy', index=False)
-
-                                                # Remove old cache file if different
-                                                if new_cache_file != cache_file_to_load:
-                                                    try:
-                                                        cache_file_to_load.unlink()
-                                                        self.logger.info(f"  Removed old cache file: {cache_file_to_load.name}")
-                                                    except Exception as e:
-                                                        self.logger.warning(f"  Could not remove old cache file: {e}")
-
-                                                file_size_mb = new_cache_file.stat().st_size / 1024 / 1024
-                                                self.logger.info(f"  ✓ Updated cache ({file_size_mb:.1f} MB)")
-                                            except Exception as e:
-                                                self.logger.warning(f"  Failed to update cache: {e}")
-
-                                            return df
-
-                                    # Tier 4: Use partial cached data with warnings
-                                    self.logger.info(f"  Using cached data starting from {cached_start.date()}")
-                                    return df
-
-                            except Exception as e:
-                                self.logger.warning(f"  Error checking MT5 for additional data: {e}")
-                                self.logger.info(f"  Using cached data as-is")
-                                return df
-
-                        # Check if cached data ends significantly before requested end
-                        elif end_gap_days > 7:  # More than 7 days gap at end
-                            self.logger.warning(f"  Cached data ends {end_gap_days:.1f} days before requested end")
-                            self.logger.warning(f"    Requested: {start_date.date()} to {end_date.date()}")
-                            self.logger.warning(f"    Cached:    {cached_start.date()} to {cached_end.date()}")
-                            self.logger.warning(f"    Will reload from MT5 to get latest data")
-                            # Don't return, fall through to reload from MT5
-                        else:
-                            # Cache is good, use it
-                            return df
-                    else:
+                        # Report progress (thread-safe)
+                        if progress_callback:
+                            with callback_lock:
+                                progress_callback(day_idx, len(days), day.date(), 'cached', len(df),
+                                                f'Loaded {len(df):,} ticks from cache ({file_size_mb:.1f} MB, {load_time:.2f}s)',
+                                                {'file_size_mb': file_size_mb, 'load_time': load_time})
                         return df
-
+                    else:
+                        self.logger.warning(f"  [{day_idx}/{len(days)}] {day.date()}: Cache empty, will download")
                 except Exception as e:
-                    self.logger.warning(f"Failed to load from cache: {e}, will reload from MT5")
+                    self.logger.warning(f"  [{day_idx}/{len(days)}] {day.date()}: Cache read failed ({e}), will download")
 
-        try:
-            # Connect if needed
-            if self._owns_connector and not self.connector.is_connected:
-                if not self.connector.connect():
-                    self.logger.error("Failed to connect to MT5")
-                    return None
+            # Cache miss - download this day's data
+            download_start = time.time()
+            self.logger.info(f"  [{day_idx}/{len(days)}] {day.date()}: Downloading from MT5/archive...")
 
-            # Ensure symbol is selected in Market Watch
-            if not mt5.symbol_select(symbol, True):
-                self.logger.warning(f"Could not select {symbol} in Market Watch")
+            # Report progress - checking MT5 (thread-safe)
+            if progress_callback:
+                with callback_lock:
+                    progress_callback(day_idx, len(days), day.date(), 'checking_mt5', 0,
+                                    'Checking MT5...', {'stage': 'checking_mt5'})
 
-            # Check if symbol is available
-            symbol_info_check = mt5.symbol_info(symbol)
-            if symbol_info_check is None:
-                self.logger.error(f"Symbol {symbol} not found in MT5")
+            # Create a progress callback for archive download stages (simple)
+            def archive_progress(stage, details=None):
+                """Report archive download progress (simple callback)."""
+                if progress_callback:
+                    with callback_lock:
+                        if stage == 'fetching':
+                            progress_callback(day_idx, len(days), day.date(), 'fetching_archive', 0,
+                                            'Fetching from archive...', {'stage': 'fetching_archive'})
+                        elif stage == 'parsing':
+                            pct = details.get('percent', 0) if details else 0
+                            progress_callback(day_idx, len(days), day.date(), 'parsing_archive', 0,
+                                            f'Parsing archive ({pct:.0f}% complete)...',
+                                            {'stage': 'parsing_archive', 'percent': pct})
+                        elif stage == 'caching':
+                            progress_callback(day_idx, len(days), day.date(), 'caching', 0,
+                                            'Caching to disk...', {'stage': 'caching'})
+
+            # Create a full progress callback for archive downloader (detailed)
+            def full_archive_progress(idx, total, date, status, count, msg, metadata=None):
+                """Report detailed archive download progress (full callback)."""
+                if progress_callback:
+                    with callback_lock:
+                        progress_callback(idx, total, date, status, count, msg, metadata)
+
+            day_df = self._download_day_ticks(symbol, day_start, day_end, tick_type, tick_type_name,
+                                             day_cache_path, str(cache_path) if cache_path else None,
+                                             archive_progress, full_archive_progress)
+
+            if day_df is not None and len(day_df) > 0:
+                download_time = time.time() - download_start
+
+                # Get file size if cached
+                file_size_mb = 0
+                source = "MT5"
+                if day_cache_path and day_cache_path.exists():
+                    file_size_mb = day_cache_path.stat().st_size / (1024 * 1024)
+                    # Check if it came from archive (download time > 5s usually means archive)
+                    if download_time > 5:
+                        source = "archive"
+
+                self.logger.info(f"  [{day_idx}/{len(days)}] {day.date()}: ✓ Downloaded {len(day_df):,} ticks from {source} ({file_size_mb:.1f} MB, {download_time:.1f}s)")
+
+                # Report progress - downloaded (thread-safe)
+                if progress_callback:
+                    with callback_lock:
+                        progress_callback(day_idx, len(days), day.date(), 'downloaded', len(day_df),
+                                        f'Downloaded {len(day_df):,} ticks from {source} ({file_size_mb:.1f} MB, {download_time:.1f}s)',
+                                        {'file_size_mb': file_size_mb, 'download_time': download_time, 'source': source})
+                return day_df
+            else:
+                self.logger.warning(f"  [{day_idx}/{len(days)}] {day.date()}: ✗ No data available")
+
+                # Report progress - no data (thread-safe)
+                if progress_callback:
+                    with callback_lock:
+                        progress_callback(day_idx, len(days), day.date(), 'no_data', 0,
+                                        'No data available', {})
                 return None
 
-            if not symbol_info_check.visible:
-                self.logger.warning(f"Symbol {symbol} not visible, attempting to enable...")
-                if not mt5.symbol_select(symbol, True):
-                    self.logger.error(f"Failed to enable {symbol} in Market Watch")
-                    return None
+        # Process days in parallel batches
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_days) as executor:
+            # Submit all days for processing
+            future_to_idx = {
+                executor.submit(process_single_day, idx + 1, day): idx
+                for idx, day in enumerate(days)
+            }
 
-            # Load ticks from MT5
-            self.logger.info(f"Loading tick data for {symbol} from {start_date} to {end_date}")
-            self.logger.info(f"  Tick type: {tick_type} (INFO=bid/ask, ALL=all ticks, TRADE=trades only)")
-
-            ticks = mt5.copy_ticks_range(symbol, start_date, end_date, tick_type)
-
-            if ticks is None or len(ticks) == 0:
-                error_code, error_msg = mt5.last_error()
-                self.logger.error(
-                    f"No tick data retrieved for {symbol} - "
-                    f"MT5 Error: ({error_code}) {error_msg}"
-                )
-                self.logger.error(
-                    f"Date range: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to "
-                    f"{end_date.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                return None
-
-            # Convert to DataFrame
-            df = pd.DataFrame(ticks)
-
-            # Convert time from Unix timestamp to datetime
-            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-
-            # Ensure all required columns exist
-            required_cols = ['time', 'bid', 'ask', 'last', 'volume']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                self.logger.error(f"Tick data missing required columns: {missing_cols}")
-                return None
-
-            # Filter out ticks with zero bid/ask (invalid ticks)
-            initial_count = len(df)
-            df = df[(df['bid'] > 0) & (df['ask'] > 0)].copy()
-            filtered_count = initial_count - len(df)
-
-            if filtered_count > 0:
-                self.logger.warning(f"  Filtered out {filtered_count} invalid ticks (zero bid/ask)")
-
-            self.logger.info(f"  Loaded {len(df):,} ticks for {symbol}")
-
-            # Log tick data statistics and validate date range
-            if len(df) > 0:
-                actual_start = df['time'].iloc[0]
-                actual_end = df['time'].iloc[-1]
-                time_span = (actual_end - actual_start).total_seconds()
-                ticks_per_second = len(df) / time_span if time_span > 0 else 0
-
-                self.logger.info(f"  Time span: {time_span/3600:.1f} hours")
-                self.logger.info(f"  Average: {ticks_per_second:.1f} ticks/second")
-                self.logger.info(f"  Actual date range: {actual_start.strftime('%Y-%m-%d %H:%M:%S')} to {actual_end.strftime('%Y-%m-%d %H:%M:%S')}")
-
-                # Check if actual data matches requested date range
-                # Allow 1 day tolerance for start date (weekends, holidays)
-                start_diff = (actual_start - start_date).total_seconds() / 86400  # days
-                end_diff = (end_date - actual_end).total_seconds() / 86400  # days
-
-                if start_diff > 1:  # Actual start is more than 1 day after requested start
-                    self.logger.warning("")
-                    self.logger.warning("=" * 80)
-                    self.logger.warning(f"⚠️  TICK DATA AVAILABILITY WARNING for {symbol}")
-                    self.logger.warning("=" * 80)
-                    self.logger.warning(f"  Requested start date: {start_date.strftime('%Y-%m-%d %H:%M:%S')}")
-                    self.logger.warning(f"  Actual first tick:    {actual_start.strftime('%Y-%m-%d %H:%M:%S')}")
-                    self.logger.warning(f"  Missing data:         {start_diff:.1f} days")
-                    self.logger.warning("")
-                    self.logger.warning("  MT5 does not have tick data available before the actual first tick.")
-                    self.logger.warning("  The backtest will start from the first available tick, not the configured START_DATE.")
-                    self.logger.warning("")
-                    self.logger.warning("  Options:")
-                    self.logger.warning("  1. Accept the later start date (backtest will start from first available tick)")
-                    self.logger.warning("  2. Disable tick mode (USE_TICK_DATA = False) to use candle-based backtesting")
-                    self.logger.warning("  3. Reduce the backtest date range to match available tick data")
-                    self.logger.warning("=" * 80)
-                    self.logger.warning("")
-
-            # Save to cache if cache_dir provided
-            if cache_dir and len(df) > 0:
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    # Use ACTUAL date range in filename (not requested range)
-                    # This makes it clear what data is actually in the cache
-                    actual_start_str = df['time'].iloc[0].strftime("%Y%m%d")
-                    actual_end_str = df['time'].iloc[-1].strftime("%Y%m%d")
-
-                    # Create cache filename with actual date range
-                    tick_type_name = {
-                        mt5.COPY_TICKS_INFO: "INFO",
-                        mt5.COPY_TICKS_ALL: "ALL",
-                        mt5.COPY_TICKS_TRADE: "TRADE"
-                    }.get(tick_type, "UNKNOWN")
-
-                    actual_cache_file = cache_path / f"{symbol}_{actual_start_str}_{actual_end_str}_{tick_type_name}.parquet"
-
-                    # If the actual cache file is different from the requested one, use the actual one
-                    # This prevents confusion when MT5 doesn't have data for the full requested range
-                    if actual_cache_file != cache_file:
-                        self.logger.info(f"  Note: Using actual date range in cache filename")
-                        self.logger.info(f"    Requested: {cache_file.name}")
-                        self.logger.info(f"    Actual:    {actual_cache_file.name}")
-                        cache_file = actual_cache_file
-
-                    self.logger.info(f"  Saving ticks to cache: {cache_file.name}")
-                    df.to_parquet(cache_file, compression='snappy', index=False)
-                    file_size_mb = cache_file.stat().st_size / 1024 / 1024
-                    self.logger.info(f"  ✓ Cached {len(df):,} ticks ({file_size_mb:.1f} MB)")
+                    result = future.result()
+                    daily_dfs[idx] = result
                 except Exception as e:
-                    self.logger.warning(f"  Failed to save cache: {e}")
+                    self.logger.error(f"Error processing day {days[idx].date()}: {e}")
+                    daily_dfs[idx] = None
 
-            return df
+        # Filter out None values
+        daily_dfs = [df for df in daily_dfs if df is not None and len(df) > 0]
 
-        except Exception as e:
-            self.logger.error(f"Error loading tick data for {symbol}: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+        # Merge all daily dataframes
+        if not daily_dfs:
+            self.logger.error(f"No tick data available for {symbol}")
             return None
+
+        self.logger.info(f"Merging {len(daily_dfs)} days of tick data...")
+
+        if len(daily_dfs) == 1:
+            merged_df = daily_dfs[0]
+        else:
+            merged_df = pd.concat(daily_dfs, ignore_index=True)
+            merged_df = merged_df.sort_values('time').reset_index(drop=True)
+
+        # Filter to exact requested range
+        # Ensure timezone-aware comparison
+        start_tz = pd.Timestamp(start_date).tz_localize('UTC') if pd.Timestamp(start_date).tz is None else pd.Timestamp(start_date)
+        end_tz = pd.Timestamp(end_date).tz_localize('UTC') if pd.Timestamp(end_date).tz is None else pd.Timestamp(end_date)
+        merged_df = merged_df[(merged_df['time'] >= start_tz) & (merged_df['time'] <= end_tz)].copy()
+
+        self.logger.info(f"✓ Total: {len(merged_df):,} ticks loaded for {symbol}")
+        return merged_df
 
     def _convert_timeframe(self, timeframe: str) -> Optional[int]:
         """Convert timeframe string to MT5 constant."""
@@ -788,68 +1034,4 @@ class BacktestDataLoader:
         }
 
         return timeframe_map.get(timeframe)
-
-    def _try_fetch_from_archive(self, symbol: str, start_date: datetime,
-                                end_date: datetime, tick_type: int) -> Optional[pd.DataFrame]:
-        """
-        Try to fetch tick data from external broker archives.
-
-        This is Tier 3 in the fallback mechanism:
-        - Tier 1: Use existing cache
-        - Tier 2: Fetch missing data from MT5
-        - Tier 3: Download from broker archives (THIS METHOD)
-        - Tier 4: Use partial cached data with warnings
-
-        Args:
-            symbol: Symbol name
-            start_date: Start date for missing data
-            end_date: End date for missing data
-            tick_type: MT5 tick type (INFO, ALL, or TRADE)
-
-        Returns:
-            DataFrame with tick data from archive, or None if fetch failed
-        """
-        try:
-            # Get MT5 server name for broker detection
-            account_info = mt5.account_info()
-            if not account_info:
-                self.logger.info(f"  Cannot fetch from archive: No MT5 account info")
-                return None
-
-            server_name = account_info.server
-
-            # Fetch from archive
-            archive_df = self.archive_downloader.fetch_tick_data(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                server_name=server_name
-            )
-
-            if archive_df is not None and len(archive_df) > 0:
-                # Ensure columns match MT5 format
-                # Archive data has: time, bid, ask, volume
-                # We may need to add additional columns for compatibility
-
-                # Add flags column if missing (0 = no flags)
-                if 'flags' not in archive_df.columns:
-                    archive_df['flags'] = 0
-
-                # Add volume_real column if missing (use volume or 0)
-                if 'volume_real' not in archive_df.columns:
-                    if 'volume' in archive_df.columns:
-                        archive_df['volume_real'] = archive_df['volume'].astype(float)
-                    else:
-                        archive_df['volume_real'] = 0.0
-
-                # Ensure time is datetime with UTC timezone
-                archive_df['time'] = pd.to_datetime(archive_df['time'], utc=True)
-
-                return archive_df
-
-            return None
-
-        except Exception as e:
-            self.logger.warning(f"  Error fetching from archive: {e}")
-            return None
 

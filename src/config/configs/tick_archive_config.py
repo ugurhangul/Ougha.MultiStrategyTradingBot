@@ -40,7 +40,7 @@ class TickArchiveConfig:
     
     # === Cache Settings ===
     save_downloaded_archives: bool = True  # Keep downloaded ZIP files for future use
-    archive_cache_dir: str = "data/tick_archives"  # Directory for storing downloaded archives
+    archive_cache_dir: str = "data/archives"  # Directory for storing downloaded archives
     
     # === Broker Mapping ===
     # Map MT5 server names to broker names used in archive URLs

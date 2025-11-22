@@ -227,7 +227,7 @@ class TradingConfig:
             download_timeout_seconds=int(os.getenv('TICK_ARCHIVE_TIMEOUT', '300')),
             max_retries=int(os.getenv('TICK_ARCHIVE_MAX_RETRIES', '3')),
             save_downloaded_archives=os.getenv('TICK_ARCHIVE_SAVE', 'true').lower() == 'true',
-            archive_cache_dir=os.getenv('TICK_ARCHIVE_CACHE_DIR', 'data/tick_archives')
+            archive_cache_dir=os.getenv('TICK_ARCHIVE_CACHE_DIR', 'data/archives')
         )
 
     def load_symbols_from_active_set(self, file_path: str = "data/active.set", connector=None, logger=None) -> bool:

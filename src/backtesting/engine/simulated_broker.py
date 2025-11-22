@@ -451,7 +451,9 @@ class SimulatedBroker:
 
         self.logger.info(f"Loaded {len(ticks):,} ticks for {symbol}")
 
-    def load_ticks_streaming(self, cache_files: dict, chunk_size: int = 100000, required_timeframes: Optional[List[str]] = None):
+    def load_ticks_streaming(self, cache_files: dict, chunk_size: int = 100000, required_timeframes: Optional[List[str]] = None,
+                            start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
+                            cache_dir: Optional[str] = None, tick_type_name: str = "INFO"):
         """
         Initialize streaming tick mode - ticks are read from disk on-demand.
 
@@ -459,10 +461,14 @@ class SimulatedBroker:
         Memory usage: ~2-3 GB instead of ~20-30 GB for full year backtest.
 
         Args:
-            cache_files: Dict mapping symbol -> parquet file path
+            cache_files: Dict mapping symbol -> parquet file path (DEPRECATED - use cache_dir instead)
             chunk_size: Number of ticks to read per chunk (default: 100,000)
             required_timeframes: List of timeframes to build (default: all timeframes)
                                 PERFORMANCE OPTIMIZATION: Only build timeframes that strategies use
+            start_date: Optional start date filter (only stream ticks >= this date)
+            end_date: Optional end date filter (only stream ticks <= this date)
+            cache_dir: Root cache directory (NEW - for date hierarchy support)
+            tick_type_name: Tick type name (e.g., 'INFO', 'ALL', 'TRADE')
         """
         from src.backtesting.engine.streaming_tick_loader import StreamingTickTimeline
         import psutil
@@ -475,11 +481,14 @@ class SimulatedBroker:
         self.logger.info("Initializing STREAMING tick mode (memory-efficient)...")
         self.logger.info(f"  Memory before initialization: {mem_before:.1f} MB")
         self.logger.info(f"  Chunk size: {chunk_size:,} ticks")
+        if start_date or end_date:
+            self.logger.info(f"  Date range filter: {start_date.date() if start_date else 'any'} to {end_date.date() if end_date else 'any'}")
         self.logger.info("")
 
-        # Create streaming timeline
+        # Create streaming timeline with date filtering
         self.logger.info("Counting ticks in cache files...")
-        streaming_timeline = StreamingTickTimeline(cache_files, chunk_size)
+        streaming_timeline = StreamingTickTimeline(cache_files, chunk_size, start_date, end_date,
+                                                   cache_dir, tick_type_name)
 
         total_ticks = len(streaming_timeline)
         self.logger.info(f"  Total ticks to stream: {total_ticks:,}")
@@ -542,7 +551,8 @@ class SimulatedBroker:
         self.current_time_snapshot = None
 
         # Enable trading for all symbols
-        for symbol in cache_files.keys():
+        # NEW: Get symbols from streaming_timeline instead of cache_files
+        for symbol in streaming_timeline.loader.symbols:
             self.trading_enabled_symbols[symbol] = True
 
         mem_after = process.memory_info().rss / 1024 / 1024  # MB

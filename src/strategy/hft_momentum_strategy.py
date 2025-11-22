@@ -492,7 +492,8 @@ class HFTMomentumStrategy(BaseStrategy):
         # Fetch M1 candles for volume analysis
         # We need lookback + a few extra candles to ensure we have enough data
         candle_count = self.config.volume_lookback + 5
-        df = self.connector.get_candles(self.symbol, "M1", count=candle_count)
+        # PERFORMANCE OPTIMIZATION #21: Use cached candles
+        df = self.get_candles_cached("M1", count=candle_count)
 
         if df is None or len(df) < self.config.volume_lookback:
             return ValidationResult(
@@ -556,8 +557,8 @@ class HFTMomentumStrategy(BaseStrategy):
 
         try:
             # Get candle data for ATR calculation
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.atr_timeframe,
                 count=self.config.atr_period + 50
             )
@@ -647,8 +648,8 @@ class HFTMomentumStrategy(BaseStrategy):
 
         try:
             # Get candle data for EMA calculation
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.trend_ema_timeframe,
                 count=self.config.trend_ema_period + 50
             )
@@ -852,8 +853,8 @@ class HFTMomentumStrategy(BaseStrategy):
         if self.config.use_atr_multiplier:
             try:
                 # Get candle data for ATR calculation
-                df = self.connector.get_candles(
-                    self.symbol,
+                # PERFORMANCE OPTIMIZATION #21: Use cached candles
+                df = self.get_candles_cached(
                     self.config.atr_timeframe,
                     count=self.config.atr_period + 50
                 )

@@ -350,8 +350,8 @@ class FakeoutStrategy(BaseStrategy):
         """
         try:
             # Get reference candles
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.reference_timeframe,
                 count=2
             )
@@ -408,8 +408,8 @@ class FakeoutStrategy(BaseStrategy):
                 return None
 
             # Get historical reference candles
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.reference_timeframe,
                 count=lookback_count
             )
@@ -617,8 +617,8 @@ class FakeoutStrategy(BaseStrategy):
         OPTIMIZATION #5 (Phase 2): Updates volume cache when new candle detected.
         """
         try:
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.breakout_timeframe,
                 count=2
             )
@@ -661,8 +661,8 @@ class FakeoutStrategy(BaseStrategy):
 
         try:
             # Get current confirmation candle
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.breakout_timeframe,
                 count=2
             )
@@ -813,8 +813,8 @@ class FakeoutStrategy(BaseStrategy):
         # OPTIMIZATION #5: Use cached average if available
         if not self.volume_cache.is_ready():
             # Fallback to Pandas for first few candles
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.breakout_timeframe,
                 count=VOLUME_CALCULATION_PERIOD
             )
@@ -982,8 +982,8 @@ class FakeoutStrategy(BaseStrategy):
         # OPTIMIZATION #5: Use cached average if available
         if not self.volume_cache.is_ready():
             # Fallback to Pandas for first few candles
-            df = self.connector.get_candles(
-                self.symbol,
+            # PERFORMANCE OPTIMIZATION #21: Use cached candles
+            df = self.get_candles_cached(
                 self.config.range_config.breakout_timeframe,
                 count=20
             )
@@ -1152,8 +1152,8 @@ class FakeoutStrategy(BaseStrategy):
             )
 
         # Get candles for divergence detection
-        df = self.connector.get_candles(
-            self.symbol,
+        # PERFORMANCE OPTIMIZATION #21: Use cached candles
+        df = self.get_candles_cached(
             self.config.range_config.breakout_timeframe,
             count=self.config.divergence_lookback + self.config.rsi_period + 10
         )
